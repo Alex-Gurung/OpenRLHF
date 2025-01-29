@@ -14,7 +14,7 @@ from openrlhf.models.utils import masked_mean
 from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
-
+import pandas as pd
 
 class PPOTrainer(ABC):
     """
@@ -46,6 +46,7 @@ class PPOTrainer(ABC):
         max_epochs (int, defaults to 1): Number of epochs to train.
         max_norm (float, defaults to 1.0): Maximum gradient norm for gradient clipping.
         tokenizer (Callable, optional): Tokenizer for input data.
+        tokenizer_split_str (str, optional): Split string for tokenizer.
         prompt_max_len (int, defaults to 128): Maximum length for prompts.
         dataloader_pin_memory (bool, defaults to True): If True, pins memory in the data loader.
         remote_rm_url (str, optional): URL for remote reward model API.
@@ -88,6 +89,7 @@ class PPOTrainer(ABC):
         reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
         save_hf_ckpt: bool = False,
         disable_ds_ckpt: bool = False,
+        tokenizer_split_str: Optional[str] = None,
         **generate_kwargs,
     ) -> None:
         assert (
@@ -102,6 +104,10 @@ class PPOTrainer(ABC):
         self.micro_rollout_batch_size = micro_rollout_batch_size
         self.max_epochs = max_epochs
         self.tokenizer = tokenizer
+        self.tokenizer_split_str = tokenizer_split_str
+        if tokenizer_split_str is None and self.tokenizer is not None:
+            self.tokenizer_split_str = self.tokenizer.eos_token
+        
         self.generate_kwargs = generate_kwargs
         self.dataloader_pin_memory = dataloader_pin_memory
         self.max_norm = max_norm
@@ -175,8 +181,13 @@ class PPOTrainer(ABC):
 
             wandb.define_metric("train/global_step")
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
-            wandb.define_metric("eval/epoch")
-            wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+            # wandb.define_metric("eval/global_step")
+            wandb.define_metric("eval/*", step_metric="train/global_step", step_sync=True)
+            columns = ["global_step", "prompt", "response", "reward", "raw_reward", "response_length", "total_length"]
+            # wandb.define_metric("eval/completions_table")
+            self.completions_table = wandb.Table(columns=columns)
+            self.completions_table_df = pd.DataFrame(columns=columns)
+            # wandb.log({"eval/completions_table": self.completions_table, "eval/global_step": 0})
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
@@ -193,6 +204,7 @@ class PPOTrainer(ABC):
         pretrain_dataloader,
         consumed_samples=0,
         num_update_steps_per_episodes=1,
+        eval_prompts_dataloader=None,
     ) -> None:
         num_rollouts_per_episodes = (
             num_update_steps_per_episodes
@@ -210,11 +222,15 @@ class PPOTrainer(ABC):
 
         self.prompts_dataloader = prompts_dataloader
         self.pretrain_dataloader = pretrain_dataloader
-
+        self.eval_prompts_dataloader = eval_prompts_dataloader
+        
         # Restore step and start_epoch
         steps = consumed_samples // args.rollout_batch_size + 1
         start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
+        
+        # Evaluate actor before training
+        self.evaluate_actor(eval_prompts_dataloader, global_steps=0)
 
         for episode in range(start_episode, args.num_episodes):
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
@@ -233,8 +249,10 @@ class PPOTrainer(ABC):
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
-                            experience.sequences[0].unsqueeze(0), skip_special_tokens=True
+                            experience.sequences[0].unsqueeze(0), skip_special_tokens=False
                         )
+                        index_of_last_eos = output[0][:-2][::-1].find(self.tokenizer.eos_token)
+                        output = output[0][index_of_last_eos:]
                         self.strategy.print(output)
                     self.replay_buffer.append(experience)
 
@@ -250,7 +268,7 @@ class PPOTrainer(ABC):
 
                 # logs/checkpoints
                 client_states = {"consumed_samples": steps * args.rollout_batch_size}
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
+                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states, eval_prompts_dataloader=eval_prompts_dataloader)
 
                 pbar.update()
                 steps = steps + 1
@@ -471,7 +489,7 @@ class PPOTrainer(ABC):
         }
         return status
 
-    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
+    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}, eval_prompts_dataloader=None):
         if global_step % args.logging_steps == 0:
             # wandb
             if self._wandb is not None and self.strategy.is_rank_0():
@@ -495,8 +513,10 @@ class PPOTrainer(ABC):
 
         # TODO: Add evaluation mechanism for PPO
         if global_step % args.eval_steps == 0:
+            if eval_prompts_dataloader is not None and len(eval_prompts_dataloader) > 0:
+                self.evaluate_actor(eval_prompts_dataloader, global_step)
             # self.evaluate(self.eval_dataloader, global_step)
-            pass
+            # pass
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
@@ -521,3 +541,135 @@ class PPOTrainer(ABC):
         if self.save_hf_ckpt:
             save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
             self.strategy.save_model(self.actor, self.tokenizer, save_path)
+
+    def evaluate_actor(self, eval_prompts_dataloader, global_steps=0):
+        self.actor.eval()
+        with torch.no_grad():
+            if isinstance(eval_prompts_dataloader.sampler, DistributedSampler):
+                eval_prompts_dataloader.sampler.set_epoch(
+                    global_steps, consumed_samples=0
+                )
+            steps = 0
+            pbar = tqdm(
+                range(eval_prompts_dataloader.__len__()),
+                desc=f"Eval [{steps + 1}/{len(eval_prompts_dataloader)}]",
+                disable=not self.strategy.is_rank_0(),
+            )
+            rewards = []
+            raw_rewards = []
+            total_experience_list = []
+            for rand_prompts in eval_prompts_dataloader:
+                cur_experience_list = self.experience_maker.make_experience_list(rand_prompts, **self.generate_kwargs)
+                for i, experience in enumerate(
+                    cur_experience_list
+                ):
+                    self.actor.eval()
+                    if self.critic is not None:
+                        self.critic.eval()
+                    
+                    rewards.append(experience.info["reward"].item())
+                    raw_rewards.append(experience.info["raw_reward"].item())
+
+                pbar.update()
+                steps = steps + 1
+                total_experience_list.extend([exp for exp in cur_experience_list])
+            # Aggregate metrics
+            # logs = {
+            #     "eval_raw_reward": sum(raw_rewards) / len(raw_rewards) if len(raw_rewards) > 0 else 0,
+            #     "eval_reward": sum(rewards) / len(rewards) if len(rewards) > 0 else 0,
+            # }
+            sum_logs = {
+                "eval_raw_reward": sum(raw_rewards),
+                "eval_reward": sum(rewards),
+                "eval_num_prompts": len(raw_rewards),
+                "eval_response_length": sum([experience.info["response_length"] for experience in total_experience_list]),
+            }
+            
+            # print("all_reduce")
+            # logs = self.strategy.all_reduce(logs)
+            logs = self.strategy.all_reduce(sum_logs, op="sum")
+            print(f"logs: {logs}")
+            
+            logs = {
+                "eval_raw_reward": logs["eval_raw_reward"] / logs["eval_num_prompts"],
+                "eval_reward": logs["eval_reward"] / logs["eval_num_prompts"],
+                "eval_response_length": logs["eval_response_length"] / logs["eval_num_prompts"],
+            }
+            
+            # print('pre table data')
+            table_data = {
+                "reward": torch.tensor([experience.info["reward"] for experience in total_experience_list]),
+                "raw_reward": torch.tensor([experience.info["raw_reward"] for experience in total_experience_list]),
+                "response_length": torch.tensor([experience.info["response_length"] for experience in total_experience_list]),
+                "total_length": torch.tensor([experience.info["total_length"] for experience in total_experience_list]),
+                "sequences": torch.stack([experience.sequences.squeeze()[-1024:] for experience in total_experience_list])
+            }
+            print(f"pre gather table_data: {table_data}")
+            
+            # sequences might be too 
+            
+            # print({k:(v.shape, v.dtype, v.device) for k, v in table_data.items()})
+            
+            # print("all_gather")
+            all_table_data = self.strategy.all_gather(table_data)
+            print(f"post gather table_data: {all_table_data}")
+            if self.strategy.is_rank_0():
+                if self._wandb is not None:
+                    logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": global_steps}.items()}
+                    self._wandb.log(logs)
+                    self._experience_list_to_table(all_table_data, global_steps)
+                elif self._tensorboard is not None:
+                    for k, v in logs.items():
+                        self._tensorboard.add_scalar(f"eval/{k}", v, global_steps)
+
+        self.actor.train()  # Reset model state
+    def _experience_list_to_table(self, table_data: Dict[str, List[float]], global_steps: int):
+        data_to_log = {}
+
+        for column in ["reward", "raw_reward", "response_length", "total_length"]:
+            data_to_log[column] = table_data[column]
+        print(data_to_log)
+        prompts = []
+        responses = []
+        # also want to add prompt and response
+        for i in range(table_data["sequences"].shape[0]):
+            cur_response_length = int(table_data["response_length"][i].item())
+            # sequences has shape (B, S), we'll just sample the first sequence from the batch
+            sequence = table_data["sequences"][i]
+            # note sequence has shape (S), and is left padded tokens
+            # we want to remove the padding tokens and decode the sequence
+            sequence = sequence.squeeze()
+            sequence = sequence[sequence != self.tokenizer.pad_token_id]
+            # should only be one assistant header
+            # ignore last five
+            index_of_last_system_message = sequence.size(0) - cur_response_length - 5
+            # up to the last section
+            prompt = self.tokenizer.decode(sequence[:index_of_last_system_message], skip_special_tokens=False)
+            # model response is the last section
+            model_response = self.tokenizer.decode(sequence[index_of_last_system_message:], skip_special_tokens=False)
+            prompt, model_response = prompt.strip(), model_response.strip()
+            
+            prompts.append(prompt)
+            responses.append(model_response)
+        
+        data_to_log["prompt"] = prompts
+        data_to_log["response"] = responses
+        data_to_log["global_step"] = [global_steps] * len(prompts)
+        
+        table = pd.DataFrame(data_to_log)
+        
+        print("logging table...")
+        # print random row
+        print(table.sample(n=1))
+        
+        self.completions_table_df = pd.concat([self.completions_table_df, table])
+        self._wandb.log({"eval/completions_table": self.completions_table_df})
+        return table
+    
+def find_index_of_last_system_message(sequence, eos_token_id, end_offset=5, offset_after_token=5):
+    # Find the index of the last system message in the sequence
+    # offset_after_token is the number of tokens to skip after the system message
+    for i in range(len(sequence) - 1, end_offset, -1):
+        if sequence[i] == eos_token_id:
+            return i + offset_after_token
+    return -1

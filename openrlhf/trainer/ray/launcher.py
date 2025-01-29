@@ -10,6 +10,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.utils.deepspeed import DeepspeedStrategy
+from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
 
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 
@@ -87,16 +88,29 @@ class ReferenceModelRayActor(BasePPORole):
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
         packed_seq_lens: Optional[list[int]] = None,
+        labels: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
-            log_probs = self.model(
-                sequences.to(device),
-                num_actions,
-                attention_mask.to(device),
-                return_output=return_output,
-                packed_seq_lens=packed_seq_lens,
-            )
+            if return_output:
+                log_probs, output = self.model(
+                    sequences.to(device),
+                    num_actions,
+                    attention_mask.to(device) if attention_mask is not None else None,
+                    return_output=return_output,
+                    packed_seq_lens=packed_seq_lens,
+                    labels=labels
+                )
+                return log_probs.to("cpu"), output
+            else:
+                log_probs = self.model(
+                    sequences.to(device),
+                    num_actions,
+                    attention_mask.to(device) if attention_mask is not None else None,
+                    return_output=return_output,
+                    packed_seq_lens=packed_seq_lens,
+                    labels=labels
+                )
         return log_probs.to("cpu")
 
     def empty_cache(self) -> None:
@@ -198,6 +212,7 @@ class PPORayActorGroup:
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg, placement_group_bundle_index=0
                 ),
+                
             ).remote(world_size, 0, None, None)
         else:
             master_actor = self.ray_actor_type.options(
@@ -263,11 +278,11 @@ class PPORayActorGroup:
         Returns:
             List: list of remote object refs.
         """
-        assert (
-            (remote_rm_urls and len(remote_rm_urls) == 1)
-            or (reward_model_groups and len(reward_model_groups) == 1)
-            or reward_fn is not None
-        ), "reward_fn must be specified if using multiple reward models"
+        # assert (
+        #     (remote_rm_urls and len(remote_rm_urls) == 1)
+        #     or (reward_model_groups and len(reward_model_groups) == 1)
+        #     or reward_fn is not None
+        # ), "reward_fn must be specified if using multiple reward models"
 
         critic_actors = critic_model_group._actor_handlers if critic_model_group else None
         initial_actors = initial_model_group._actor_handlers
@@ -280,7 +295,7 @@ class PPORayActorGroup:
             initial_actor = initial_actors[i % len(initial_actors)]
 
             reward_actors = []
-            if not remote_rm_urls:
+            if not remote_rm_urls and reward_model_groups is not None:
                 for reward_model_group in reward_model_groups:
                     actors = reward_model_group._actor_handlers
                     reward_actors.append(actors[i % len(actors)])

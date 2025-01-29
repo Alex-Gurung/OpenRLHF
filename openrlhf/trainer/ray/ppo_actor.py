@@ -28,6 +28,7 @@ class ActorPPOTrainer(PPOTrainer):
         vllm_engines: List = None,
         remote_rm_url: List[str] = None,
         critic_train_remote: bool = False,
+        remote_experience_maker_class: type = RemoteExperienceMaker,
         **kwargs,
     ):
         """PPOTrainer for ray.
@@ -41,7 +42,7 @@ class ActorPPOTrainer(PPOTrainer):
         self.vllm_engines = vllm_engines
         self.critic_train_remote = critic_train_remote
 
-        self.experience_maker = RemoteExperienceMaker(
+        self.experience_maker = remote_experience_maker_class(
             self.actor,
             self.critic,
             self.reward_model,
@@ -187,6 +188,10 @@ class ActorPPOTrainer(PPOTrainer):
 
 @ray.remote(num_gpus=1)
 class ActorModelRayActor(BasePPORole):
+    def __init__(self, *args, remote_experience_maker_class=RemoteExperienceMaker, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.remote_experience_maker_class = remote_experience_maker_class
+
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
         args = strategy.args
 
@@ -374,6 +379,7 @@ class ActorModelRayActor(BasePPORole):
             micro_rollout_batch_size=args.micro_rollout_batch_size,
             gradient_checkpointing=args.gradient_checkpointing,
             critic_train_remote=critic_train_remote,
+            remote_experience_maker_class=self.remote_experience_maker_class,
             tokenizer=self.tokenizer,
             prompt_max_len=args.prompt_max_len,
             value_clip=args.value_clip,

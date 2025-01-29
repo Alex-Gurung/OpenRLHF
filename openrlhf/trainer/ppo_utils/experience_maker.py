@@ -313,6 +313,7 @@ class NaiveExperienceMaker(ABC):
         info = {
             "kl": masked_mean(kl, action_mask, dim=-1),
             "reward": r,
+            "raw_reward": r,
             "response_length": samples.response_length,
             "total_length": samples.total_length,
             "num_actions": num_actions,
