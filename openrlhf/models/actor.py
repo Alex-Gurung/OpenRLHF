@@ -1,5 +1,5 @@
 from typing import Optional, Tuple, Union
-
+import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -7,6 +7,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
+from transformers import Cache
 
 from .ring_attn_utils import convert_ring_attn_params
 from .utils import log_probs_from_logits, reset_position_ids
@@ -23,6 +24,7 @@ class Actor(nn.Module):
         use_flash_attention_2 (bool, optional): Whether to utilize Flash Attention 2.0 for improved performance. Defaults to False.
         bf16 (bool, optional): Enable bfloat16 precision for model computations. Defaults to True.
         load_in_4bit (bool, optional): Load the model in 4-bit precision. Defaults to False.
+        load_in_8bit (bool, optional): Load the model in 8-bit precision. Defaults to False.
         lora_rank (int, optional): Rank for LoRA adaptation. Defaults to 0.
         lora_alpha (int, optional): Alpha parameter for LoRA. Defaults to 16.
         lora_dropout (float, optional): Dropout rate for LoRA layers. Defaults to 0.
@@ -38,6 +40,7 @@ class Actor(nn.Module):
         use_flash_attention_2=False,
         bf16=True,
         load_in_4bit=False,
+        load_in_8bit=False,
         lora_rank=0,
         lora_alpha=16,
         lora_dropout=0,
@@ -67,6 +70,11 @@ class Actor(nn.Module):
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.bfloat16,
                 )
+            elif load_in_8bit:
+                assert bf16, "we only support bnb_4bit_compute_dtype = bf16"
+                nf4_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                )
             else:
                 nf4_config = None
 
@@ -93,7 +101,7 @@ class Actor(nn.Module):
                 )
                 self.model = get_peft_model(self.model, lora_config)
 
-                if load_in_4bit:
+                if load_in_4bit or load_in_8bit:
                     for name, module in self.model.named_modules():
                         if isinstance(module, LoraLayer):
                             module = module.to(torch.bfloat16)
@@ -128,7 +136,7 @@ class Actor(nn.Module):
             "top_k": kwargs.get("top_k", None),
             "top_p": kwargs.get("top_p", None),
             "do_sample": kwargs.get("do_sample", True),
-            "early_stopping": True,
+            "early_stopping": kwargs.get("num_beams", 1) > 1,
             "temperature": kwargs.get("temperature", 1),
             "use_cache": True,
             "num_beams": kwargs.get("num_beams", 1),
@@ -185,11 +193,18 @@ class Actor(nn.Module):
         sequences: torch.LongTensor,
         num_actions: Optional[Union[int, list[int]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        return_output=False,
+        return_output: bool = False,
         ring_attn_group: Optional[dist.ProcessGroup] = None,
         packed_seq_lens: Optional[list[int]] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_loss: bool = False,
+        return_past_key_values: bool = False,
+        past_key_values: Optional[Union[torch.Tensor, Cache]] = None,
+        use_cache: bool = True,
+        
     ) -> torch.Tensor:
         """Returns action log probs"""
+        start = time.time()
         if not self.packing_samples:
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
             position_ids = attention_mask.long().cumsum(-1) - 1
@@ -204,14 +219,26 @@ class Actor(nn.Module):
                 position_ids = reset_position_ids(attention_mask)
             # explicitly ignore attention_mask for packing_samples
             attention_mask = None
-
-        output = self.model(sequences, attention_mask=attention_mask, position_ids=position_ids)
+        output = self.model(sequences, attention_mask=attention_mask, 
+                            position_ids=position_ids, labels=labels, 
+                            past_key_values=past_key_values, use_cache=use_cache)
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
+        to_return = []
+        if return_past_key_values:
+            to_return.append(output["past_key_values"])
+            
+        if return_loss:
+            print("IN ACTOR ONLY RETURN LOSS")
+            loss = output.loss
+            to_return.append(loss)
 
         if num_actions is None:
             assert return_output
-            return output
+            to_return.append(output)
+            if len(to_return) == 1:
+                return to_return[0]
+            return to_return
 
         log_probs = log_probs_from_logits(output["logits"][:, :-1, :], sequences[:, 1:])
 
@@ -226,11 +253,14 @@ class Actor(nn.Module):
                 action_log_probs.append(log_probs[:, start:end])
                 offset += seq_len
             action_log_probs = torch.cat(action_log_probs, dim=1)
-
+        end = time.time()
+        print(f"Time taken to total for forward: {end - start} seconds")
+        to_return.append(action_log_probs)
         if return_output:
-            return (action_log_probs, output)
-        else:
-            return action_log_probs
+            to_return.append(output)
+        if len(to_return) == 1:
+            return to_return[0]
+        return to_return
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={"use_reentrant": False}):
         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs=gradient_checkpointing_kwargs)

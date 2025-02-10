@@ -25,6 +25,7 @@ def get_llm_for_sequence_regression(
     *,
     bf16=True,
     load_in_4bit=False,
+    load_in_8bit=False,
     lora_rank=0,
     lora_alpha=16,
     target_modules=None,
@@ -47,6 +48,7 @@ def get_llm_for_sequence_regression(
         model_type (str): Type of the model, either "reward" or "critic".
         bf16 (bool, optional): Enable bfloat16 precision. Defaults to True.
         load_in_4bit (bool, optional): Load the model in 4-bit precision. Defaults to False.
+        load_in_8bit (bool, optional): Load the model in 8-bit precision. Defaults to False.
         lora_rank (int, optional): Rank for LoRA adaptation. Defaults to 0.
         lora_alpha (int, optional): Alpha parameter for LoRA. Defaults to 16.
         target_modules (list, optional): List of target modules for LoRA. Defaults to None.
@@ -90,21 +92,27 @@ def get_llm_for_sequence_regression(
 
     if load_in_4bit:
         assert bf16, "we only support bnb_4bit_compute_dtype = bf16"
-        nf4_config = BitsAndBytesConfig(
+        nf_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
+    elif load_in_8bit:
+        assert bf16, "we only support bnb_4bit_compute_dtype = bf16"
+        nf_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            bnb_8bit_compute_dtype=torch.bfloat16,
+        )
     else:
-        nf4_config = None
+        nf_config = None
 
     model = cls_class.from_pretrained(
         model_name_or_path,
         config=config,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16 if bf16 else "auto",
-        quantization_config=nf4_config,
+        quantization_config=nf_config,
         device_map=device_map,
         **kwargs,
     )

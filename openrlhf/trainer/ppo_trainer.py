@@ -230,6 +230,7 @@ class PPOTrainer(ABC):
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
         
         # Evaluate actor before training
+        print("Evaluating actor before training")
         self.evaluate_actor(eval_prompts_dataloader, global_steps=0)
 
         for episode in range(start_episode, args.num_episodes):
@@ -245,7 +246,7 @@ class PPOTrainer(ABC):
 
             for rand_prompts in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, **self.generate_kwargs)
+                    self.experience_maker.make_experience_list(rand_prompts, for_eval=False, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
@@ -268,7 +269,7 @@ class PPOTrainer(ABC):
 
                 # logs/checkpoints
                 client_states = {"consumed_samples": steps * args.rollout_batch_size}
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states, eval_prompts_dataloader=eval_prompts_dataloader)
+                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states, eval_prompts_dataloader=eval_prompts_dataloader, episode=episode)
 
                 pbar.update()
                 steps = steps + 1
@@ -421,7 +422,7 @@ class PPOTrainer(ABC):
 
         self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
         if self.ema_model:
-            self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cpu")
+            self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
 
         # status
         status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
@@ -489,7 +490,7 @@ class PPOTrainer(ABC):
         }
         return status
 
-    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}, eval_prompts_dataloader=None):
+    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}, eval_prompts_dataloader=None, episode=None):
         if global_step % args.logging_steps == 0:
             # wandb
             if self._wandb is not None and self.strategy.is_rank_0():
@@ -498,6 +499,7 @@ class PPOTrainer(ABC):
                     for k, v in {
                         **logs_dict,
                         "global_step": global_step,
+                        "episode": episode,
                     }.items()
                 }
                 if self.experience_maker.perf_stats is not None:
@@ -558,21 +560,27 @@ class PPOTrainer(ABC):
             rewards = []
             raw_rewards = []
             total_experience_list = []
+            print("Iterating through eval prompts")
             for rand_prompts in eval_prompts_dataloader:
-                cur_experience_list = self.experience_maker.make_experience_list(rand_prompts, **self.generate_kwargs)
+                print(f"step: {steps}")
+                cur_experience_list = self.experience_maker.make_experience_list(rand_prompts, for_eval=True, **self.generate_kwargs)
                 for i, experience in enumerate(
                     cur_experience_list
                 ):
+                    print(f"i: {i}")
                     self.actor.eval()
                     if self.critic is not None:
                         self.critic.eval()
                     
-                    rewards.append(experience.info["reward"].item())
-                    raw_rewards.append(experience.info["raw_reward"].item())
+                    num_rewards = experience.info["reward"].shape[0]
+                    for i in range(num_rewards):
+                        rewards.append(experience.info["reward"][i].item())
+                        raw_rewards.append(experience.info["raw_reward"][i].item())
 
                 pbar.update()
                 steps = steps + 1
                 total_experience_list.extend([exp for exp in cur_experience_list])
+            print("Done iterating through eval prompts")
             # Aggregate metrics
             # logs = {
             #     "eval_raw_reward": sum(raw_rewards) / len(raw_rewards) if len(raw_rewards) > 0 else 0,

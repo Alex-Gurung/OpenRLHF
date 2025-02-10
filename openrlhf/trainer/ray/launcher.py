@@ -9,10 +9,10 @@ from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
+from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
 
-from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 
 class DistributedTorchRayActor:
     def __init__(self, world_size, rank, master_addr, master_port):
@@ -81,6 +81,78 @@ class ReferenceModelRayActor(BasePPORole):
         self.model = self.strategy.prepare(model, is_rlhf=True)
         self.model.eval()
 
+    def batch_forward(
+        self,
+        all_sequences: torch.LongTensor,
+        all_num_actions: int = None,
+        all_attention_mask: Optional[torch.Tensor] = None,
+        all_packed_seq_lens: Optional[list[int]] = None,
+        all_labels: Optional[torch.Tensor] = None,
+        return_loss: bool = False,
+        return_output: bool = False,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        device = torch.cuda.current_device()
+        with torch.no_grad():
+            all_losses = []
+            all_log_probs = []
+            all_outputs = []
+            past_key_values = None
+            for i in range(len(all_sequences)):
+                sequences = all_sequences[i]
+                num_actions = all_num_actions[i] if all_num_actions else None
+                attention_mask = all_attention_mask[i] if all_attention_mask else None
+                packed_seq_lens = all_packed_seq_lens[i] if all_packed_seq_lens else None
+                labels = all_labels[i]
+                print(f"return_loss: {return_loss}")
+                print(f"return_output: {return_output}")
+                print(f"use_cache: {use_cache}")
+                print(f"past_key_values: {past_key_values}")
+                returned = self.model(
+                    sequences.to(device),
+                    num_actions,
+                    attention_mask.to(device) if attention_mask is not None else None,
+                    labels=labels,
+                    return_loss=return_loss,
+                    use_cache=use_cache,
+                    past_key_values=past_key_values,
+                    return_output=return_output,
+                    return_past_key_values=True
+                )
+                loss = None
+                past_key_values = None
+                log_probs = None
+                output = None
+                cur_index = 0
+                if isinstance(returned, list):
+                    past_key_values = returned[cur_index]
+                    cur_index += 1
+                    if return_loss:
+                        loss = returned[cur_index]
+                        cur_index += 1
+                    if return_output:
+                        log_probs = returned[cur_index]
+                    cur_index += 1
+                    if return_output:
+                        output = returned[cur_index]
+                        cur_index += 1
+                else:
+                    past_key_values = returned
+                if loss is not None:
+                    loss = loss.to("cpu")
+                if log_probs is not None:
+                    log_probs = log_probs.to("cpu")
+                all_losses.append(loss)
+                all_log_probs.append(log_probs)
+                all_outputs.append(output)
+                print('new past key values: ', past_key_values)
+        if return_loss:
+            return all_losses
+        elif return_output:
+            return all_log_probs, all_outputs
+        else:
+            return all_log_probs
+    
     def forward(
         self,
         sequences: torch.LongTensor,
@@ -88,30 +160,34 @@ class ReferenceModelRayActor(BasePPORole):
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
         packed_seq_lens: Optional[list[int]] = None,
-        labels: Optional[torch.Tensor] = None
+        labels: Optional[torch.Tensor] = None,
+        return_loss: bool = False
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
-            if return_output:
-                log_probs, output = self.model(
-                    sequences.to(device),
-                    num_actions,
-                    attention_mask.to(device) if attention_mask is not None else None,
-                    return_output=return_output,
-                    packed_seq_lens=packed_seq_lens,
-                    labels=labels
-                )
-                return log_probs.to("cpu"), output
+            returned = self.model(
+                sequences.to(device),
+                num_actions,
+                attention_mask.to(device) if attention_mask is not None else None,
+                return_output=return_output,
+                packed_seq_lens=packed_seq_lens,
+                labels=labels,
+                return_loss=return_loss
+            )
+            if return_loss:
+                loss = returned[0] if isinstance(returned, list) else returned
+                loss = loss.to("cpu")
+                return loss
+            elif return_output:
+                log_probs = returned[0]
+                output = returned[1]
+                if log_probs is not None:
+                    log_probs = log_probs.to("cpu")
+                return log_probs, output
             else:
-                log_probs = self.model(
-                    sequences.to(device),
-                    num_actions,
-                    attention_mask.to(device) if attention_mask is not None else None,
-                    return_output=return_output,
-                    packed_seq_lens=packed_seq_lens,
-                    labels=labels
-                )
-        return log_probs.to("cpu")
+                log_probs = returned[0] if isinstance(returned, list) else returned
+                log_probs = log_probs.to("cpu")
+                return log_probs
 
     def empty_cache(self) -> None:
         torch.cuda.empty_cache()
@@ -194,15 +270,13 @@ class PPORayActorGroup:
 
         # Use placement group to lock resources for models of same type
         if self._num_gpus_per_node > 1 and pg is None:
-            bundles = [
-                {"GPU": self._num_gpus_per_node, "CPU": self._num_gpus_per_node} for _ in range(self._num_nodes)
-            ]
+            bundles = [{"GPU": 1, "CPU": 1} for _ in range(self._num_nodes * self._num_gpus_per_node)]
             if self._resources:
                 resources_name = list(self._resources.keys())[0]
                 for i in range(len(bundles)):
                     bundles[i][resources_name] = self._num_resources_per_node
 
-            pg = placement_group(bundles, strategy="STRICT_SPREAD")
+            pg = placement_group(bundles, strategy="PACK")
             ray.get(pg.ready())
         if pg:
             master_actor = self.ray_actor_type.options(
@@ -233,7 +307,7 @@ class PPORayActorGroup:
                         resources=self._resources,
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=pg,
-                            placement_group_bundle_index=rank // self._num_gpus_per_node,
+                            placement_group_bundle_index=rank,
                         ),
                     ).remote(world_size, rank, master_addr, master_port)
                 else:

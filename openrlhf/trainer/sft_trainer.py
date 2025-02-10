@@ -118,6 +118,7 @@ class SFTTrainer(ABC):
             disable=not self.strategy.is_rank_0(),
         )
         loss_sum = 0
+        perplexity_sum = 0
         for epoch in range(start_epoch, self.epochs):
             if isinstance(self.train_dataloader.sampler, DistributedSampler):
                 self.train_dataloader.sampler.set_epoch(
@@ -165,23 +166,34 @@ class SFTTrainer(ABC):
 
                 if not self.pretrain_mode:
                     if self.packing_samples:
-                        index = 0
-                        for input_length, source_len in zip(infos["input_length"], prompt_id_lens):
-                            labels[0][index : index + source_len] = self.loss_fn.IGNORE_INDEX
-                            index += input_length
+                        # As response_ranges need to constrain the dataset organization strictly, we handle multiturn feature separately.
+                        if infos["response_ranges"]:
+                            dump_labels = torch.full(labels.size(), self.loss_fn.IGNORE_INDEX).to(labels.device)
+                            for response_ranges in infos["response_ranges"]:
+                                for response_range in response_ranges:
+                                    dump_labels[0][response_range[0]: response_range[1]] = labels[0][response_range[0]: response_range[1]]
+                            labels = dump_labels
+                        else:
+                            index = 0
+                            for input_length, source_len in zip(infos["input_length"], prompt_id_lens):
+                                labels[0][index : index + source_len] = self.loss_fn.IGNORE_INDEX
+                                index += input_length
                     else:
                         for label, source_len in zip(labels, prompt_id_lens):
                             label[:source_len] = self.loss_fn.IGNORE_INDEX
 
                 gpt_loss = self.loss_fn(output.logits, labels)
+                perplexity = torch.exp(gpt_loss)
                 loss = gpt_loss + aux_loss * self.args.aux_loss_coef
                 self.strategy.backward(loss, self.model, self.optimizer)
                 self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler)
 
                 loss_sum += gpt_loss.item()
+                perplexity_sum += perplexity.item()
                 logs_dict = {
                     "gpt_loss": gpt_loss.item(),
                     "lr": self.scheduler.get_last_lr()[0],
+                    "perplexity": perplexity.item(),
                 }
                 if self.aux_loss:
                     logs_dict["aux_loss"] = aux_loss.item()
@@ -193,7 +205,9 @@ class SFTTrainer(ABC):
                 # logs/checkpoints/evaluation
                 if step % self.strategy.accumulated_gradient == 0:
                     logs_dict["loss_mean"] = loss_sum / self.strategy.accumulated_gradient
+                    logs_dict["perplexity_mean"] = perplexity_sum / self.strategy.accumulated_gradient
                     loss_sum = 0
+                    perplexity_sum = 0
                     global_step = step // self.strategy.accumulated_gradient
                     client_states = {"consumed_samples": global_step * args.train_batch_size}
                     self.save_logs_and_checkpoints(args, global_step, step_bar, logs_dict, client_states)
@@ -242,6 +256,7 @@ class SFTTrainer(ABC):
         self.model.eval()
         with torch.no_grad():
             loss_sum = 0
+            perplexity_sum = 0
             step_bar = tqdm(
                 range(eval_dataloader.__len__()),
                 desc="Eval stage of steps %d" % steps,
@@ -276,19 +291,28 @@ class SFTTrainer(ABC):
 
                 if not self.pretrain_mode:
                     if self.packing_samples:
-                        index = 0
-                        for input_length, source_len in zip(infos["input_length"], prompt_id_lens):
-                            labels[0][index : index + source_len] = self.loss_fn.IGNORE_INDEX
-                            index += input_length
+                        if infos["response_ranges"]:
+                            dump_labels = torch.full(labels.size(), self.loss_fn.IGNORE_INDEX).to(labels.device)
+                            for response_ranges in infos["response_ranges"]:
+                                for response_range in response_ranges:
+                                    dump_labels[0][response_range[0]: response_range[1]] = labels[0][response_range[0]: response_range[1]]
+                            labels = dump_labels
+                        else:
+                            index = 0
+                            for input_length, source_len in zip(infos["input_length"], prompt_id_lens):
+                                labels[0][index : index + source_len] = self.loss_fn.IGNORE_INDEX
+                                index += input_length
                     else:
                         for label, source_len in zip(labels, prompt_id_lens):
                             label[:source_len] = self.loss_fn.IGNORE_INDEX
 
                 loss = self.loss_fn(output.logits, labels)
+                perplexity = torch.exp(loss)
 
                 times += 1
                 loss_sum += loss.item()
-                bar_dict = {"eval gpt_loss": loss_sum / times}
+                perplexity_sum += perplexity.item()
+                bar_dict = {"eval gpt_loss": loss_sum / times, "eval perplexity": perplexity_sum / times}
                 step_bar.update()
                 logs = self.strategy.all_reduce(bar_dict)
                 step_bar.set_postfix(logs)
