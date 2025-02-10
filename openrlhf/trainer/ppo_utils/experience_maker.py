@@ -527,7 +527,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             return super().generate_samples(all_prompts, for_eval=for_eval, **generate_kwargs)
 
         # vLLM generation
-        samples = self._generate_vllm(all_prompts, for_eval=for_eval, **generate_kwargs)
+        samples = self._generate_vllm(all_prompts, **generate_kwargs)
 
         # vLLM offload when colocate_all_models
         if self.strategy.args.vllm_enable_sleep:

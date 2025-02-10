@@ -11,7 +11,6 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
-from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
 
 
 class DistributedTorchRayActor:
