@@ -39,7 +39,7 @@ class LLMRayActor:
         self.actor_counter = 0
         self.requests = {}
         self.responses = {}
-
+        
         self.llm = LLM(*args, **kwargs)
 
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend, use_ray):
@@ -174,6 +174,8 @@ def create_vllm_engines(
                 gpu_memory_utilization=gpu_memory_utilization,
                 bundle_indices=bundle_indices if shared_pg else None,
                 enable_sleep_mode=vllm_enable_sleep,
+                # swap_space=20,
+                # cpu_offload_gb=20,
             )
         )
 

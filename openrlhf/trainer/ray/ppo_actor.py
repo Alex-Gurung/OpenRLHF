@@ -391,6 +391,7 @@ class ActorModelRayActor(BasePPORole):
         self.eval_prompts_dataloader = strategy.setup_dataloader(
             self.eval_prompts_dataset, args.rollout_batch_size // strategy.world_size, True, False
         )
+        
 
         if args.pretrain_data:
             pretrain_data = blending_datasets(

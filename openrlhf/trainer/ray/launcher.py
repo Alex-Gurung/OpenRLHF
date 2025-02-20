@@ -11,6 +11,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
+from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
 
 
 class DistributedTorchRayActor:
@@ -358,14 +359,14 @@ class PPORayActorGroup:
         # ), "reward_fn must be specified if using multiple reward models"
 
         critic_actors = critic_model_group._actor_handlers if critic_model_group else None
-        initial_actors = initial_model_group._actor_handlers
+        initial_actors = initial_model_group._actor_handlers if initial_model_group else None
 
         refs = []
         # TODO(wuxibin): actor model choose critic/reward/initial model in a
         # round robin fashion, implement more efficient dispatching strategy.
         for i, actor in enumerate(self._actor_handlers):
             critic_actor = critic_actors[i % len(critic_actors)] if critic_actors else None
-            initial_actor = initial_actors[i % len(initial_actors)]
+            initial_actor = initial_actors[i % len(initial_actors)] if initial_actors else None
 
             reward_actors = []
             if not remote_rm_urls and reward_model_groups is not None:

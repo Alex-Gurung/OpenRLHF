@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
-from openrlhf.models.utils import masked_mean
+from openrlhf.models.utils import masked_mean, unpacking_samples, compute_approx_kl
 from openrlhf.utils.distributed_sampler import DistributedSampler
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveExperienceMaker, NaiveReplayBuffer
@@ -183,7 +183,7 @@ class PPOTrainer(ABC):
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
             # wandb.define_metric("eval/global_step")
             wandb.define_metric("eval/*", step_metric="train/global_step", step_sync=True)
-            columns = ["global_step", "prompt", "response", "reward", "raw_reward", "response_length", "total_length"]
+            columns = ["global_step", "prompt", "response", "reward", "raw_reward", "response_length", "total_length", "pct_improvements"]
             # wandb.define_metric("eval/completions_table")
             self.completions_table = wandb.Table(columns=columns)
             self.completions_table_df = pd.DataFrame(columns=columns)
@@ -232,7 +232,7 @@ class PPOTrainer(ABC):
         # Evaluate actor before training
         print("Evaluating actor before training")
         self.evaluate_actor(eval_prompts_dataloader, global_steps=0)
-
+        print("Starting episodes; ", start_episode, args.num_episodes)
         for episode in range(start_episode, args.num_episodes):
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
                 self.prompts_dataloader.sampler.set_epoch(
@@ -244,9 +244,9 @@ class PPOTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
 
-            for rand_prompts in self.prompts_dataloader:
+            for rand_prompts, labels in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, for_eval=False, **self.generate_kwargs)
+                    self.experience_maker.make_experience_list(rand_prompts, labels, for_eval=False, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
@@ -257,11 +257,10 @@ class PPOTrainer(ABC):
                         self.strategy.print(output)
                     self.replay_buffer.append(experience)
 
-                torch.cuda.empty_cache()
-                self.replay_buffer.normalize("advantages", self.strategy)
+                if self.args.advantage_estimator != "group_norm":
+                    self.replay_buffer.normalize("advantages", self.strategy)
                 status = self.ppo_train(steps)
                 self.replay_buffer.clear()
-                torch.cuda.empty_cache()
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
@@ -280,6 +279,7 @@ class PPOTrainer(ABC):
             self._tensorboard.close()
 
     def ppo_train(self, global_steps=0):
+        torch.cuda.empty_cache()
         # replay buffer may be empty at first, we should rebuild at each training
         dataloader = DataLoader(
             self.replay_buffer,
@@ -341,6 +341,7 @@ class PPOTrainer(ABC):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
+        torch.cuda.empty_cache()
         return status_mean
 
     def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:
@@ -364,6 +365,8 @@ class PPOTrainer(ABC):
             attention_mask = torch.cat(
                 [torch.full_like(s, i + 1) for i, s in enumerate(experience.sequences)], dim=0
             ).unsqueeze(0)
+            if self.args.use_kl_loss:
+                base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
         else:
             sequences = experience.sequences
             old_action_log_probs = experience.action_log_probs
@@ -371,6 +374,8 @@ class PPOTrainer(ABC):
             num_actions = experience.action_mask.size(1)
             packed_seq_lens = None
             attention_mask = experience.attention_mask
+            if self.args.use_kl_loss:
+                base_action_log_probs = experience.base_action_log_probs
 
         # actor loss
         action_log_probs, output = self.actor(
@@ -388,12 +393,38 @@ class PPOTrainer(ABC):
             advantages,
             action_mask=experience.action_mask,
         )
+
+        if self.args.use_kl_loss:
+            if self.initial_model is not None:
+                kl = compute_approx_kl(
+                    action_log_probs,
+                    base_action_log_probs,
+                    experience.action_mask,
+                    use_kl_estimator_k3 = self.args.use_kl_estimator_k3,
+                )
+            else:
+                kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device = action_log_probs.device)
+
+            if not self.args.packing_samples:
+                kl_mean = masked_mean(kl, experience.action_mask, dim=-1)
+            else:
+                # convert tensor into list of tensors so that it's easier to manipulate
+                # within dataset.
+
+                kl = unpacking_samples(kl, num_actions)
+                kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device = action_log_probs.device)
+
+            kl_loss = kl_mean.mean()
+            experience.info["kl"] = kl_loss.item()
+        else:
+            kl_loss = 0
+
         # mixtral
         if self.aux_loss:
             aux_loss = output.aux_loss
         else:
             aux_loss = 0
-        loss = actor_loss + aux_loss * self.args.aux_loss_coef
+        loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
         self.strategy.backward(loss, self.actor, self.actor_optim)
 
         # ptx loss
@@ -560,6 +591,7 @@ class PPOTrainer(ABC):
             rewards = []
             raw_rewards = []
             total_experience_list = []
+            pct_improvements = []
             print("Iterating through eval prompts")
             for rand_prompts in eval_prompts_dataloader:
                 print(f"step: {steps}")
@@ -576,38 +608,52 @@ class PPOTrainer(ABC):
                     for i in range(num_rewards):
                         rewards.append(experience.info["reward"][i].item())
                         raw_rewards.append(experience.info["raw_reward"][i].item())
-
+                        pct_improvements.append(experience.info["pct_improvements"][i].item())
                 pbar.update()
                 steps = steps + 1
                 total_experience_list.extend([exp for exp in cur_experience_list])
             print("Done iterating through eval prompts")
             # Aggregate metrics
+            # logs = {
+            #     "eval_raw_reward": sum(raw_rewards) / len(raw_rewards) if len(raw_rewards) > 0 else 0,
+            #     "eval_reward": sum(rewards) / len(rewards) if len(rewards) > 0 else 0,
+            # }
             sum_logs = {
                 "eval_raw_reward": sum(raw_rewards),
                 "eval_reward": sum(rewards),
+                "eval_pct_improvements": sum(pct_improvements),
                 "eval_num_prompts": len(raw_rewards),
                 "eval_response_length": sum([experience.info["response_length"] for experience in total_experience_list]),
             }
             
+            # print("all_reduce")
+            # logs = self.strategy.all_reduce(logs)
             logs = self.strategy.all_reduce(sum_logs, op="sum")
             print(f"logs: {logs}")
             
             logs = {
-                "eval_raw_reward": logs["eval_raw_reward"] / logs["eval_num_prompts"],
-                "eval_reward": logs["eval_reward"] / logs["eval_num_prompts"],
-                "eval_response_length": logs["eval_response_length"] / logs["eval_num_prompts"],
+                "eval_raw_reward": logs["eval_raw_reward"] / logs["eval_num_prompts"] if logs["eval_num_prompts"] > 0 else 0,
+                "eval_reward": logs["eval_reward"] / logs["eval_num_prompts"] if logs["eval_num_prompts"] > 0 else 0,
+                "eval_response_length": logs["eval_response_length"] / logs["eval_num_prompts"] if logs["eval_num_prompts"] > 0 else 0,
+                "eval_pct_improvements": logs["eval_pct_improvements"] / logs["eval_num_prompts"] if logs["eval_num_prompts"] > 0 else 0,
             }
             
             # print('pre table data')
             table_data = {
                 "reward": torch.tensor([experience.info["reward"] for experience in total_experience_list]),
                 "raw_reward": torch.tensor([experience.info["raw_reward"] for experience in total_experience_list]),
+                "pct_improvements": torch.tensor([experience.info["pct_improvements"] for experience in total_experience_list]),
                 "response_length": torch.tensor([experience.info["response_length"] for experience in total_experience_list]),
                 "total_length": torch.tensor([experience.info["total_length"] for experience in total_experience_list]),
                 "sequences": torch.stack([experience.sequences.squeeze()[-1024:] for experience in total_experience_list])
             }
             print(f"pre gather table_data: {table_data}")
             
+            # sequences might be too 
+            
+            # print({k:(v.shape, v.dtype, v.device) for k, v in table_data.items()})
+            
+            # print("all_gather")
             all_table_data = self.strategy.all_gather(table_data)
             print(f"post gather table_data: {all_table_data}")
             if self.strategy.is_rank_0():
@@ -623,7 +669,7 @@ class PPOTrainer(ABC):
     def _experience_list_to_table(self, table_data: Dict[str, List[float]], global_steps: int):
         data_to_log = {}
 
-        for column in ["reward", "raw_reward", "response_length", "total_length"]:
+        for column in ["reward", "raw_reward", "response_length", "total_length", "pct_improvements"]:
             data_to_log[column] = table_data[column]
         print(data_to_log)
         prompts = []
