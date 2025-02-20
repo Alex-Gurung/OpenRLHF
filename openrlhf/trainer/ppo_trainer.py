@@ -582,10 +582,6 @@ class PPOTrainer(ABC):
                 total_experience_list.extend([exp for exp in cur_experience_list])
             print("Done iterating through eval prompts")
             # Aggregate metrics
-            # logs = {
-            #     "eval_raw_reward": sum(raw_rewards) / len(raw_rewards) if len(raw_rewards) > 0 else 0,
-            #     "eval_reward": sum(rewards) / len(rewards) if len(rewards) > 0 else 0,
-            # }
             sum_logs = {
                 "eval_raw_reward": sum(raw_rewards),
                 "eval_reward": sum(rewards),
@@ -593,8 +589,6 @@ class PPOTrainer(ABC):
                 "eval_response_length": sum([experience.info["response_length"] for experience in total_experience_list]),
             }
             
-            # print("all_reduce")
-            # logs = self.strategy.all_reduce(logs)
             logs = self.strategy.all_reduce(sum_logs, op="sum")
             print(f"logs: {logs}")
             
@@ -614,11 +608,6 @@ class PPOTrainer(ABC):
             }
             print(f"pre gather table_data: {table_data}")
             
-            # sequences might be too 
-            
-            # print({k:(v.shape, v.dtype, v.device) for k, v in table_data.items()})
-            
-            # print("all_gather")
             all_table_data = self.strategy.all_gather(table_data)
             print(f"post gather table_data: {all_table_data}")
             if self.strategy.is_rank_0():
