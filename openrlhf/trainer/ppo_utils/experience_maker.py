@@ -39,7 +39,6 @@ class Experience:
     sequences: (B, S)
     action_log_probs: (B, A)
     base_action_log_probs: (B, A)
-    base_action_log_probs: (B, A)
     values: (B, A)
     returns: (B, A)
     advantages: (B, A)
@@ -52,7 +51,6 @@ class Experience:
 
     sequences: torch.Tensor
     action_log_probs: torch.Tensor
-    base_action_log_probs: torch.Tensor
     base_action_log_probs: torch.Tensor
     values: torch.Tensor
     returns: Optional[torch.Tensor]
@@ -67,7 +65,6 @@ class Experience:
         self.sequences = to(self.sequences, device)
         self.action_log_probs = to(self.action_log_probs, device)
         self.base_action_log_probs = to(self.base_action_log_probs, device)
-        self.base_action_log_probs = to(self.base_action_log_probs, device)
         self.returns = to(self.returns, device)
         self.advantages = to(self.advantages, device)
         self.values = to(self.values, device)
@@ -80,7 +77,6 @@ class Experience:
     def pin_memory(self):
         self.sequences = pin_memory(self.sequences)
         self.action_log_probs = pin_memory(self.action_log_probs)
-        self.base_action_log_probs = pin_memory(self.base_action_log_probs)
         self.base_action_log_probs = pin_memory(self.base_action_log_probs)
         self.returns = pin_memory(self.returns)
         self.advantages = pin_memory(self.advantages)
@@ -124,7 +120,6 @@ class Samples:
     total_length: torch.Tensor
     prompts: list[str]
     labels: list[str]
-    labels: list[str]
 
 
 class NaiveExperienceMaker(ABC):
@@ -162,7 +157,6 @@ class NaiveExperienceMaker(ABC):
         # custom reward func for reinforced finetuning
         self.custom_reward_func = None
         if remote_rm_url and remote_rm_url[0].endswith(".py"):
-            print(f"Loading custom `reward_func(queries, prompts, labels)` from {remote_rm_url[0]}")
             print(f"Loading custom `reward_func(queries, prompts, labels)` from {remote_rm_url[0]}")
             import importlib.util
 
@@ -288,7 +282,6 @@ class NaiveExperienceMaker(ABC):
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             prompts = all_prompts[i : i + args.micro_rollout_batch_size]
             labels = all_labels[i : i + args.micro_rollout_batch_size]
-            labels = all_labels[i : i + args.micro_rollout_batch_size]
             inputs = self.tokenize_fn(prompts, self.prompt_max_len, device="cuda")
             sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
             samples = Samples(
@@ -301,7 +294,6 @@ class NaiveExperienceMaker(ABC):
                 total_length=attention_mask.float().sum(dim=-1),
                 prompts=prompts,
                 labels=labels,
-                labels=labels,
             )
             samples_list.append(samples)
         return samples_list
@@ -312,8 +304,6 @@ class NaiveExperienceMaker(ABC):
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
         self.actor.eval()
-        if self.initial_model is not None:
-            self.initial_model.eval()
         if self.initial_model is not None:
             self.initial_model.eval()
         if self.reward_model is not None:
@@ -394,7 +384,6 @@ class NaiveExperienceMaker(ABC):
             sequences,
             action_log_probs,
             base_action_log_probs,
-            base_action_log_probs,
             value,
             None,
             None,
@@ -414,7 +403,6 @@ class NaiveExperienceMaker(ABC):
         - rewards: List of rewards
         """
         args = self.strategy.args
-        # reward shaping for rloo and reinforce_baseline
         # reward shaping for rloo and reinforce_baseline
         if args.advantage_estimator == "rloo":
             rewards = torch.cat([experience.info["reward"] for experience in experiences])
@@ -636,10 +624,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
             base_action_log_probs_ref = self.initial_model.forward.remote(
                 sequences_cpu, num_actions, attention_mask_cpu, packed_seq_lens=packed_seq_lens
             )
-        if self.initial_model is not None:
-            base_action_log_probs_ref = self.initial_model.forward.remote(
-                sequences_cpu, num_actions, attention_mask_cpu, packed_seq_lens=packed_seq_lens
-            )
 
             if args.colocate_actor_ref or args.colocate_all_models:
                 ray.get([base_action_log_probs_ref])
@@ -704,8 +688,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         base_action_log_probs, value, rewards = ref_values[0], ref_values[1], ref_values[2:]
         if base_action_log_probs is not None:
             base_action_log_probs = base_action_log_probs.to(device)
-        if base_action_log_probs is not None:
-            base_action_log_probs = base_action_log_probs.to(device)
         if value is not None:
             value = value.to(device)
         rewards = [r.to(device) for r in rewards]
@@ -723,19 +705,10 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 action_log_probs,
                 base_action_log_probs,
                 action_mask=action_mask,
-                use_kl_estimator_k3=args.use_kl_estimator_k3,
+                use_kl_estimator_k3=self.strategy.args.use_kl_estimator_k3,
             )
         else:
-            kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=device)
-        if (self.initial_model is not None) and (not args.use_kl_loss):
-            kl = compute_approx_kl(
-                action_log_probs,
-                base_action_log_probs,
-                action_mask=action_mask,
-                use_kl_estimator_k3=args.use_kl_estimator_k3,
-            )
-        else:
-            kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=device)
+            kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
 
         if not self.packing_samples:
             kl_mean = masked_mean(kl, action_mask, dim=-1)
@@ -749,14 +722,9 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 value = unpacking_samples(value, num_actions)
             if base_action_log_probs is not None:
                 base_action_log_probs = unpacking_samples(base_action_log_probs, num_actions)
-            if base_action_log_probs is not None:
-                base_action_log_probs = unpacking_samples(base_action_log_probs, num_actions)
 
             kl = unpacking_samples(kl, num_actions)
             kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device=device)
-        
-        if not args.use_kl_loss:
-            base_action_log_probs = None
         
         if not args.use_kl_loss:
             base_action_log_probs = None
@@ -776,7 +744,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         experience = Experience(
             sequences,
             action_log_probs,
-            base_action_log_probs,
             base_action_log_probs,
             value,
             None,
@@ -848,7 +815,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         for i in range(0, len(all_outputs), args.micro_rollout_batch_size):
             outputs = all_outputs[i : i + self.strategy.args.micro_rollout_batch_size]
             prompts = all_prompts[i : i + self.strategy.args.micro_rollout_batch_size]
-            labels = all_labels[i : i + self.strategy.args.micro_rollout_batch_size]
             labels = all_labels[i : i + self.strategy.args.micro_rollout_batch_size]
             if not self.packing_samples:
                 # NOTE: concat all outputs to following format:

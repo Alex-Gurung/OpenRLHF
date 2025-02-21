@@ -246,7 +246,7 @@ class PPOTrainer(ABC):
 
             for rand_prompts, labels in self.prompts_dataloader:
                 for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, **self.generate_kwargs)
+                    self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
                 ):
                     if i == 0:
                         output = self.tokenizer.batch_decode(
@@ -593,9 +593,9 @@ class PPOTrainer(ABC):
             total_experience_list = []
             pct_improvements = []
             print("Iterating through eval prompts")
-            for rand_prompts in eval_prompts_dataloader:
+            for rand_prompts, labels in eval_prompts_dataloader:
                 print(f"step: {steps}")
-                cur_experience_list = self.experience_maker.make_experience_list(rand_prompts, for_eval=True, **self.generate_kwargs)
+                cur_experience_list = self.experience_maker.make_experience_list(rand_prompts, labels, for_eval=True, **self.generate_kwargs)
                 for i, experience in enumerate(
                     cur_experience_list
                 ):
