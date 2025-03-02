@@ -5,6 +5,7 @@ from typing import Callable, Dict, List, Optional, Type
 
 import ray
 import torch
+import torch.distributed as dist
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -159,6 +160,7 @@ class ReferenceModelRayActor(BasePPORole):
         num_actions: int = None,
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
+        logps_allgather=False,
         packed_seq_lens: Optional[list[int]] = None,
         labels: Optional[torch.Tensor] = None,
         return_loss: bool = False
@@ -170,6 +172,8 @@ class ReferenceModelRayActor(BasePPORole):
                 num_actions,
                 attention_mask.to(device) if attention_mask is not None else None,
                 return_output=return_output,
+                ring_attn_group=self.strategy.ring_attn_group,
+                logps_allgather=logps_allgather,
                 packed_seq_lens=packed_seq_lens,
                 labels=labels,
                 return_loss=return_loss
@@ -219,11 +223,11 @@ class RewardModelRayActor(BasePPORole):
         self.model.eval()
 
     def forward(
-        self, sequences: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None, packed_seq_lens=None
+        self, sequences: torch.LongTensor, attention_mask: Optional[torch.Tensor] = None, packed_seq_lens=None, pad_sequence=False
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
-            reward = self.model(sequences.to(device), attention_mask.to(device), packed_seq_lens=packed_seq_lens)
+            reward = self.model(sequences.to(device), attention_mask.to(device), ring_attn_group=self.strategy.ring_attn_group, pad_sequence=True, packed_seq_lens=packed_seq_lens)
         return reward.to("cpu")
 
     def empty_cache(self) -> None:
