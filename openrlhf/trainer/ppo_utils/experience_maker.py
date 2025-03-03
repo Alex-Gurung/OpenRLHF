@@ -203,6 +203,15 @@ class NaiveExperienceMaker(ABC):
         args = self.strategy.args
         print("Generating samples")
         s = time.time()
+
+        # vLLM wakeup when vllm_enable_sleep
+        if self.strategy.args.vllm_enable_sleep:
+            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+
+            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+
         # generate responses
         if self.strategy.ring_attn_group is not None:
             # Only rank 0 in the ring attention group executes the generation function, and then broadcasts it to all other ranks.
@@ -219,7 +228,13 @@ class NaiveExperienceMaker(ABC):
                 )
         else:
             samples_list = self.generate_samples(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
+
+        # vLLM offload when vllm_enable_sleep
+        if self.strategy.args.vllm_enable_sleep:
+            batch_vllm_engine_call(self.vllm_engines, "sleep")
+
         torch.distributed.barrier()
+        torch.cuda.synchronize()
         e = time.time()
         print(f"Time taken to generate {len(samples_list)} samples: {e - s} seconds")
     
@@ -601,12 +616,6 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         When not using vllm, we will fallback to the default implementation,
         in which actor will be used to generate samples.
         """
-        from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-
-        # vLLM wakeup when vllm_enable_sleep
-        if self.strategy.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "wake_up")
-
         if self.vllm_engines is None:
             return super().generate_samples(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
 
