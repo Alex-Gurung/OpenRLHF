@@ -721,6 +721,8 @@ class PPOTrainer(ABC):
 
         for column in ["reward", "raw_reward", "response_length", "total_length", "pct_improvements"]:
             data_to_log[column] = table_data[column]
+            if type(data_to_log[column]) == torch.Tensor:
+                data_to_log[column] = data_to_log[column].flatten().cpu()
         print(data_to_log)
         prompts = []
         responses = []
@@ -748,7 +750,7 @@ class PPOTrainer(ABC):
         data_to_log["prompt"] = prompts
         data_to_log["response"] = responses
         data_to_log["global_step"] = [global_steps] * len(prompts)
-        
+            
         table = pd.DataFrame(data_to_log)
         
         print("logging table...")
