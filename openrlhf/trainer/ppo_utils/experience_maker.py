@@ -328,6 +328,7 @@ class NaiveExperienceMaker(ABC):
                 total_length=attention_mask.float().sum(dim=-1),
                 prompts=prompts,
                 labels=labels,
+                pad_len=None,
             )
             samples_list.append(samples)
         return samples_list
@@ -860,6 +861,8 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         # Make sure all requests are sent.
         if self.strategy.ring_attn_group is None:
             torch.distributed.barrier()
+        else:
+            time.sleep(3)
 
         # Retrieve and combine results from all outputs
         all_output_refs = []

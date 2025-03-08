@@ -3,9 +3,10 @@ import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.nn import functional as F
+from flash_attn.utils.distributed import all_gather
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
+from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from flash_attn.utils.distributed import all_gather
