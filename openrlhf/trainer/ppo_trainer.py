@@ -640,7 +640,6 @@ class PPOTrainer(ABC):
                 for i, experience in enumerate(
                     cur_experience_list
                 ):
-                    print(f"i: {i}")
                     self.actor.eval()
                     if self.critic is not None:
                         self.critic.eval()
