@@ -61,6 +61,7 @@ class DeepspeedStrategy(ABC):
         self.grad_accum_dtype = getattr(args, "grad_accum_dtype", None)
         # overlap_comm
         self.overlap_comm = getattr(args, "overlap_comm", False)
+        self.torch_compile = getattr(args, "torch_compile", False)
 
         self.is_rlhf = False
         self.time_steps = defaultdict(int)
@@ -215,6 +216,8 @@ class DeepspeedStrategy(ABC):
             args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
             dist_init_required=True,
         )
+        if self.torch_compile:
+            engine.compile()
         if is_actor:
             model.model = engine
         else:
@@ -256,6 +259,8 @@ class DeepspeedStrategy(ABC):
             config=ds_config,
             dist_init_required=True,
         )
+        if self.torch_compile:
+            engine.compile()
         if is_actor:
             model.model = engine
         else:
