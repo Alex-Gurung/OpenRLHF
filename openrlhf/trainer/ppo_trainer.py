@@ -9,6 +9,8 @@ from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveReplayBuffer
 import pandas as pd
+from openrlhf.utils.distributed_sampler import DistributedSampler
+from tqdm import tqdm
 
 class BasePPOTrainer(ABC):
     """

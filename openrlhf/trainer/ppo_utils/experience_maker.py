@@ -293,7 +293,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def make_experience(self, rollout_samples: Samples, for_eval:bool=False) -> List[Experience]:
+    def make_experience(self, rollout_samples: Samples) -> List[Experience]:
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
@@ -645,7 +645,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
 
     @torch.no_grad()
     def make_experience_list(
-        self, all_prompts: Union[str, List[str]], all_labels, **generate_kwargs
+        self, all_prompts: Union[str, List[str]], all_labels, for_eval:bool=False, **generate_kwargs
     ) -> List[Experience]:
         if self.strategy.args.perf:
             self.perf_stats = {
@@ -653,7 +653,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
                 "actor_value_rm_time": 0,
                 "wait_time": 0,
             }
-        experiences = super().make_experience_list(all_prompts, all_labels, **generate_kwargs)
+        experiences = super().make_experience_list(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
         if self.critic is not None:
             for experience in experiences:
                 # send experience to critic
@@ -663,7 +663,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
+    def generate_samples(self, all_prompts: List[str], all_labels, for_eval:bool=False, **generate_kwargs) -> List[Samples]:
         """
         Generate samples and return in batches.
 
@@ -671,13 +671,13 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         in which actor will be used to generate samples.
         """
         if self.vllm_engines is None:
-            return self._generate_with_hf(all_prompts, all_labels, **generate_kwargs)
+            return self._generate_with_hf(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
 
         # vLLM generation
-        return self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
+        return self._generate_vllm(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
 
     @torch.no_grad()
-    def _generate_with_hf(self, all_prompts: List[str], all_labels, **generate_kwargs) -> Samples:
+    def _generate_with_hf(self, all_prompts: List[str], all_labels, for_eval:bool=False, **generate_kwargs) -> Samples:
         """
         Generate samples and return in batches.
         """
@@ -685,8 +685,9 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         args = self.strategy.args
         self.actor.eval()
         # sample multiple response
-        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
+        num_responses = args.n_samples_per_prompt if not for_eval else 1
+        all_prompts = sum([[prompt] * num_responses for prompt in all_prompts], [])
+        all_labels = sum([[label] * num_responses for label in all_labels], [])
         rollout_sequences = []
         rollout_attention_mask = []
         rollout_action_mask = []
@@ -711,7 +712,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         )
         return rollout_samples
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> Samples:
+    def _generate_vllm(self, all_prompts: List[str], all_labels, for_eval:bool=False, **kwargs) -> Samples:
         from vllm import SamplingParams
 
         # round-robin load balance
