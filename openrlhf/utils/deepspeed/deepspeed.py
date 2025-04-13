@@ -1,5 +1,4 @@
 import os
-import random
 import shutil
 from abc import ABC
 from collections import defaultdict
@@ -7,10 +6,11 @@ from datetime import timedelta
 from typing import List, Tuple, Union
 
 import deepspeed
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import transformers
+import transformers.modeling_flash_attention_utils
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 from peft import PeftModel, get_peft_model_state_dict
 from torch import distributed as dist
@@ -40,6 +40,7 @@ class DeepspeedStrategy(ABC):
     def __init__(
         self,
         seed: int = 42,
+        full_determinism: bool = False,
         max_norm: float = 0.0,
         micro_train_batch_size=1,
         train_batch_size=1,
@@ -55,6 +56,7 @@ class DeepspeedStrategy(ABC):
         self.micro_train_batch_size = micro_train_batch_size
         self.bf16 = bf16
         self.seed = seed
+        self.full_determinism = full_determinism
         self.max_norm = max_norm
         self.adam_offload = getattr(args, "adam_offload", False)
         self.zpg = getattr(args, "zpg", 1)
@@ -62,18 +64,19 @@ class DeepspeedStrategy(ABC):
         # overlap_comm
         self.overlap_comm = getattr(args, "overlap_comm", False)
         self.torch_compile = getattr(args, "torch_compile", False)
+        self.use_ds_universal_ckpt = getattr(args, "use_ds_universal_ckpt", False)
 
         self.is_rlhf = False
         self.time_steps = defaultdict(int)
 
-    def set_seed(self, seed: int) -> None:
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
     def setup_distributed(self, timeout=timedelta(minutes=60)) -> None:
-        self.set_seed(self.seed)
+        if self.full_determinism:
+            transformers.enable_full_determinism(self.seed)
+            # Use deterministic backward in flash attention as, by default, flash attention uses atomic adds
+            # https://github.com/Dao-AILab/flash-attention/commit/732654583c2e640adc012ecb60e460bf19dcd9e3
+            transformers.modeling_flash_attention_utils.deterministic_g = True
+        else:
+            transformers.set_seed(self.seed)
 
         # Take the local rank from args as first priority
         if self.args.local_rank != -1:
@@ -236,6 +239,7 @@ class DeepspeedStrategy(ABC):
             zpg=self.zpg,
             grad_accum_dtype=self.grad_accum_dtype,
             overlap_comm=self.overlap_comm,
+            use_ds_universal_ckpt=self.use_ds_universal_ckpt,
         )
 
         ds_config["train_micro_batch_size_per_gpu"] = self.micro_train_batch_size
@@ -370,6 +374,8 @@ class DeepspeedStrategy(ABC):
                 for filename in os.listdir(train_from_model_path):
                     if filename.endswith(".py"):
                         shutil.copy(os.path.join(train_from_model_path, filename), os.path.join(output_dir, filename))
+        dist.barrier()
+        torch.cuda.synchronize()
 
     def all_reduce(self, data, op="mean"):
         assert op in ("mean", "max", "sum")

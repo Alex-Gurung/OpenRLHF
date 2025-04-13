@@ -141,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
+    parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
 
     # DeepSpeed
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
@@ -149,6 +150,12 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
     parser.add_argument("--torch_compile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--full_determinism",
+        action="store_true",
+        default=False,
+        help="Enable reproducible behavior during distributed training",
+    )
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
     parser.add_argument("--zero_stage", type=int, default=2, help="DeepSpeed ZeRO stage")
@@ -214,10 +221,10 @@ if __name__ == "__main__":
     # TensorBoard parameters
     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")
 
-    args = parser.parse_args()
-
     # ModelScope parameters
     parser.add_argument("--use_ms", action="store_true", default=False)
+
+    args = parser.parse_args()
 
     if args.input_template and "{}" not in args.input_template:
         print("[Warning] {} not in args.input_template, set to None")

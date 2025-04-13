@@ -96,7 +96,7 @@ def train(args):
         args.micro_train_batch_size,
         True,
         True,
-        train_dataset.packing_collate_fn if args.packing_samples else train_dataset.collate_fn,
+        train_dataset.collate_fn,
     )
 
     eval_dataloader = strategy.setup_dataloader(
@@ -104,7 +104,7 @@ def train(args):
         args.micro_train_batch_size,
         True,
         False,
-        eval_dataset.packing_collate_fn if args.packing_samples else eval_dataset.collate_fn,
+        eval_dataset.collate_fn,
     )
 
     # scheduler
@@ -167,6 +167,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_dpo")
     parser.add_argument("--max_ckpt_num", type=int, default=3)
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
+    parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
 
     # DeepSpeed
     parser.add_argument("--micro_train_batch_size", type=int, default=8, help="batch size per GPU")
@@ -176,6 +177,12 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
     parser.add_argument("--torch_compile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--full_determinism",
+        action="store_true",
+        default=False,
+        help="Enable reproducible behavior during distributed training",
+    )
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1, help="local_rank for deepspeed")
     parser.add_argument("--zero_stage", type=int, default=2, help="DeepSpeed ZeRO stage")

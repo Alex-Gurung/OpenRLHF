@@ -22,6 +22,7 @@ def get_strategy(args):
 
     strategy = DeepspeedStrategy(
         seed=getattr(args, "seed", 42),
+        full_determinism=getattr(args, "full_determinism", False),
         max_norm=getattr(args, "max_norm", 1.0),
         micro_train_batch_size=getattr(args, "micro_train_batch_size", 1),
         train_batch_size=getattr(args, "train_batch_size", 128),
@@ -81,6 +82,11 @@ def blending_datasets(
                 data = load_dataset(dataset, data_dir=data_dir)
                 strategy.print(f"loaded {dataset} from files")
         # remote/local folder or common file
+        elif strategy.args.use_ms:
+            from modelscope.msdatasets import MsDataset
+
+            namespace, dataset = dataset.split("/")
+            data = MsDataset.load(dataset, namespace=namespace)
         else:
             data = load_dataset(dataset, data_dir=data_dir)
             strategy.print(f"loaded {dataset} from files")
