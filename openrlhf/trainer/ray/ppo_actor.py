@@ -41,6 +41,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         vllm_engines: List = None,
         remote_rm_url: List[str] = None,
         critic_train_remote: bool = False,
+        remote_experience_maker_class=RemoteExperienceMaker,
         **kwargs,
     ):
         """PPOTrainer for ray.
@@ -85,7 +86,7 @@ class ActorPPOTrainer(BasePPOTrainer):
             log_dir = os.path.join(self.strategy.args.use_tensorboard, self.strategy.args.wandb_run_name)
             self._tensorboard = SummaryWriter(log_dir=log_dir)
 
-        self.experience_maker = RemoteExperienceMaker(
+        self.experience_maker = remote_experience_maker_class(
             self.actor,
             self.critic,
             self.reward_model,
@@ -897,6 +898,7 @@ class ActorModelRayActor(BasePPORole):
         reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
         vllm_engines: List[ray.actor.ActorHandle] = None,
         critic_train_remote: bool = False,
+        remote_experience_maker_class=RemoteExperienceMaker,
     ):
         """Train actor model with prompt datasets."""
         strategy = self.strategy
@@ -943,6 +945,7 @@ class ActorModelRayActor(BasePPORole):
             eos_token_id=self.tokenizer.eos_token_id,
             save_hf_ckpt=args.save_hf_ckpt,
             disable_ds_ckpt=args.disable_ds_ckpt,
+            remote_experience_maker_class=remote_experience_maker_class,
         )
 
         # broadcast checkpoint

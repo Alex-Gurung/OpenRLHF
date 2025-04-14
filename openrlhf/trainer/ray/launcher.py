@@ -10,6 +10,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from tqdm import tqdm
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
+from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 
@@ -294,6 +295,7 @@ class PPORayActorGroup:
         remote_rm_urls: List[str] = None,
         reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
         vllm_engines: List = None,
+        remote_experience_maker_class = RemoteExperienceMaker,
     ):
         """Train actor model.
 
@@ -340,6 +342,7 @@ class PPORayActorGroup:
                     vllm_engines=vllm_engines,
                     # whether this actor should triger corresponding critic model training
                     critic_train_remote=(i < len(critic_actors)) if critic_actor else None,
+                    remote_experience_maker_class=remote_experience_maker_class,
                 )
             )
 
