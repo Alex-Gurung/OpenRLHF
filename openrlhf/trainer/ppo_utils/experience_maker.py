@@ -197,6 +197,8 @@ class BaseExperienceMaker(ABC):
             ring_rank0 = [i * self.strategy.ring_attn_size for i in range(world_size // self.strategy.ring_attn_size)]
             self.ring_rank0_group = dist.new_group(ranks=ring_rank0)
 
+        # there can also be reward functions tied to this experience maker
+        self.class_reward_fn = None
         # custom reward func for reinforced finetuning
         self.custom_reward_func = None
         remote_rm_url = [remote_rm_url] if isinstance(remote_rm_url, str) else remote_rm_url
@@ -369,8 +371,9 @@ class RemoteExperienceMaker(BaseExperienceMaker):
                 queries_list = sum(
                     [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in sequences_cpu_list], []
                 )
-
-                if self.custom_reward_func:
+                if self.class_reward_fn:
+                    r = self.class_reward_fn.remote(queries_list, prompts_list, labels_list)
+                elif self.custom_reward_func:
                     r = self.custom_reward_func.remote(queries_list, prompts_list, labels_list)
                 else:
                     rank = torch.distributed.get_rank() // self.strategy.ring_attn_size

@@ -629,7 +629,9 @@ class ActorPPOTrainer(BasePPOTrainer):
                 all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
 
                 # Calculate rewards
-                if self.experience_maker.custom_reward_func:
+                if self.experience_maker.class_reward_fn:
+                    rewards = self.experience_maker.class_reward_fn.remote(queries, all_prompts, all_labels)
+                elif self.experience_maker.custom_reward_func:
                     rewards = self.experience_maker.custom_reward_func.remote(queries, all_prompts, all_labels)
                 else:
                     rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
