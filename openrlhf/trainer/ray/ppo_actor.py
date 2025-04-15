@@ -77,6 +77,7 @@ class ActorPPOTrainer(BasePPOTrainer):
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
             wandb.define_metric("eval/epoch")
             wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+            self.completions_table = wandb.Table(columns=["step", "response", "reward"])
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
@@ -194,7 +195,10 @@ class ActorPPOTrainer(BasePPOTrainer):
         steps = consumed_samples // args.rollout_batch_size + 1
         start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-
+        
+        # do initial evaluate
+        self.evaluate(self.eval_dataloader, 0, args.eval_temperature, args.eval_n_samples_per_prompt)
+        
         for episode in range(start_episode, args.num_episodes):
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
                 self.prompts_dataloader.sampler.set_epoch(
@@ -621,7 +625,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                 generate_kwargs = self.generate_kwargs.copy()
                 generate_kwargs["temperature"] = temperature
                 generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
-                samples = self.experience_maker.generate_samples(all_prompts, all_labels, **generate_kwargs)
+                samples = self.experience_maker.generate_samples(all_prompts, all_labels, for_eval=True, **generate_kwargs)
                 queries = [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in samples.sequences]
 
                 # duplicate prompts and labels for each sample
@@ -630,14 +634,15 @@ class ActorPPOTrainer(BasePPOTrainer):
 
                 # Calculate rewards
                 if self.experience_maker.class_reward_fn:
-                    rewards = self.experience_maker.class_reward_fn.remote(queries, all_prompts, all_labels)
-                elif self.experience_maker.custom_reward_func:
-                    rewards = self.experience_maker.custom_reward_func.remote(queries, all_prompts, all_labels)
+                    rewards = self.experience_maker.class_reward_fn(samples.sequences, all_prompts, all_labels)
                 else:
-                    rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
-                    rm = self.remote_rm_url[rank % len(self.remote_rm_url)]
-                    rewards = remote_rm_fn_ray.remote(rm, queries=queries, prompts=all_prompts, labels=all_labels)
-                rewards = ray.get(rewards)
+                    if self.experience_maker.custom_reward_func:
+                        rewards = self.experience_maker.custom_reward_func.remote(queries, all_prompts, all_labels)
+                    else:
+                        rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
+                        rm = self.remote_rm_url[rank % len(self.remote_rm_url)]
+                        rewards = remote_rm_fn_ray.remote(rm, queries=queries, prompts=all_prompts, labels=all_labels)
+                    rewards = ray.get(rewards)
 
                 # Reshape rewards to (num_prompts, n_samples_per_prompt)
                 rewards = rewards.reshape(-1, n_samples_per_prompt)
@@ -654,6 +659,13 @@ class ActorPPOTrainer(BasePPOTrainer):
                     local_metrics[datasource][f"pass{n_samples_per_prompt}"] += prompt_rewards.max().float().item()
                     local_metrics[datasource]["pass1"] += prompt_rewards.mean().float().item()
                     local_metrics[datasource]["count"] += 1
+                    # query = queries[i]
+                    resp_sequences = samples.sequences[i]
+                    eos_positions = (resp_sequences == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+                    assistant_start_idx = eos_positions[-2] + 2
+                    decoded_sequence = self.tokenizer.decode(resp_sequences[assistant_start_idx:], skip_special_tokens=True)
+                    
+                    local_metrics[datasource]["resp_seq"] = decoded_sequence
 
                 # All gather metrics from all ranks
                 gathered_metrics = [None] * (self.strategy.world_size // self.strategy.ring_attn_size)
@@ -667,6 +679,8 @@ class ActorPPOTrainer(BasePPOTrainer):
 
                 # Only rank0 processes the gathered metrics
                 if self.strategy.is_rank_0():
+                    # Add completions to wandb table
+                    rows = []
                     # Combine metrics from all ranks
                     global_metrics = {}
                     for rank_metrics in gathered_metrics:
@@ -678,6 +692,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                             ]
                             global_metrics[datasource]["pass1"] += metrics["pass1"]
                             global_metrics[datasource]["count"] += metrics["count"]
+                            rows.append([global_step, metrics["resp_seq"], metrics["pass1"]])
 
                     # Calculate global averages
                     logs = {}
@@ -691,6 +706,9 @@ class ActorPPOTrainer(BasePPOTrainer):
                     if self._wandb is not None:
                         logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": global_step}.items()}
                         self._wandb.log(logs)
+                        self._wandb.log({"eval/completions_table": self.completions_table})
+                        for row in rows:
+                            self.completions_table.add_data(*row)
                     elif self._tensorboard is not None:
                         for k, v in logs.items():
                             self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
@@ -840,6 +858,7 @@ class ActorModelRayActor(BasePPORole):
                 args.eval_dataset,
                 None,  # No probability sampling for eval datasets
                 strategy,
+                dataset_split=getattr(args, "eval_dataset_split", "train"),
             )
             eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
             eval_dataset = PromptDataset(eval_data, self.tokenizer, strategy, input_template=args.input_template)

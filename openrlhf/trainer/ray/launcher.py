@@ -123,16 +123,22 @@ class ReferenceModelRayActor(BasePPORole):
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
         packed_seq_lens: Optional[list[int]] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_loss=False,
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
         with torch.no_grad():
             log_probs = self.model(
                 sequences.to(device),
-                action_mask.to(device),
+                action_mask.to(device) if action_mask is not None else None,
                 attention_mask.to(device),
                 ring_attn_group=self.strategy.ring_attn_group,
                 packed_seq_lens=packed_seq_lens,
+                labels=labels,
+                return_loss=return_loss,
             )
+            if return_loss:
+                return log_probs.to("cpu")
         return log_probs.to("cpu")
 
     def empty_cache(self) -> None:
@@ -328,9 +334,10 @@ class PPORayActorGroup:
 
             reward_actors = []
             if not remote_rm_urls:
-                for reward_model_group in reward_model_groups:
-                    actors = reward_model_group._actor_handlers
-                    reward_actors.append(actors[i % len(actors)])
+                if reward_model_groups is not None:
+                    for reward_model_group in reward_model_groups:
+                        actors = reward_model_group._actor_handlers
+                        reward_actors.append(actors[i % len(actors)])
 
             refs.append(
                 actor.fit.remote(

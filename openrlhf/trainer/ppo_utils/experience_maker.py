@@ -357,7 +357,14 @@ class RemoteExperienceMaker(BaseExperienceMaker):
 
         # Batch call reward model
         r_refs = []
-        if not self.remote_rm_url:
+        print("self.class_reward_fn: ", self.class_reward_fn)
+        if self.class_reward_fn:
+            # queries_list = sum(
+            #         [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in sequences_cpu_list], []
+            #     )
+            # r_refs = self.class_reward_fn(queries_list, prompts_list, labels_list)
+            r_refs = self.class_reward_fn(sequences_cpu_list, prompts_list, labels_list)
+        elif not self.remote_rm_url:
             for rm in self.reward_model:
                 r_refs.append(
                     rm.forward_batch.remote(
@@ -373,8 +380,6 @@ class RemoteExperienceMaker(BaseExperienceMaker):
                 )
                 if self.class_reward_fn:
                     r = self.class_reward_fn.remote(queries_list, prompts_list, labels_list)
-                elif self.custom_reward_func:
-                    r = self.custom_reward_func.remote(queries_list, prompts_list, labels_list)
                 else:
                     rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
                     rm = self.remote_rm_url[rank % len(self.remote_rm_url)]
@@ -402,10 +407,15 @@ class RemoteExperienceMaker(BaseExperienceMaker):
 
         # Wait for all remote calls to complete
         start = time.time()
-        ref_values = ray.get([base_action_log_probs_ref, value_ref] + r_refs)
+        if self.class_reward_fn:
+            ref_values = ray.get([base_action_log_probs_ref, value_ref])
+            base_action_log_probs_list, value_list = ref_values[0], ref_values[1]
+            rewards_list = r_refs
+        else:
+            ref_values = ray.get([base_action_log_probs_ref, value_ref] + r_refs)
+            base_action_log_probs_list, value_list, rewards_list = ref_values[0], ref_values[1], ref_values[2]
         wait_time = time.time() - start
 
-        base_action_log_probs_list, value_list, rewards_list = ref_values[0], ref_values[1], ref_values[2]
         if self.remote_rm_url is not None and isinstance(rewards_list, torch.Tensor):
             rewards_list = rewards_list.chunk(len(samples_list))
 
@@ -650,7 +660,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         return returns
 
     @torch.no_grad()
-    def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> Samples:
+    def generate_samples(self, all_prompts: List[str], all_labels, for_eval=False, **generate_kwargs) -> Samples:
         """
         Generate samples and return in batches.
 
@@ -658,22 +668,23 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         in which actor will be used to generate samples.
         """
         if self.vllm_engines is None:
-            return self._generate_with_hf(all_prompts, all_labels, **generate_kwargs)
+            return self._generate_with_hf(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
 
         # vLLM generation
-        return self._generate_vllm(all_prompts, all_labels, **generate_kwargs)
+        return self._generate_vllm(all_prompts, all_labels, for_eval=for_eval, **generate_kwargs)
 
     @torch.no_grad()
-    def _generate_with_hf(self, all_prompts: List[str], all_labels, **generate_kwargs) -> Samples:
+    def _generate_with_hf(self, all_prompts: List[str], all_labels, for_eval=False, **generate_kwargs) -> Samples:
         """
         Generate samples and return in batches.
         """
         assert not getattr(self, "packing_samples", False)
         args = self.strategy.args
         self.actor.eval()
+        num_samples = args.n_samples_per_prompt if not for_eval else args.eval_n_samples_per_prompt
         # sample multiple response
-        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
+        all_prompts = sum([[prompt] * num_samples for prompt in all_prompts], [])
+        all_labels = sum([[label] * num_samples for label in all_labels], [])
         rollout_sequences = []
         rollout_attention_mask = []
         rollout_action_mask = []
@@ -698,7 +709,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         )
         return rollout_samples
 
-    def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> Samples:
+    def _generate_vllm(self, all_prompts: List[str], all_labels, for_eval=False, **kwargs) -> Samples:
         from vllm import SamplingParams
 
         # round-robin load balance
@@ -712,7 +723,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
             llms = self.vllm_engines[rank::world_size]
 
         args = self.strategy.args
-
+        num_samples = args.n_samples_per_prompt if not for_eval else args.eval_n_samples_per_prompt
         sampling_params = SamplingParams(
             temperature=kwargs.get("temperature", 1.0),
             top_p=kwargs.get("top_p", 1.0),
@@ -724,8 +735,8 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         )
 
         # Expand prompt list based on the number of samples per prompt
-        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
-        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
+        all_prompts = sum([[prompt] * num_samples for prompt in all_prompts], [])
+        all_labels = sum([[label] * num_samples for label in all_labels], [])
         all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
 
         # Distribute requests to engines and collect responses to outputs
