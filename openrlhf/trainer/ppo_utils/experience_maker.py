@@ -354,7 +354,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
                 ray.get([self.critic.empty_cache.remote()])
         else:
             value_ref = ray.put([None] * len(samples_list))
-
+        # breakpoint()
         # Batch call reward model
         r_refs = []
         print("self.class_reward_fn: ", self.class_reward_fn)
@@ -363,6 +363,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
             #         [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in sequences_cpu_list], []
             #     )
             # r_refs = self.class_reward_fn(queries_list, prompts_list, labels_list)
+            # breakpoint()
             r_refs = self.class_reward_fn(sequences_cpu_list, prompts_list, labels_list)
         elif not self.remote_rm_url:
             for rm in self.reward_model:
@@ -533,6 +534,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         for experience, reward in zip(experiences, rewards):
             experience = experience.to_device("cuda")
             reward = reward.to(device="cuda")
+            # breakpoint()
             reward = compute_reward(
                 reward,
                 self.kl_ctl.value,
@@ -559,7 +561,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
                     if dist.get_rank() == 0:
                         logger.warning("gamma is set to 1.0 for rloo, reinforce_baseline, and group_norm")
                     kwargs["gamma"] = 1.0
-
+                # breakpoint()
                 experience.returns = self.get_cumulative_returns(
                     reward,
                     experience.action_mask,

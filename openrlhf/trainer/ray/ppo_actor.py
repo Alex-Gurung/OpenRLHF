@@ -77,7 +77,7 @@ class ActorPPOTrainer(BasePPOTrainer):
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
             wandb.define_metric("eval/epoch")
             wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
-            self.completions_table = wandb.Table(columns=["step", "response", "reward"])
+            self.completions_table = wandb.Table(columns=["step", "response", "reward", "len_sequence"])
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
@@ -197,7 +197,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
         
         # do initial evaluate
-        self.evaluate(self.eval_dataloader, 0, args.eval_temperature, args.eval_n_samples_per_prompt)
+        # self.evaluate(self.eval_dataloader, 0, args.eval_temperature, args.eval_n_samples_per_prompt)
         
         for episode in range(start_episode, args.num_episodes):
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
@@ -455,6 +455,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                 ).item()
             else:
                 status[k] = v.mean().item()
+        
         return status
 
     def _broadcast_to_vllm(self):
@@ -649,24 +650,28 @@ class ActorPPOTrainer(BasePPOTrainer):
 
                 # Collect local statistics for each data source
                 local_metrics = {}  # {datasource: {"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}}
-
                 for i, datasource in enumerate(all_datasources):
                     if datasource not in local_metrics:
-                        local_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
+                        local_metrics[datasource] = {f"max_pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0, "seqs_with_rewards_and_len": []}
 
                     # Calculate pass@k and pass@1
                     prompt_rewards = rewards[i]
-                    local_metrics[datasource][f"pass{n_samples_per_prompt}"] += prompt_rewards.max().float().item()
+                    local_metrics[datasource][f"max_pass{n_samples_per_prompt}"] += prompt_rewards.max().float().item()
                     local_metrics[datasource]["pass1"] += prompt_rewards.mean().float().item()
                     local_metrics[datasource]["count"] += 1
                     # query = queries[i]
                     resp_sequences = samples.sequences[i]
                     eos_positions = (resp_sequences == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
                     assistant_start_idx = eos_positions[-2] + 2
-                    decoded_sequence = self.tokenizer.decode(resp_sequences[assistant_start_idx:], skip_special_tokens=True)
+                    # filter out eos tokens and pad tokens
+                    relevant_tokens = resp_sequences[assistant_start_idx:]
+                    relevant_tokens = relevant_tokens[relevant_tokens != self.tokenizer.eos_token_id]
+                    relevant_tokens = relevant_tokens[relevant_tokens != self.tokenizer.pad_token_id]
+                    len_sequence = len(relevant_tokens)
+                    decoded_sequence = self.tokenizer.decode(relevant_tokens, skip_special_tokens=True)
                     
-                    local_metrics[datasource]["resp_seq"] = decoded_sequence
-
+                    local_metrics[datasource]["seqs_with_rewards_and_len"].append((decoded_sequence, prompt_rewards.mean().float().item(), len_sequence))
+                
                 # All gather metrics from all ranks
                 gathered_metrics = [None] * (self.strategy.world_size // self.strategy.ring_attn_size)
                 if self.strategy.ring_attn_group is not None:
@@ -686,19 +691,20 @@ class ActorPPOTrainer(BasePPOTrainer):
                     for rank_metrics in gathered_metrics:
                         for datasource, metrics in rank_metrics.items():
                             if datasource not in global_metrics:
-                                global_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
-                            global_metrics[datasource][f"pass{n_samples_per_prompt}"] += metrics[
-                                f"pass{n_samples_per_prompt}"
+                                global_metrics[datasource] = {f"max_pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
+                            global_metrics[datasource][f"max_pass{n_samples_per_prompt}"] += metrics[
+                                f"max_pass{n_samples_per_prompt}"
                             ]
                             global_metrics[datasource]["pass1"] += metrics["pass1"]
                             global_metrics[datasource]["count"] += metrics["count"]
-                            rows.append([global_step, metrics["resp_seq"], metrics["pass1"]])
+                            for resp_seq, reward, len_sequence in metrics["seqs_with_rewards_and_len"]:
+                                rows.append([global_step, resp_seq, reward, len_sequence])
 
                     # Calculate global averages
                     logs = {}
                     for datasource, metrics in global_metrics.items():
-                        logs[f"eval_{datasource}_pass{n_samples_per_prompt}"] = (
-                            metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
+                        logs[f"eval_{datasource}_max_pass{n_samples_per_prompt}"] = (
+                            metrics[f"max_pass{n_samples_per_prompt}"] / metrics["count"]
                         )
                         logs[f"eval_{datasource}_pass1"] = metrics["pass1"] / metrics["count"]
 
@@ -706,9 +712,9 @@ class ActorPPOTrainer(BasePPOTrainer):
                     if self._wandb is not None:
                         logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": global_step}.items()}
                         self._wandb.log(logs)
-                        self._wandb.log({"eval/completions_table": self.completions_table})
                         for row in rows:
                             self.completions_table.add_data(*row)
+                        self._wandb.log({"eval/completions_table": self.completions_table})
                     elif self._tensorboard is not None:
                         for k, v in logs.items():
                             self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
