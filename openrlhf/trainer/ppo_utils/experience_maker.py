@@ -188,6 +188,8 @@ class RemoteExperienceMaker(ABC):
 
         # custom reward func for reinforced finetuning
         self.custom_reward_func = None
+        # there can also be reward functions tied to this experience maker
+        self.class_reward_fn = None
         self.remote_rm_url = [remote_rm_url] if isinstance(remote_rm_url, str) else remote_rm_url
         if remote_rm_url and remote_rm_url[0].endswith(".py"):
             print(f"Loading custom `reward_func(queries, prompts, labels)` from {remote_rm_url[0]}")
@@ -275,13 +277,15 @@ class RemoteExperienceMaker(ABC):
 
         # Batch call reward model
         r_refs = None
-        if not self.remote_rm_url:
+        if not self.remote_rm_url and not self.class_reward_fn:
             r_refs = self.reward_model_group.async_run_method_batch(
                 method_name="forward",
                 sequences=sequences_list,
                 attention_mask=attention_mask_list,
                 pad_sequence=[True] * len(samples_list),
             )
+        elif self.class_reward_fn:
+            r_refs = self.class_reward_fn(sequences_list, prompts_list, labels_list)
         else:
             queries_list = sum(
                 [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in sequences_list], []

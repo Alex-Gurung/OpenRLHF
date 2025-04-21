@@ -37,6 +37,7 @@ class PPOTrainer(ABC):
         vllm_engines=None,
         prompt_max_len: int = 120,
         dataloader_pin_memory: bool = True,
+        remote_experience_maker_class=RemoteExperienceMaker,
         **generate_kwargs,
     ) -> None:
         super().__init__()
@@ -68,7 +69,7 @@ class PPOTrainer(ABC):
         else:
             self.kl_ctl = FixedKLController(self.init_kl_coef)
 
-        self.experience_maker = RemoteExperienceMaker(
+        self.experience_maker = remote_experience_maker_class(
             self.actor_model_group,
             self.critic_model_group,
             self.reward_model_group,
@@ -410,6 +411,7 @@ class PPOTrainer(ABC):
                 args.eval_dataset,
                 None,  # No probability sampling for eval datasets
                 strategy,
+                dataset_split=getattr(args, "eval_dataset_split", "train"),
             )
             eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
             eval_dataset = PromptDataset(eval_data, self.tokenizer, strategy, input_template=args.input_template)

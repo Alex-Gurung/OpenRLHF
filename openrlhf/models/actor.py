@@ -171,7 +171,9 @@ class Actor(nn.Module):
         sequences: torch.LongTensor,
         action_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
         return_output=False,
+        return_loss=False,
         allgather_logits=False,
         return_logprobs=False,
         ring_attn_group: Optional[dist.ProcessGroup] = None,
@@ -192,7 +194,9 @@ class Actor(nn.Module):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
 
-        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids)
+        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels)
+        if return_loss:
+            return output["loss"]
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
 
