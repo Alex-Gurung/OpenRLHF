@@ -460,7 +460,6 @@ class ActorModelRayActor(BasePPORole):
             eps_clip=args.eps_clip,
             ema_beta=args.ema_beta,
             vllm_engines=self.vllm_engines,
-            experience_maker_cls=RemoteExperienceMaker,
         )
 
     def fit(self, kl_ctl: float = 0):
