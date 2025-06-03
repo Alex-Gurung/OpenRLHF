@@ -10,7 +10,6 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from tqdm import tqdm
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
-from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 
