@@ -325,9 +325,13 @@ class ActorPPOTrainer(BasePPOTrainer):
                 # for DP
                 # weighted mean for kl
                 if "kl" in status:
+                    print(f"pre multiply kl: {status['kl']}")
                     status["kl"] *= status["response_length"]
+                    print(f"post multiply kl: {status['kl']}")
                     status = self.strategy.all_reduce(status)
+                    print(f"post reduce kl: {status['kl']}")
                     status["kl"] /= status["response_length"]
+                    print(f"post divide kl: {status['kl']}")
 
                 short_status = {}
 
@@ -405,6 +409,7 @@ class ActorPPOTrainer(BasePPOTrainer):
 
             kl_loss = kl_mean.mean()
             experience.info["kl"] = kl_loss.item()
+            print(f"kl_loss: {kl_loss.item()}")
         else:
             kl_loss = 0
 
@@ -453,6 +458,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                 status[k] = (
                     (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
                 ).item()
+                print(f"new kl: {status[k]}")
             else:
                 status[k] = v.mean().item()
         
