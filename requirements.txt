@@ -1,7 +1,7 @@
 accelerate
 bitsandbytes
 datasets
-deepspeed==0.16.5
+deepspeed==0.16.9
 einops
 flash-attn==2.7.4.post1
 isort
@@ -15,9 +15,10 @@ pynvml>=12.0.0
 ray[default]==2.43.0
 tensorboard
 torch
+torchdata
 torchmetrics
 tqdm
-transformers==4.51.3
+transformers==4.52.3
 transformers_stream_generator
 wandb
 wheel

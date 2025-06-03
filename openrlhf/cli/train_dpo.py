@@ -6,9 +6,10 @@ from datetime import datetime
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import RewardDataset
+from openrlhf.datasets.utils import blending_datasets
 from openrlhf.models import Actor
-from openrlhf.trainer import DPOTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.trainer.dpo_trainer import DPOTrainer
+from openrlhf.utils import get_strategy, get_tokenizer
 
 
 def train(args):
@@ -65,6 +66,7 @@ def train(args):
         strategy,
         args.seed,
         max_count=args.max_samples,
+        dataset_split=args.dataset_split,
     )
 
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
@@ -75,7 +77,6 @@ def train(args):
         strategy,
         input_template=args.input_template,
         is_dpo=True,
-        multiple_of=args.ring_attn_size,
     )
 
     # prepare dataloader
@@ -94,6 +95,7 @@ def train(args):
             args.eval_dataset,
             None,  # No probability sampling for eval datasets
             strategy,
+            dataset_split=args.eval_split,
         )
         eval_dataset = RewardDataset(
             eval_data,
@@ -102,7 +104,6 @@ def train(args):
             strategy,
             input_template=args.input_template,
             is_dpo=True,
-            multiple_of=args.ring_attn_size,
         )
         eval_dataloader = strategy.setup_dataloader(
             eval_dataset,
@@ -180,7 +181,7 @@ if __name__ == "__main__":
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
-    parser.add_argument("--torch_compile", action="store_true", default=False)
+    parser.add_argument("--deepcompile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--full_determinism",
@@ -202,6 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--grad_accum_dtype", type=str, default=None, help="Adam grad accum data type")
     parser.add_argument("--overlap_comm", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
+    parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed Tensor parallel size")
 
     # DPO
     parser.add_argument("--max_epochs", type=int, default=1)
@@ -242,6 +244,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default=None, help="Path to the training dataset")
     parser.add_argument("--dataset_probs", type=str, default=None, help="Sampling probabilities for training datasets")
     parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--eval_split", type=str, default="test")
     parser.add_argument("--max_samples", type=int, default=1000000, help="Maximum number of samples to use")
 
     parser.add_argument("--prompt_key", type=str, default=None)

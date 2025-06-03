@@ -41,6 +41,8 @@ class KDTrainer(ABC):
         batch_size: int = 1,
         max_epochs: int = 2,
         tokenizer=None,
+        save_hf_ckpt: bool = False,
+        disable_ds_ckpt: bool = False,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -56,6 +58,8 @@ class KDTrainer(ABC):
         self.tokenizer = tokenizer
         self.optimizer = optim
         self.args = strategy.args
+        self.disable_ds_ckpt = disable_ds_ckpt
+        self.save_hf_ckpt = save_hf_ckpt
 
         self.loss_fn = GPTLMLoss()
         self.kd_loss = KDLoss()
@@ -124,10 +128,11 @@ class KDTrainer(ABC):
             # train
             self.model.train()
             self.teacher_model.eval()
-            for prompts_id_len, inputs, attention_masks, _ in self.train_dataloader:
+            for inputs, attention_masks, loss_masks in self.train_dataloader:
                 inputs = inputs.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_masks.squeeze(1).to(torch.cuda.current_device())
                 output = self.model(inputs, attention_mask=attention_mask, return_output=True)
+                prompts_id_len = (loss_masks != 0).int().argmax(dim=-1).squeeze(-1)
 
                 # loss function
                 labels = torch.where(

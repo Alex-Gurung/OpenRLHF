@@ -3,8 +3,6 @@ set -x
 python3 -m openrlhf.cli.train_ppo_ray \
    --ref_num_nodes 1 \
    --ref_num_gpus_per_node 8 \
-   --reward_num_nodes 1 \
-   --reward_num_gpus_per_node 8 \
    --actor_num_nodes 1 \
    --actor_num_gpus_per_node 8 \
    --vllm_num_engines 4 \
@@ -17,7 +15,7 @@ python3 -m openrlhf.cli.train_ppo_ray \
    --kl_estimator k3 \
    --advantage_estimator group_norm \
    --pretrain OpenRLHF/Llama-3-8b-sft-mixture \
-   --reward_pretrain OpenRLHF/Llama-3-8b-rm-700k \
+   --agent_func_path /openrlhf/examples/python/agent_func.py \
    --save_path /openrlhf/examples/test_scripts/final/llama3-8b-rlhf \
    --ckpt_path /openrlhf/examples/test_scripts/ckpt/llama3-8b-rlhf \
    --save_hf_ckpt \

@@ -6,9 +6,10 @@ from datetime import datetime
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import ProcessRewardDataset
+from openrlhf.datasets.utils import blending_datasets
 from openrlhf.models import Actor
-from openrlhf.trainer import ProcessRewardModelTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.trainer.prm_trainer import ProcessRewardModelTrainer
+from openrlhf.utils import get_strategy, get_tokenizer
 
 
 def train(args):
@@ -51,6 +52,7 @@ def train(args):
         strategy,
         args.seed,
         max_count=args.max_samples,
+        dataset_split=args.dataset_split,
     )
 
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
@@ -62,7 +64,7 @@ def train(args):
         args.micro_train_batch_size,
         True,
         True,
-        train_dataset.packing_collate_fn if args.packing_samples else train_dataset.collate_fn,
+        train_dataset.collate_fn,
     )
 
     eval_dataset = None
@@ -72,6 +74,7 @@ def train(args):
             args.eval_dataset,
             None,  # No probability sampling for eval datasets
             strategy,
+            dataset_split=args.eval_split,
         )
         eval_dataset = ProcessRewardDataset(eval_data, tokenizer, args.max_len, strategy)
         eval_dataloader = strategy.setup_dataloader(
@@ -79,7 +82,7 @@ def train(args):
             args.micro_train_batch_size,
             True,
             False,
-            eval_dataset.packing_collate_fn if args.packing_samples else eval_dataset.collate_fn,
+            eval_dataset.collate_fn,
         )
 
     # scheduler
@@ -142,7 +145,7 @@ if __name__ == "__main__":
     # DeepSpeed
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
-    parser.add_argument("--torch_compile", action="store_true", default=False)
+    parser.add_argument("--deepcompile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--full_determinism",
@@ -189,7 +192,9 @@ if __name__ == "__main__":
     # custom dataset
     parser.add_argument("--dataset", type=str, default=None, help="Path to the training dataset")
     parser.add_argument("--dataset_probs", type=str, default=None, help="Sampling probabilities for training datasets")
-    parser.add_argument("--eval_dataset", type=str, default=None, help="Paths to the evaluation datasets")
+    parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--eval_split", type=str, default="test")
     parser.add_argument("--max_samples", type=int, default=1000000, help="Maximum number of samples to use")
 
     parser.add_argument("--input_key", type=str, default="input", help="JSON dataset key")

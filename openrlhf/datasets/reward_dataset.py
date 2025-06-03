@@ -2,7 +2,8 @@ from typing import Callable
 
 from torch.utils.data import Dataset
 
-from .utils import exist_and_not_none, zero_pad_sequences
+from openrlhf.datasets.utils import exist_and_not_none
+from openrlhf.utils.utils import zero_pad_sequences
 
 
 def preprocess_data(
@@ -63,14 +64,12 @@ class RewardDataset(Dataset):
         input_template=None,
         is_dpo=False,
         num_processors=8,
-        multiple_of=1,
     ) -> None:
         super().__init__()
         self.is_dpo = is_dpo
         self.tokenizer = tokenizer
         self.strategy = strategy
         self.max_length = max_length
-        self.multiple_of = multiple_of
 
         # chat_template
         self.input_template = input_template

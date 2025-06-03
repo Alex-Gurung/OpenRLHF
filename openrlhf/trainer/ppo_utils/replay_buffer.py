@@ -1,13 +1,12 @@
 import random
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import List, Optional
 
 import torch
-import torch.nn.functional as F
 
-
-from .experience_maker import Experience
+from openrlhf.trainer.ppo_utils.experience_maker import Experience
+from openrlhf.utils.utils import zero_pad_sequences
 
 
 @dataclass
@@ -39,117 +38,99 @@ class BufferItem:
 
 
 def split_experience_batch(experience: Experience) -> List[BufferItem]:
+    """Split a batch of experiences into individual BufferItems."""
     batch_size = len(experience.sequences)
-    batch_kwargs = [{} for _ in range(batch_size)]
-    keys = (
-        "sequences",
-        "action_log_probs",
-        "base_action_log_probs",
-        "values",
-        "returns",
-        "advantages",
-        "attention_mask",
-        "action_mask",
-    )
+    # Get fields from BufferItem, excluding 'info'
+    keys = tuple(field.name for field in fields(BufferItem) if field.name != "info")
+
+    # Validate batch size for all attributes
     for key in keys:
         value = getattr(experience, key)
-        if value is None:
-            for i in range(batch_size):
-                batch_kwargs[i][key] = None
-            continue
-        vals = value
-        if isinstance(vals, torch.Tensor):
-            vals = torch.unbind(vals)
-        assert batch_size == len(vals)
-        for i, v in enumerate(vals):
-            batch_kwargs[i][key] = v
+        if value is not None:
+            if isinstance(value, (torch.Tensor, list)):
+                if len(value) != batch_size:
+                    raise ValueError(f"Size of {key} ({len(value)}) does not match batch_size ({batch_size})")
 
+    items = []
     for i in range(batch_size):
-        batch_kwargs[i]["info"] = {}
-    for k, v in experience.info.items():
-        vals = torch.unbind(v)
-        assert batch_size == len(vals)
-        for i, vv in enumerate(vals):
-            if isinstance(vv, torch.Tensor):
-                assert vv.numel() == 1, f"info[{k}] must be a scalar tensor, but got {vv.shape}"
-                vv = vv.item()
-            batch_kwargs[i]["info"][k] = vv
+        # Process main attributes
+        item = {key: (getattr(experience, key)[i] if getattr(experience, key) is not None else None) for key in keys}
 
-    items = [BufferItem(**kwargs) for kwargs in batch_kwargs]
+        # Process info dictionary
+        item["info"] = {}
+        for k, v in experience.info.items():
+            if isinstance(v, (torch.Tensor, list)):
+                if len(v) != batch_size:
+                    raise ValueError(f"Size of info[{k}] ({len(v)}) does not match batch_size ({batch_size})")
+                item["info"][k] = v[i]
+            else:
+                raise TypeError(f"Unsupported type for info[{k}]: {type(v)}")
+
+        items.append(BufferItem(**item))
+
     return items
 
 
-def zero_pad_sequences(sequences: List[torch.Tensor], side: str = "left") -> torch.Tensor:
-    assert side in ("left", "right")
-    max_len = max(seq.size(0) for seq in sequences)
-    padded_sequences = []
-    for seq in sequences:
-        pad_len = max_len - seq.size(0)
-        padding = (pad_len, 0) if side == "left" else (0, pad_len)
-        padded_sequences.append(F.pad(seq, padding))
-    return torch.stack(padded_sequences, dim=0)
-
-
 def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Experience:
-    kwargs = {}
-    keys = (
-        "sequences",
-        "action_log_probs",
-        "base_action_log_probs",
-        "values",
-        "returns",
-        "advantages",
-        "attention_mask",
-        "action_mask",
-    )
-    for key in keys:
-        vals = [getattr(item, key) for item in items]
-        vals = torch.stack(vals, dim=0) if vals[0] is not None else None
-        kwargs[key] = vals
+    """Combine individual BufferItems into a batch of experiences."""
+    if not items:
+        raise ValueError("Empty items list")
 
+    # Get fields from BufferItem, excluding 'info'
+    keys = tuple(field.name for field in fields(BufferItem) if field.name != "info")
+
+    # Process main attributes
+    kwargs = {
+        key: (
+            zero_pad_sequences([getattr(item, key) for item in items], "right", stack=True)
+            if getattr(items[0], key) is not None
+            else None
+        )
+        for key in keys
+    }
+
+    # Process info dictionary
     kwargs["info"] = {}
     for key in items[0].info.keys():
-        vals = torch.tensor([item.info[key] for item in items])
-        kwargs["info"][key] = vals
+        values = [item.info[key] for item in items]
+        if not values:
+            continue
+
+        # Validate all items have the same type
+        first_type = type(values[0])
+        if not all(isinstance(v, first_type) for v in values):
+            raise TypeError(f"Inconsistent types in info[{key}]")
+
+        # Convert to tensor if all values are numeric
+        if all(isinstance(v, (int, float)) for v in values):
+            kwargs["info"][key] = torch.tensor(values)
+        else:
+            kwargs["info"][key] = values
+
     return Experience(**kwargs)
 
 
 def remove_padding_in_sequences(items):
     for item in items:
-        seq, act_log_prob, base_act_log_prob, value, ret, adv, att_mask, act_mask = (
-            item.sequences,
-            item.action_log_probs,
-            item.base_action_log_probs,
-            item.values,
-            item.returns,
-            item.advantages,
-            item.attention_mask,
-            item.action_mask,
-        )
-        right_pad = (1 - act_mask.long()).sum()
+        # Calculate right padding using attention_mask
+        right_pad = item.attention_mask.flip(0).argmax()
         right_pad = None if right_pad == 0 else -right_pad
 
-        # left_pad for seq and att_mask
-        left_pad = att_mask.long().argmax()
-        (
-            item.sequences,
-            item.action_log_probs,
-            item.base_action_log_probs,
-            item.values,
-            item.returns,
-            item.advantages,
-            item.attention_mask,
-            item.action_mask,
-        ) = (
-            seq[left_pad:right_pad],
-            act_log_prob[:right_pad],
-            base_act_log_prob[:right_pad] if item.base_action_log_probs is not None else None,
-            value[:right_pad] if item.values is not None else None,
-            ret[:right_pad],
-            adv[:right_pad],
-            att_mask[left_pad:right_pad],
-            act_mask[:right_pad],
-        )
+        # Remove right padding for all tensors
+        for key in [
+            "sequences",
+            "action_log_probs",
+            "base_action_log_probs",
+            "values",
+            "returns",
+            "advantages",
+            "attention_mask",
+            "action_mask",
+        ]:
+            value = getattr(item, key)
+            if value is not None:
+                setattr(item, key, value[:right_pad])
+
     return items
 
 
@@ -179,6 +160,7 @@ class NaiveReplayBuffer(ABC):
         if self.cpu_offload:
             experience.to_device(torch.device("cpu"))
         items = split_experience_batch(experience)
+        items = remove_padding_in_sequences(items)
         self.items.extend(items)
         if self.limit > 0:
             samples_to_remove = len(self.items) - self.limit
@@ -205,32 +187,3 @@ class NaiveReplayBuffer(ABC):
     def collate_fn(self, batch) -> Experience:
         experience = make_experience_batch(batch, self.packing_samples)
         return experience
-
-    def normalize(self, strategy, attribute: str, divide_by_std: bool = True) -> None:
-        assert attribute == "advantages"
-        items = []
-        action_masks = []
-        for item in self:
-            items.append(getattr(item, attribute))
-            action_masks.append(item.action_mask)
-
-        items_vector = torch.cat(items).float().flatten()
-
-        action_masks_vector = torch.cat(action_masks).flatten()
-        num_actions = action_masks_vector.sum()
-
-        # for DP
-        # mean
-        sum_and_count = torch.tensor([items_vector.sum(), num_actions], device=items_vector.device)
-        all_sum, all_count = strategy.all_reduce(sum_and_count, "sum")
-        mean = all_sum / all_count
-        # std
-        if divide_by_std:
-            std = ((items_vector - mean).pow(2) * action_masks_vector).sum()
-            all_std = strategy.all_reduce(std, "sum")
-            rstd = (all_std / all_count).clamp(min=1e-8).rsqrt()
-        else:
-            rstd = 1
-
-        for i, item in enumerate(self):
-            setattr(item, attribute, (items[i] - mean) * rstd)

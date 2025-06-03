@@ -3,7 +3,7 @@ from typing import Callable
 import torch
 from torch.utils.data import Dataset
 
-from .utils import zero_pad_sequences
+from openrlhf.utils.utils import zero_pad_sequences
 
 
 def preprocess_data(
@@ -51,7 +51,6 @@ class SFTDataset(Dataset):
         input_template=None,
         pretrain_mode=False,
         num_processors=8,  # Specify the number of processors you want to use
-        multiple_of=1,
         multiturn=False,
     ) -> None:
         super().__init__()
@@ -59,7 +58,6 @@ class SFTDataset(Dataset):
         self.strategy = strategy
         self.pretrain_mode = pretrain_mode
         self.max_length = max_length
-        self.multiple_of = multiple_of
         self.multiturn = multiturn
 
         # chat template
@@ -208,7 +206,7 @@ class SFTDataset(Dataset):
         loss_mask = torch.zeros_like(input_ids, dtype=torch.float32)
         if not self.multiturn:
             prompt_ids_len = self.prompt_ids_lens[idx]
-            loss_mask[0, prompt_ids_len:-1] = 1
+            loss_mask[0, prompt_ids_len - 1 : -1] = 1
         else:
             response_ranges = self.response_ranges[idx]
             for start_idx, end_idx in response_ranges:

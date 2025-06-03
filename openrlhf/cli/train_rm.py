@@ -6,9 +6,10 @@ from datetime import datetime
 from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import RewardDataset
+from openrlhf.datasets.utils import blending_datasets
 from openrlhf.models import get_llm_for_sequence_regression
-from openrlhf.trainer import RewardModelTrainer
-from openrlhf.utils import blending_datasets, get_strategy, get_tokenizer
+from openrlhf.trainer.rm_trainer import RewardModelTrainer
+from openrlhf.utils import get_strategy, get_tokenizer
 
 
 def train(args):
@@ -49,6 +50,7 @@ def train(args):
         strategy,
         args.seed,
         max_count=args.max_samples,
+        dataset_split=args.dataset_split,
     )
 
     train_data = train_data.select(range(min(args.max_samples, len(train_data))))
@@ -58,7 +60,6 @@ def train(args):
         args.max_len,
         strategy,
         input_template=args.input_template,
-        multiple_of=args.ring_attn_size,
     )
 
     # prepare dataloader
@@ -75,6 +76,7 @@ def train(args):
             args.eval_dataset,
             None,  # No probability sampling for eval datasets
             strategy,
+            dataset_split=args.eval_split,
         )
     else:
         # Used for calculating mean/std for reward normalization
@@ -86,7 +88,6 @@ def train(args):
         args.max_len,
         strategy,
         input_template=args.input_template,
-        multiple_of=args.ring_attn_size,
     )
     eval_dataloader = strategy.setup_dataloader(
         eval_dataset,
@@ -139,6 +140,8 @@ def train(args):
         max_norm=args.max_norm,
         max_epochs=args.max_epochs,
         loss=args.loss,
+        disable_ds_ckpt=args.disable_ds_ckpt,
+        save_hf_ckpt=args.save_hf_ckpt,
     )
 
     trainer.fit(args, consumed_samples, num_update_steps_per_epoch)
@@ -165,11 +168,13 @@ if __name__ == "__main__":
     parser.add_argument("--max_ckpt_mem", type=int, default=1e8)
     parser.add_argument("--load_checkpoint", action="store_true", default=False)
     parser.add_argument("--use_ds_universal_ckpt", action="store_true", default=False)
+    parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)
+    parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
 
     # DeepSpeed
     parser.add_argument("--max_norm", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--gradient_checkpointing", action="store_true", default=False)
-    parser.add_argument("--torch_compile", action="store_true", default=False)
+    parser.add_argument("--deepcompile", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--full_determinism",
@@ -187,6 +192,7 @@ if __name__ == "__main__":
     parser.add_argument("--overlap_comm", action="store_true", default=False)
     parser.add_argument("--gradient_checkpointing_use_reentrant", action="store_true", default=False)
     parser.add_argument("--disable_fast_tokenizer", action="store_true", default=False)
+    parser.add_argument("--ds_tensor_parallel_size", type=int, default=1, help="DeepSpeed Tensor parallel size")
 
     # Models
     parser.add_argument("--pretrain", type=str, default=None)
@@ -227,8 +233,12 @@ if __name__ == "__main__":
     parser.add_argument("--packing_samples", action="store_true", default=False)
 
     # Custom dataset
-    parser.add_argument("--dataset", type=str, default=None)
-    parser.add_argument("--dataset_probs", type=str, default="1.0", help="sampling probs for datasets")
+    parser.add_argument("--dataset", type=str, default=None, help="Path to the training dataset")
+    parser.add_argument("--dataset_probs", type=str, default=None, help="Sampling probabilities for training datasets")
+    parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--dataset_split", type=str, default="train")
+    parser.add_argument("--eval_split", type=str, default="train")
+    parser.add_argument("--max_samples", type=int, default=1000000, help="Maximum number of samples to use")
     parser.add_argument("--prompt_key", type=str, default=None)
     parser.add_argument("--chosen_key", type=str, default="chosen")
     parser.add_argument("--rejected_key", type=str, default="rejected")
@@ -237,8 +247,6 @@ if __name__ == "__main__":
         "--apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
     )
     parser.add_argument("--tokenizer_chat_template", type=str, default=None)
-    parser.add_argument("--max_samples", type=int, default=1e8, help="Max number of samples")
-    parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
     parser.add_argument("--max_len", type=int, default=512)
 
     # wandb parameters
