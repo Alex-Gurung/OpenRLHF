@@ -159,7 +159,10 @@ class TrainingActor(BasePPOTrainer):
         else:
             self.kl_ctl = FixedKLController(self.init_kl_coef)
 
-        self.experience_maker = RemoteExperienceMaker(
+        if not self.remote_experience_maker_cls:
+            self.remote_experience_maker_cls = RemoteExperienceMaker
+
+        self.experience_maker = self.remote_experience_maker_cls(
             self.actor_model_group,
             self.critic_model_group,
             self.reward_model_group,
@@ -247,6 +250,7 @@ class PPOTrainerAsync:
         dataloader_pin_memory: bool = True,
         prompt_split: str = "train",
         eval_split: str = "test",
+        remote_experience_maker_cls: RemoteExperienceMaker = None,
         **generate_kwargs,
     ) -> None:
         super().__init__()
@@ -306,6 +310,7 @@ class PPOTrainerAsync:
             eval_split,
             signal_actor=self.signal_actor,
             remote_reward_model=self.remote_reward_model,
+            remote_experience_maker_cls=remote_experience_maker_cls,
             **generate_kwargs,
         )
 

@@ -376,6 +376,7 @@ class PPOTrainer(BasePPOTrainer):
         dataloader_pin_memory: bool = True,
         prompt_split: str = "train",
         eval_split: str = "test",
+        remote_experience_maker_cls: RemoteExperienceMaker = None,
         **generate_kwargs,
     ) -> None:
         super().__init__(
@@ -409,8 +410,8 @@ class PPOTrainer(BasePPOTrainer):
             self.tokenizer,
             self.prompt_max_len,
         )
-
-        self.experience_maker = RemoteExperienceMaker(
+        self.experience_maker_cls = remote_experience_maker_cls if remote_experience_maker_cls else RemoteExperienceMaker
+        self.experience_maker = self.experience_maker_cls(
             self.actor_model_group,
             self.critic_model_group,
             self.reward_model_group,

@@ -46,7 +46,6 @@ class ActorPPOTrainer(ABC):
         tokenizer=None,
         dataloader_pin_memory: bool = True,
         vllm_engines: List = None,
-        remote_experience_maker_class=RemoteExperienceMaker,
         **kwargs,
     ):
         """PPOTrainer for ray.
@@ -461,6 +460,7 @@ class ActorModelRayActor(BasePPORole):
             eps_clip=args.eps_clip,
             ema_beta=args.ema_beta,
             vllm_engines=self.vllm_engines,
+            experience_maker_cls=RemoteExperienceMaker,
         )
 
     def fit(self, kl_ctl: float = 0):
