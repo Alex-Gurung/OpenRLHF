@@ -91,6 +91,10 @@ class BaseModelActor(BaseDistributedActor):
             raise ValueError(f"Function {method_name} is not callable")
 
         results = []
+        try:
+            v = self.strategy
+        except:
+            print("No strategy")
         for i in tqdm(range(list_length), desc=f"{method_name}", disable=not self.strategy.is_rank_0()):
             # Create kwargs for single item
             sample_kwargs = {param_name: param_value[i] for param_name, param_value in kwargs.items()}
