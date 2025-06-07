@@ -137,14 +137,19 @@ class BasePPOTrainer(ABC):
                 self.actor_model_group.async_run_method(method_name="reload_states")
 
             actor_status_ref = self.actor_model_group.async_run_method(method_name="fit", kl_ctl=self.kl_ctl.value)
+            print('finished fit')
             status.update(ray.get(actor_status_ref)[0])
-
+            print('finished update')
             if self.strategy.args.deepspeed_enable_sleep:
+                print('offloading states')
                 self.actor_model_group.async_run_method(method_name="offload_states")
+                print('offloaded states')
 
             # 4. broadcast weights to vllm engines
             if self.vllm_engines is not None:
+                print('broadcasting to vllm')
                 self._broadcast_to_vllm()
+                print('broadcasted to vllm')
 
         # 5. wait remote critic model training done
         if self.critic_model_group and not self.strategy.args.colocate_all_models:
@@ -154,14 +159,22 @@ class BasePPOTrainer(ABC):
 
     def _broadcast_to_vllm(self):
         if self.strategy.args.vllm_enable_sleep:
+            print('sleep enabled')
+            print('importing vllm engine')
             from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-
+            print('imported vllm engine')
+            print('calling wake up')
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
+            print('called wake up')
 
+        print('calling broadcast to vllm')
         ray.get(self.actor_model_group.async_run_method(method_name="broadcast_to_vllm"))
+        print('called broadcast to vllm')
 
         if self.strategy.args.vllm_enable_sleep:
+            print('calling sleep')
             batch_vllm_engine_call(self.vllm_engines, "sleep")
+            print('called sleep')
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:

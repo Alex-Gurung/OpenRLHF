@@ -178,16 +178,25 @@ class TrainingActor(BasePPOTrainer):
 
     def _broadcast_to_vllm(self):
         if self.vllm_engines is not None:
+            print('inside broadcast to vllm')
             # Block generation
+            print('blocking generation')
             ray.get(self.signal_actor.set_generating.remote(False))
+            print('blocked generation')
             # Wait for weight updates to be allowed
+            print('waiting for weight updates')
             ray.get(self.signal_actor.wait_update_weights.remote())
+            print('allowed weight updates')
 
             # Perform weight update
+            print('performing weight update')
             ray.get(self.actor_model_group.async_run_method(method_name="broadcast_to_vllm"))
+            print('performed weight update')
 
             # Allow generation
+            print('allowing generation')
             ray.get(self.signal_actor.set_generating.remote(True))
+            print('allowed generation')
 
     def fit(self, queue, steps):
         args = self.args

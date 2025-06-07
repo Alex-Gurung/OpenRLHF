@@ -467,9 +467,13 @@ class PolicyModelActor(BaseModelActor):
         torch.cuda.empty_cache()
         self.actor.train()
         status = self.trainer.ppo_train(kl_ctl)
+        print(f"clearing replay buffer")
         self.trainer.replay_buffer.clear()
+        print(f"cleared replay buffer")
         torch.cuda.empty_cache()
+        print(f"emptied cache")
         torch.cuda.synchronize()
+        print(f"synchronized")
         return status
 
     def save_model(self):
