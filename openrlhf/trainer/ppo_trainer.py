@@ -1,6 +1,7 @@
 import os
 import time
 from abc import ABC
+from typing import Optional
 from datetime import timedelta
 
 import ray
@@ -33,7 +34,7 @@ class BasePPOTrainer(ABC):
         dataloader_pin_memory: bool = True,
         prompt_split: str = "train",
         eval_split: str = "test",
-        sample_generator_cls: SamplesGenerator = None,
+        sample_generator_cls: Optional[SamplesGenerator] = None,
         **generate_kwargs,
     ) -> None:
         super().__init__()
