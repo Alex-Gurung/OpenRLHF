@@ -10,7 +10,7 @@ from tqdm import tqdm
 from openrlhf.datasets import PromptDataset
 from openrlhf.datasets.utils import blending_datasets
 from openrlhf.trainer.ppo_utils import AdaptiveKLController, FixedKLController
-from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
+from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker, SamplesGenerator
 from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.logging_utils import init_logger
@@ -33,6 +33,7 @@ class BasePPOTrainer(ABC):
         dataloader_pin_memory: bool = True,
         prompt_split: str = "train",
         eval_split: str = "test",
+        sample_generator_cls: SamplesGenerator = None,
         **generate_kwargs,
     ) -> None:
         super().__init__()
@@ -71,12 +72,16 @@ class BasePPOTrainer(ABC):
         self.experience_maker = None
         self.remote_reward_model = None
 
-        if self.args.agent_func_path:
-            from openrlhf.trainer.ppo_utils.experience_maker_async import SamplesGeneratorAsync as SamplesGenerator
+        if sample_generator_cls is None:
+            if self.args.agent_func_path:
+                from openrlhf.trainer.ppo_utils.experience_maker_async import SamplesGeneratorAsync as SamplesGenerator
+            else:
+                from openrlhf.trainer.ppo_utils.experience_maker import SamplesGenerator
+            self.generator_cls = SamplesGenerator
         else:
-            from openrlhf.trainer.ppo_utils.experience_maker import SamplesGenerator
+            self.generator_cls = sample_generator_cls
 
-        self.generator_cls = SamplesGenerator
+        # self.generator_cls = SamplesGenerator
 
     def _init_wandb(self):
         # wandb/tensorboard setting
@@ -257,7 +262,8 @@ class BasePPOTrainer(ABC):
             generate_kwargs["temperature"] = temperature
             generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
             samples_list = self.samples_generator.generate_samples(
-                all_prompts, all_labels, remote_reward_model=self.remote_reward_model, **generate_kwargs
+                # all_prompts, all_labels, remote_reward_model=self.remote_reward_model, **generate_kwargs
+                all_prompts, all_labels, remote_reward_model=self.reference_model_group, **generate_kwargs
             )
 
             # duplicate prompts and labels for each sample
@@ -466,6 +472,8 @@ class PPOTrainer(BasePPOTrainer):
         data_loader_state_dict = checkpoint_states["data_loader_state_dict"]
         if data_loader_state_dict:
             self.prompts_dataloader.load_state_dict(data_loader_state_dict)
+
+        self.evaluate(self.eval_dataloader, 0, args.eval_temperature, args.eval_n_samples_per_prompt)
 
         for episode in range(episode, args.num_episodes):
             pbar = tqdm(

@@ -308,8 +308,10 @@ class RayActorGroup:
         return [actor.save_model.remote() for actor in self._actor_handlers]
 
     def async_run_method(self, method_name, *args, **kwargs):
+        print("inside async run method with method name", method_name)
         refs = []
         for actor in self._actor_handlers:
+            print(f"running method {method_name} on actor {actor}")
             method = getattr(actor, method_name)
             refs.append(method.remote(*args, **kwargs))
         return refs

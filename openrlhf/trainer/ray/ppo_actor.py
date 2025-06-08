@@ -269,14 +269,18 @@ class ActorPPOTrainer(ABC):
         return status
 
     def _broadcast_to_vllm(self):
+        print(f"inside ppo trainer broadcast to vllm")
         use_prefix_cache = getattr(self.strategy.args, "enable_prefix_caching", False)
         cache_reset_refs = []
         if use_prefix_cache and torch.distributed.get_rank() == 0:
+            print(f"clearing prefix cache for each engine")
             # clear prefix cache
             for engine in self.vllm_engines:
                 cache_reset_refs.append(engine.reset_prefix_cache.remote())
-
+            print(f"cleared prefix cache for each engine")
+        print(f"emptying cache")
         torch.cuda.empty_cache()
+        print(f"emptied cache")
         model = self.actor.model.module
         count, num_params = 0, len(list(model.named_parameters()))
 
@@ -347,11 +351,15 @@ class ActorPPOTrainer(ABC):
                 else:
                     with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
                         _handle_cuda_ipc(param, count, num_params)
-
+        print("finished per parameter broadcast to vllm")
         if cache_reset_refs:
+            print(f"resetting cache for each engine")
             ray.get(cache_reset_refs)
+            print(f"reset cache for each engine")
         torch.cuda.empty_cache()
+        print(f"emptied cache")
         torch_dist_barrier_and_cuda_sync()
+        print(f"synchronized")
 
 
 @ray.remote(num_gpus=1)

@@ -260,6 +260,7 @@ class PPOTrainerAsync:
         prompt_split: str = "train",
         eval_split: str = "test",
         remote_experience_maker_cls: RemoteExperienceMaker = None,
+        sample_generator_cls: GenerateSamplesActor = None,
         **generate_kwargs,
     ) -> None:
         super().__init__()
@@ -283,7 +284,8 @@ class PPOTrainerAsync:
         else:
             self.remote_reward_model = None
 
-        self.generator_actor = GenerateSamplesActor.remote(
+        self.sample_generator_cls = sample_generator_cls
+        self.generator_actor = self.sample_generator_cls.remote(
             pretrain,
             strategy,
             actor_model_group,
