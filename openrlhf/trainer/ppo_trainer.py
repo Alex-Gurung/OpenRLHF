@@ -202,6 +202,8 @@ class BasePPOTrainer(ABC):
                         "global_step": global_step,
                     }.items()
                 }
+                # also log current episode from client_states
+                logs["train/episode"] = client_states["episode"]
                 self._wandb.log(logs)
             # TensorBoard
             elif self._tensorboard is not None:
