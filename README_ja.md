@@ -42,6 +42,8 @@ OpenRLHFは、Ray、vLLM、ZeRO-3、およびHuggingFace Transformersを基盤�
 詳細は[スライド](https://docs.google.com/presentation/d/1JRhB1d7csofx0PIZBmfyBdMluxNd5JLPpUHrrvVhGnk/edit?usp=sharing) | [技術報告](https://arxiv.org/abs/2405.11143) | [ドキュメント](https://openrlhf.readthedocs.io/)をご覧ください。
 
 ## ニュース
+- [2025/6] [Magistral](https://mistral.ai/static/research/magistral.pdf) は REINFORCE++-baseline を使用して推論モデルを訓練しています。
+- [2025/5] [MARTI](https://github.com/TsinghuaC3I/MARTI) が OpenRLHF のフォークとしてリリースされました。集中型マルチエージェント相互作用と分散型ポリシー訓練を統合し、RL を使用した LLM ベースのマルチエージェントシステムの訓練を目的として設計されています。
 - [2025/5] OpenRLHF 0.8.0 は [Async Pipeline RLHF](./examples/scripts/train_reinforce_baseline_llama_ray_async.sh) (`--async_train`) と [Async Agent RLHF](./examples/scripts/train_reinforce_baseline_llama_ray_agent_async.sh)(`--agent_func_path`) をサポート
 - [2025/4] ブログ記事 [Accelerating RLHF with vLLM, Best Practice from OpenRLHF](https://blog.vllm.ai/2025/04/23/openrlhf-vllm.html) を公開
 - [2025/4] Clean OpenRLHF: シングルコントローラーと統合パッキングサンプルに基づくソースコードのリファクタリング
@@ -50,14 +52,16 @@ OpenRLHFは、Ray、vLLM、ZeRO-3、およびHuggingFace Transformersを基盤�
 - [2025/2] [LMM-R1](https://github.com/TideDra/lmm-r1) は OpenRLHF のフォークで、マルチモーダルタスクでの DeepSeek-R1 の再現のための高性能 RL インフラストラクチャを提供することを目的としています。
 - [2025/2] MIT & Microsoft は OpenRLHF を使用して [On the Emergence of Thinking in LLMs I: Searching for the Right Intuition](https://arxiv.org/pdf/2502.06773) を提案しました。
 - [2025/1] HKUSTは [OpenRLHF を使用して小規模モデルでの DeepSeek-R1-Zero と DeepSeek-R1 のトレーニング](https://github.com/hkust-nlp/simpleRL-reason)を再現しました。
-- [2024/12] 私たちは😊 [REINFORCE++: A Simple and Efficient Approach for Aligning Large Language Models](https://www.researchgate.net/publication/387487679_REINFORCE_A_SIMPLE_AND_EFFICIENT_APPROACH_FOR_ALIGNING_LARGE_LANGUAGE_MODELS)を「提案」しました。
+- [2024/12] 私たちは😊 [REINFORCE++: A Simple and Efficient Approach for Aligning Large Language Models](https://arxiv.org/abs/2501.03262)を「提案」しました。
 - [2024/12] [Notionブログ](https://hijkzzz.notion.site/unraveling-rlhf-and-its-variants-engineering-insights#147d9a33ecc9806090f3d5c749d31f05)でPPO、REINFORCE++、GRPO、およびRLOOを分析しました。
+- [2023/8] OpenRLHF がオープンソース化されました。
 
 ## 特徴
 
 - Rayに基づく分散[ PPO](./examples/scripts/train_ppo_llama_ray.sh)および[EINFORCE++/REINFORCE++-baseline/GRPO/RLOO](./examples/scripts/train_reinforce_llama_ray.sh)の実装。
 - [Ray-based Reinforced Finetuning](./examples/scripts/train_ppo_llama_with_reward_fn.sh)
 - RayとHybrid Engineに基づく[PPO](./examples/scripts/train_ppo_llama_ray_hybrid_engine.sh)および[REINFORCE++/REINFORCE++-baseline/GRPO/RLOO](./examples/scripts/train_reinforce_llama_ray_hybrid_engine.sh)のサポート (`--colocate_all_models`, `--vllm_enable_sleep` and `--vllm_gpu_memory_utilization 0.5`)
+- DAPOからのRL Dynamic Samplingのサポート(`--dynamic_filtering` and `--dynamic_filtering_reward_range`)
 - [DeepSpeed AutoTP トレーニング](./examples/scripts/train_sft_llama_tensor_parallelism.sh)のサポート (`--ds_tensor_parallel_size`)
 - [70億以上のパラメータを持つモデル](./examples/scripts/train_ppo_llama_ray_70b.sh)の完全なRLHF微調整のサポート。
 - RLHFタスクでの生成を加速するためのvLLMの統合（`--vllm_num_engines`）。
@@ -86,13 +90,13 @@ OpenRLHFを使用するには、まずDockerコンテナを起動し（**推奨*
 
 ```bash
 # Dockerコンテナを起動
-docker run --runtime=nvidia -it --rm --shm-size="10g" --cap-add=SYS_ADMIN -v $PWD:/openrlhf nvcr.io/nvidia/pytorch:24.07-py3 bash
+docker run --runtime=nvidia -it --rm --shm-size="10g" --cap-add=SYS_ADMIN -v $PWD:/openrlhf nvcr.io/nvidia/pytorch:25.02-py3 bash
 sudo pip uninstall xgboost transformer_engine flash_attn pynvml -y
 
 # pip install
 pip install openrlhf
 
-# vLLM加速を使用する場合（vLLM 0.8.5.post1をインストール）
+# vLLM加速を使用する場合（vLLM 0.9.1をインストール）
 pip install openrlhf[vllm]
 # 最新のvLLMもサポートされています
 pip install openrlhf[vllm_latest]
@@ -109,7 +113,7 @@ pip install -e .
 ```
 
 > [!NOTE]
->vLLM 0.8.5.post1以降の使用をお勧めします。
+>vLLM 0.9.1以降の使用をお勧めします。
 >また、[vLLM用のDockerfile](./dockerfile/)および[Nvidia-Dockerのワンクリックインストールスクリプト](./examples/scripts/nvidia_docker_install.sh)も提供しています。
 
 ### データセットの準備
@@ -148,7 +152,7 @@ tokenizer.apply_chat_template(dataset[0]["input_key"], tokenize=False)
 "<s>[INST] Hello, how are you? [/INST]I'm doing great. How can I help you today?</s> [INST] I'd like to show off how chat templating works! [/INST]"
 ```
 
-トレーニングおよびテストデータセットの指定方法
+テストデータセットの指定方法は？
 
 テストデータセットのパスは ``--eval_dataset {name or path}`` を使用して設定してください。
 
@@ -421,25 +425,12 @@ python -m openrlhf.cli.lora_combiner \
     --bf16
 ```
 
-## パフォーマンス
-
-Adam offload、報酬モデル（RM）および参照モデル（Ref）のoffloadなどの技術を活用することで、DSChatのパフォーマンスを最大限に最適化し、推論段階でのマイクロバッチサイズを増やし、メモリ不足の問題を回避しました。また、DSChatのいくつかのバグを修正し、LLaMA2のHybrid Engine（HE）を有効にしました。最適化されたDSChatとOpenRLHFを使用して1024個のプロンプトを1つのPPO epochでトレーニングするのに必要な平均時間（秒）：
-
-| **サイズ** | **NVIDIA A800-80GB GPUs** | **最適化されたDSChat（Hybrid Engine付き）** | **OpenRLHF** | **スピードアップ** |
-| :---: | :---: | :---: | :---: | :---: |
-| 7B | 16 | 855.09 | 471.11 | 1.82x |
-| 13B | 32 | 1528.93 | 608.93 | 2.5x |
-| 34B | 32 | 3634.98 | 1526.4 | 2.4x |
-| 70B | 32 | 10407.0 | 4488.53 | 2.3x |
-
-> [!NOTE]
-> このデータは古いものです。パフォーマンスチューニングセクションを参照して再テストしてください。
-
 ### パフォーマンスチューニングガイド
 
 最適なパフォーマンスを得るために、ノードを `vLLM:Actor:Critic = 1:1:1` の比率で割り当てることをお勧めします。
 
 - 例えば、70Bモデルと48個のA100 GPUの場合、16個のA100 GPUをvLLMエンジンに、16個のGPUをActorモデルに、残りの16個のGPUをCriticモデルに割り当てることをお勧めします。
+- RLアルゴリズムの収束性が要求を満たす場合は、非同期トレーニング `--async_train` を有効にしてください。
 - GPUメモリが十分にある場合は、分散RLHFではなく、hybrid engine `--colocate_all_models` と `--vllm_enable_sleep` および `--deepspeed_enable_sleep` を使用してください。
 - `--colocate_critic_reward`、`--colocate_actor_ref` オプションを有効にしてノードを統合します。
 - `rollout_micro_batch_size` を可能な限り増やし（vLLMエンジンのTPサイズを最小化）、トレーニングフェーズでは `--micro_train_batch_size` を大きくし、`--packing_samples` を有効にしてください。
@@ -498,13 +489,38 @@ Adam offload、報酬モデル（RM）および参照モデル（Ref）のoffloa
   <img src="https://contrib.rocks/image?repo=OpenRLHF/OpenRLHF" />
 </a>
 
+## 参考文献と謝辞
+
+AIとNLP分野への貢献に対して、以下のプロジェクトと組織に感謝の意を表します：
+
+- [Hugging Face Transformers ↗](https://github.com/huggingface/transformers)
+- [OpenAI GPT ↗](https://github.com/openai/gpt-3)
+- [LLaMA ↗](https://llama.meta.com/)
+- [DeepSpeed ↗](https://github.com/microsoft/DeepSpeed)
+- [Ray ↗](https://github.com/ray-project/ray)
+
+私たちのプロジェクトは [ColossalChat](https://github.com/hpcaitech/ColossalAI/tree/main/applications/ColossalChat) と [DeepSpeedChat](https://github.com/microsoft/DeepSpeedExamples/tree/master/applications/DeepSpeed-Chat) にも感謝したいと思います。プロジェクトの初期段階で、彼らのコード設計を参考にしました。
+私たちのプロジェクトは、リングアテンション開発のGPUサポートを提供してくれた [Netmind.AI](https://www.netmind.ai/) にも感謝したいと思います。
+
+(2024/7) 私たちのGitHub組織はOpenLLMAIからOpenRLHFに変更されました。
+
 ## 引用
+OpenRLHF
 ```
 @article{hu2024openrlhf,
   title={OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework},
   author={Jian Hu and Xibin Wu and Zilin Zhu and Xianyu and Weixun Wang and Dehao Zhang and Yu Cao},
   journal={arXiv preprint arXiv:2405.11143},
   year={2024}
+}
+```
+REINFORCE++-baseline
+```
+@article{hu2025reinforce++,
+  title={Reinforce++: A simple and efficient approach for aligning large language models},
+  author={Hu, Jian},
+  journal={arXiv preprint arXiv:2501.03262},
+  year={2025}
 }
 ```
 
