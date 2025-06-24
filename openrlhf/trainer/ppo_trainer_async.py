@@ -159,7 +159,7 @@ class TrainingActor(BasePPOTrainer):
         else:
             self.kl_ctl = FixedKLController(self.init_kl_coef)
 
-        if not self.remote_experience_maker_cls:
+        if not hasattr(self, 'remote_experience_maker_cls') or self.remote_experience_maker_cls is None:
             self.remote_experience_maker_cls = RemoteExperienceMaker
 
         self.experience_maker = self.remote_experience_maker_cls(
@@ -259,8 +259,8 @@ class PPOTrainerAsync:
         dataloader_pin_memory: bool = True,
         prompt_split: str = "train",
         eval_split: str = "test",
-        remote_experience_maker_cls: RemoteExperienceMaker = None,
-        sample_generator_cls: GenerateSamplesActor = None,
+        remote_experience_maker_cls: RemoteExperienceMaker = RemoteExperienceMaker,
+        sample_generator_cls: GenerateSamplesActor = GenerateSamplesActor,
         **generate_kwargs,
     ) -> None:
         super().__init__()

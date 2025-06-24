@@ -35,6 +35,7 @@ class BasePPOTrainer(ABC):
         prompt_split: str = "train",
         eval_split: str = "test",
         sample_generator_cls: Optional[SamplesGenerator] = None,
+        remote_experience_maker_cls: Optional[RemoteExperienceMaker] = RemoteExperienceMaker,
         **generate_kwargs,
     ) -> None:
         super().__init__()
@@ -72,6 +73,8 @@ class BasePPOTrainer(ABC):
         self.samples_generator = None
         self.experience_maker = None
         self.remote_reward_model = None
+
+        self.remote_experience_maker_cls = remote_experience_maker_cls
 
         if sample_generator_cls is None:
             if self.args.agent_func_path:
@@ -398,7 +401,7 @@ class PPOTrainer(BasePPOTrainer):
         dataloader_pin_memory: bool = True,
         prompt_split: str = "train",
         eval_split: str = "test",
-        remote_experience_maker_cls: RemoteExperienceMaker = None,
+        remote_experience_maker_cls: RemoteExperienceMaker = RemoteExperienceMaker,
         **generate_kwargs,
     ) -> None:
         super().__init__(
