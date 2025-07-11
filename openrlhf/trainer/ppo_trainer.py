@@ -225,6 +225,7 @@ class BasePPOTrainer(ABC):
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
+            print(f"saving! {global_step}/{args.save_steps}")
             tag = f"global_step{global_step}"
             ref = self.actor_model_group.async_run_method(
                 method_name="save_checkpoint", tag=tag, client_states=client_states
@@ -232,6 +233,8 @@ class BasePPOTrainer(ABC):
             if self.critic_model_group is not None:
                 ref.extend(self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag))
             ray.get(ref)
+        else:
+            print(f"not saving! {global_step}/{args.save_steps}")
 
     def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
         """Evaluate model performance on eval dataset.
