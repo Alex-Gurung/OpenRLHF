@@ -345,12 +345,15 @@ class DeepspeedStrategy(ABC):
         unwrapped_model.load_state_dict(state_dict, strict=strict)
 
     def save_model(self, model: nn.Module, tokenizer, output_dir, **kwargs) -> None:
+        print(f"inside deepspeed save_model")
         if self.is_rank_0():
+            print(f"making dirs: {output_dir}")
             os.makedirs(output_dir, exist_ok=True)
 
         # save model weights for ZeRO2/3
         model_to_save = self._unwrap_model(model)
 
+        print(f"gathering parameters")
         # gather parameters
         if self.args.zero_stage > 2 or self.args.ds_tensor_parallel_size > 1:
             output_state_dict = (
@@ -363,6 +366,7 @@ class DeepspeedStrategy(ABC):
 
             output_state_dict = clone_tensors_for_torch_save(model_to_save.state_dict())
 
+        print(f"about to save with rank {self.get_rank()}")
         if self.is_rank_0():
             state_dict_keys = set(model_to_save.state_dict().keys())
             output_state_dict_keys = set(output_state_dict.keys())
@@ -395,14 +399,17 @@ class DeepspeedStrategy(ABC):
             model_to_save.config.to_json_file(output_config_file)
             # save tokenizer
             tokenizer.save_pretrained(output_dir)
-
+        print(f"done saving with rank {self.get_rank()}")
         del output_state_dict
         # Explicitly release memory
         import gc
 
-        gc.collect()
+        print(f"collecting garbage")
 
+        gc.collect()
+        print(f"syncing")
         torch_dist_barrier_and_cuda_sync()
+        print(f"done syncing")
 
     def all_reduce(self, data, op="mean"):
         assert op in ("mean", "max", "sum")
