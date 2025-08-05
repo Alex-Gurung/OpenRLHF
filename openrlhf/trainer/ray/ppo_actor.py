@@ -576,3 +576,241 @@ class PolicyModelActor(BaseModelActor):
             )
         # wait
         torch_dist_barrier_and_cuda_sync()
+
+    def train_reasoning_projector_full_loop(self, training_batches, epochs):
+        """Full training loop for reasoning projector (called via Ray)"""
+        
+        # Ensure model is in training mode
+        self.actor.train()
+        
+        # Freeze all parameters except reasoning projector (following old_train_sft.py pattern)
+        for param in self.actor.model.model.parameters():
+            param.requires_grad = False
+        for param in self.actor.model.lm_head.parameters():
+            param.requires_grad = False
+        
+        # Check if reasoning projector exists
+        if not hasattr(self.actor.model.model, 'reasoning_projector'):
+            logger.warning("Model does not have reasoning_projector module. Skipping training.")
+            return 0.0
+            
+        for param in self.actor.model.model.reasoning_projector.parameters():
+            param.requires_grad = True
+            
+        # Create optimizer once for the entire training loop
+        projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+        if not projector_params:
+            logger.warning("No reasoning projector parameters found. Skipping training.")
+            return 0.0
+            
+        optimizer = torch.optim.AdamW(projector_params, lr=self.args.reasoning_projector_lr)
+        
+        device = torch.cuda.current_device()
+        total_loss = 0.0
+        step_count = 0
+        
+        # Training loop (following SFT/PPO actor patterns)
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            
+            for batch_idx, batch in enumerate(training_batches):
+                # Move batch to device
+                input_ids = batch.input_ids.to(device)
+                attention_mask = batch.attention_mask.to(device)
+                labels = batch.labels.to(device)
+                
+                # Forward pass
+                outputs = self.actor.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True
+                )
+                
+                loss = outputs.loss
+                
+                # Backward and optimizer step (strategy handles gradient accumulation internally)
+                self.strategy.backward(loss, self.actor, optimizer)
+                self.strategy.optimizer_step(optimizer, self.actor, None, name="reasoning_projector")
+                
+                epoch_loss += loss.item()
+                step_count += 1
+                
+            total_loss += epoch_loss
+            avg_epoch_loss = epoch_loss / len(training_batches)
+            logger.info(f"Reasoning projector epoch {epoch}: loss={avg_epoch_loss:.4f}")
+        
+        # Re-enable all parameters for normal training
+        for param in self.actor.model.parameters():
+            param.requires_grad = True
+            
+        avg_total_loss = total_loss / step_count if step_count > 0 else 0.0
+        return avg_total_loss
+    
+    def train_reasoning_projector_distributed(self, dataset, per_gpu_batch_size, epochs, learning_rate):
+        """Efficient distributed reasoning projector training"""
+        from torch.utils.data import DataLoader, DistributedSampler
+        
+        # Ensure model is in training mode
+        self.actor.train()
+        
+        # Freeze all parameters except reasoning projector
+        for param in self.actor.model.model.parameters():
+            param.requires_grad = False
+        for param in self.actor.model.lm_head.parameters():
+            param.requires_grad = False
+        
+        # Check if reasoning projector exists
+        if not hasattr(self.actor.model.model, 'reasoning_projector'):
+            logger.warning("Model does not have reasoning_projector module. Skipping training.")
+            return 0.0
+            
+        for param in self.actor.model.model.reasoning_projector.parameters():
+            param.requires_grad = True
+        
+        # Get reasoning projector parameters
+        projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+        if not projector_params:
+            logger.warning("No reasoning projector parameters found. Skipping training.")
+            return 0.0
+        
+        # Create fresh optimizer and scheduler (as you requested)
+        optimizer = torch.optim.AdamW(
+            projector_params, 
+            lr=learning_rate,
+            betas=(0.9, 0.95),  # Standard for LLM training
+            weight_decay=0.1,
+            eps=1e-8
+        )
+        
+        # Calculate total steps for scheduler
+        total_steps = len(dataset) // per_gpu_batch_size * epochs
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=learning_rate * 0.1
+        )
+        
+        # Setup distributed dataloader
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        
+        sampler = DistributedSampler(
+            dataset, 
+            num_replicas=world_size, 
+            rank=rank,
+            shuffle=True,
+            drop_last=True
+        ) if world_size > 1 else None
+        
+        dataloader = DataLoader(
+            dataset,
+            batch_size=per_gpu_batch_size,
+            sampler=sampler,
+            shuffle=(sampler is None),
+            pin_memory=True,
+            num_workers=2,  # Efficient dataloading
+            drop_last=True,
+            collate_fn=self._collate_reasoning_samples
+        )
+        
+        device = torch.cuda.current_device()
+        total_loss = 0.0
+        step_count = 0
+        
+        logger.info(f"🚀 [REASONING PROJECTOR] Rank {rank}: Starting training - {epochs} epochs, {len(dataloader)} steps/epoch")
+        
+        # Check if reasoning projector exists
+        has_projector = hasattr(self.actor.model.model, 'reasoning_projector')
+        logger.info(f"🚀 [REASONING PROJECTOR] Model has reasoning_projector: {has_projector}")
+        
+        if has_projector:
+            projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+            logger.info(f"🚀 [REASONING PROJECTOR] Reasoning projector has {len(projector_params)} parameters")
+        else:
+            logger.warning("❌ [REASONING PROJECTOR] No reasoning_projector found in model!")
+        
+        # Training loop with distributed reductions
+        for epoch in range(epochs):
+            if sampler:
+                sampler.set_epoch(epoch)
+                
+            epoch_loss = 0.0
+            epoch_steps = 0
+            
+            for batch_idx, batch in enumerate(dataloader):
+                # Move batch to device
+                input_ids = batch.input_ids.to(device, non_blocking=True)
+                attention_mask = batch.attention_mask.to(device, non_blocking=True)
+                labels = batch.labels.to(device, non_blocking=True)
+                
+                # Forward pass
+                outputs = self.actor.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    return_dict=True
+                )
+                
+                loss = outputs.loss
+                
+                # Backward and optimizer step using strategy for efficiency
+                self.strategy.backward(loss, self.actor, optimizer)
+                self.strategy.optimizer_step(optimizer, self.actor, scheduler, name="reasoning_projector")
+                
+                epoch_loss += loss.item()
+                step_count += 1
+                epoch_steps += 1
+                
+                # Log progress periodically
+                if batch_idx % 10 == 0 and rank == 0:
+                    logger.info(f"Epoch {epoch}, Step {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
+            
+            total_loss += epoch_loss
+            avg_epoch_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0.0
+            
+            # All-reduce epoch loss for logging
+            if world_size > 1:
+                epoch_loss_tensor = torch.tensor(avg_epoch_loss, device=device)
+                torch.distributed.all_reduce(epoch_loss_tensor)
+                avg_epoch_loss = epoch_loss_tensor.item() / world_size
+            
+            if rank == 0:
+                logger.info(f"Reasoning projector epoch {epoch}: avg_loss={avg_epoch_loss:.4f}")
+        
+        # Re-enable all parameters for normal training
+        for param in self.actor.model.parameters():
+            param.requires_grad = True
+            
+        avg_total_loss = total_loss / step_count if step_count > 0 else 0.0
+        
+        # All-reduce final loss across all ranks
+        if world_size > 1:
+            loss_tensor = torch.tensor(avg_total_loss, device=device)
+            torch.distributed.all_reduce(loss_tensor)
+            avg_total_loss = loss_tensor.item() / world_size
+        
+        # Collect comprehensive training metrics
+        training_metrics = {
+            "loss": avg_total_loss,
+            "learning_rate": scheduler.get_last_lr()[0] if scheduler else learning_rate,
+            "total_steps": step_count,
+            "epochs": epochs,
+            "samples_processed": len(dataset),
+            "gpu_memory_allocated": torch.cuda.memory_allocated(device) / 1024**3,  # GB
+            "gpu_memory_reserved": torch.cuda.memory_reserved(device) / 1024**3,    # GB
+        }
+            
+        return training_metrics
+    
+    def _collate_reasoning_samples(self, batch):
+        """Collate function for reasoning projector samples"""
+        # Extract samples from ReasoningProjectorBatch objects
+        input_ids = torch.cat([sample.input_ids for sample in batch], dim=0)
+        attention_mask = torch.cat([sample.attention_mask for sample in batch], dim=0)
+        labels = torch.cat([sample.labels for sample in batch], dim=0)
+        
+        from openrlhf.trainer.reasoning_projector_trainer import ReasoningProjectorBatch
+        return ReasoningProjectorBatch(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )

@@ -450,6 +450,20 @@ if __name__ == "__main__":
         "--dynamic_filtering_reward_range", nargs=2, default=(0, 1), type=float, help="Dynamic filtering rewards range"
     )
 
+        # Reasoning Projector Training
+    parser.add_argument("--enable_reasoning_projector_training", action="store_true", default=False,
+                       help="Enable reasoning projector training after each episode")
+    parser.add_argument("--reasoning_projector_epochs", type=int, default=1,
+                       help="Number of training epochs for reasoning projector per episode")
+    parser.add_argument("--reasoning_projector_lr", type=float, default=1e-5,
+                       help="Learning rate for reasoning projector training")
+    parser.add_argument("--reasoning_projector_data_ratio", type=float, default=0.1,
+                       help="Ratio of generated samples to use for projector training")
+    parser.add_argument("--reasoning_projector_swap_ratio", type=float, default=0.3,
+                       help="Ratio of reasoning sentences to swap with special tokens")
+    parser.add_argument("--reasoning_projector_batch_size", type=int, default=None,
+                       help="Batch size for projector training (defaults to micro_train_batch_size)")
+
     # TensorBoard parameters
     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")
 

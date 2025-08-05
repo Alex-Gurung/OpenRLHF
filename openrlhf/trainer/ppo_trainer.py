@@ -454,6 +454,15 @@ class PPOTrainer(BasePPOTrainer):
         self.prepare_datasets()
         self._init_wandb()
 
+        # Initialize reasoning projector trainer if enabled
+        if self.args.enable_reasoning_projector_training:
+            from openrlhf.trainer.reasoning_projector_trainer import ReasoningProjectorTrainer
+            self.reasoning_projector_trainer = ReasoningProjectorTrainer(
+                self.tokenizer, self.strategy, self.args
+            )
+            self.episode_experiences = []  # Store experiences for projector training
+            logger.info("Reasoning projector training enabled")
+
         # get eval and save steps
         if self.args.eval_steps == -1:
             self.args.eval_steps = float("inf")  # do not evaluate
@@ -535,6 +544,11 @@ class PPOTrainer(BasePPOTrainer):
                     number_of_samples = 0
 
                 experiences = self.experience_maker.make_experience_batch(rollout_samples)
+                
+                # Keep experiences to train reasoning projector if enabled
+                if self.args.enable_reasoning_projector_training:
+                    self.episode_experiences.append(experiences)
+                
                 sample0 = self.tokenizer.batch_decode(
                     experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
                 )
@@ -572,7 +586,83 @@ class PPOTrainer(BasePPOTrainer):
 
                 steps = steps + 1
 
+            # Run training of reasoning projector if enabled
+            if self.args.enable_reasoning_projector_training and hasattr(self, 'episode_experiences'):
+                self._train_reasoning_projector(episode)
+                self.episode_experiences.clear()  # Clear for next episode
+
         if self._wandb is not None:
             self._wandb.finish()
         if self._tensorboard is not None:
             self._tensorboard.close()
+
+    def _train_reasoning_projector(self, episode):
+        """Train reasoning projector using experiences from current episode"""
+        if not self.episode_experiences:
+            logger.warning("No experiences available for reasoning projector training")
+            return
+            
+        logger.info(f"Starting distributed reasoning projector training for episode {episode}")
+        
+        # Flatten experiences from all batches in the episode
+        all_experiences = []
+        for experience_batch in self.episode_experiences:
+            if isinstance(experience_batch, list):
+                all_experiences.extend(experience_batch)
+            else:
+                all_experiences.append(experience_batch)
+        
+        # Track training time
+        import time
+        start_time = time.time()
+        
+        # Use new distributed training with sleep/wake optimization
+        metrics = self.reasoning_projector_trainer.train_projector_distributed(
+            self.actor_model_group,
+            self.critic_model_group, 
+            self.reward_model_group,
+            self.vllm_engines,
+            all_experiences
+        )
+        
+        # Add timing information
+        training_time = time.time() - start_time
+        metrics["training_time_seconds"] = training_time
+        metrics["samples_per_second"] = metrics.get("samples_processed", 0) / max(training_time, 0.001)
+        
+        # Broadcast updated weights to vLLM engines using existing method
+        if self.vllm_engines is not None:
+            logger.info("Broadcasting updated reasoning projector weights to vLLM")
+            self._broadcast_to_vllm()
+        
+        # Log results to wandb/tensorboard
+        self._log_reasoning_projector_results(episode, metrics)
+            
+        logger.info(f"Distributed reasoning projector training completed. Loss: {metrics['loss']:.4f}, "
+                   f"Time: {training_time:.2f}s, Samples: {metrics.get('samples_processed', 0)}")
+    
+    def _log_reasoning_projector_results(self, episode, metrics):
+        """Log reasoning projector training results to wandb/tensorboard"""
+        # Prepare comprehensive logs similar to SFT training
+        logs = {
+            "reasoning_projector_loss": metrics["loss"],
+            "reasoning_projector_learning_rate": metrics["learning_rate"],
+            "reasoning_projector_training_time": metrics["training_time_seconds"],
+            "reasoning_projector_samples_per_second": metrics["samples_per_second"],
+            "reasoning_projector_total_steps": metrics["total_steps"],
+            "reasoning_projector_epochs": metrics["epochs"],
+            "reasoning_projector_samples_processed": metrics["samples_processed"],
+            "reasoning_projector_gpu_memory_allocated_gb": metrics["gpu_memory_allocated"],
+            "reasoning_projector_gpu_memory_reserved_gb": metrics["gpu_memory_reserved"],
+            "reasoning_projector_episode": episode,
+        }
+        
+        # Log to wandb
+        if self._wandb is not None:
+            wandb_logs = {"eval/%s" % k: v for k, v in logs.items()}
+            self._wandb.log(wandb_logs)
+        
+        # Log to tensorboard  
+        elif self._tensorboard is not None:
+            for k, v in logs.items():
+                self._tensorboard.add_scalar(f"eval/{k}", v, episode)
