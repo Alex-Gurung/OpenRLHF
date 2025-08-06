@@ -82,6 +82,10 @@ class Actor(nn.Module):
             else:
                 model_class = AutoModelForCausalLM
 
+            # TODO: FIX THIS HACK FOR NOW
+            from .final_qwen2 import Qwen2ForCausalLM
+            model_class = Qwen2ForCausalLM
+
             self.model = model_class.from_pretrained(
                 pretrain_or_model,
                 trust_remote_code=True,
