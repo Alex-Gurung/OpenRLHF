@@ -1,5 +1,6 @@
 from typing import Optional
 
+import deepspeed
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -120,6 +121,14 @@ class Actor(nn.Module):
             if "output_router_logits" in model_config:
                 print("[MoE] set output_router_logits as True")
                 self.model.config.output_router_logits = True
+
+                # set_z3_leaf_modules is required for MoE models
+                for m in self.model.modules():
+                    # https://github.com/microsoft/DeepSpeed/pull/4966
+                    if "SparseMoeBlock" in m.__class__.__name__:
+                        deepspeed.utils.set_z3_leaf_modules(self.model, [m.__class__])
+                        print(f"Setting zero3 leaf for model on class with name: {m.__class__.__name__}")
+                        break
 
             # https://github.com/huggingface/transformers/issues/26877
             # Use `model.generate(use_cache=True)` instead.`
