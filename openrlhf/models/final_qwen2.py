@@ -33,11 +33,30 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2PreTrainedModel, Qwen2RotaryEmbedding, Qwen2Model, KwargsForCausalLM,
     Qwen2ForCausalLM
 )
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config as OldQwen2Config
 import copy
 from transformers import AutoTokenizer
 from typing import List, Optional
-from .qwen2config import Qwen2Config
+# from qwen2config import Qwen2Config
 from torch._dynamo import disable
+
+class Qwen2Config(OldQwen2Config):
+    model_type = "qwen2"
+    keys_to_ignore_at_inference = ["past_key_values"]
+
+    # Default tensor parallel plan for base model `Qwen2`
+    base_model_tp_plan = {
+        "layers.*.self_attn.q_proj": "colwise",
+        "layers.*.self_attn.k_proj": "colwise",
+        "layers.*.self_attn.v_proj": "colwise",
+        "layers.*.self_attn.o_proj": "rowwise",
+        "layers.*.mlp.gate_proj": "colwise",
+        "layers.*.mlp.up_proj": "colwise",
+        "layers.*.mlp.down_proj": "rowwise",
+        "reasoning_projector.gate_proj": "colwise",
+        "reasoning_projector.up_proj": "colwise",
+        "reasoning_projector.down_proj": "rowwise",
+    }
 
 logger = logging.get_logger(__name__)
 
@@ -114,9 +133,13 @@ class Qwen2Model(Qwen2Model):
     def __init__(self, config: Qwen2Config):
         super().__init__(config)
         
-        self.reasoning_projector = Qwen2MLP(config)
+        # self.reasoning_projector = Qwen2MLP(config)
+        self.NUM_REASONING_LAYERS = 3
+        self.reasoning_projector = nn.Sequential(
+            *[Qwen2MLP(config) for layer_idx in range(self.NUM_REASONING_LAYERS)]
+        )
 
-        self.TOKENIZER = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct-1M")
+        self.TOKENIZER = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
 
     @disable
     def safe_decode(self, token_ids):
@@ -124,12 +147,14 @@ class Qwen2Model(Qwen2Model):
 
     def init_reasoning_projector_from_pretrained(self):
         last_mlp_layer = self.layers[-1].mlp
-        self.reasoning_projector.load_state_dict(last_mlp_layer.state_dict())
+        for i in range(self.NUM_REASONING_LAYERS): 
+            self.reasoning_projector[i].load_state_dict(last_mlp_layer.state_dict())
 
     @can_return_tuple
     @auto_docstring
     def reasoning_forward(
         self,
+        all_embeddings: Optional[torch.FloatTensor] = None,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
@@ -146,86 +171,150 @@ class Qwen2Model(Qwen2Model):
         Generate reasoning embeddings iteratively, where each step builds on previous context.
         
         This method performs N iterations (where N = complexity) of:
-        1. Forward pass with current context + past_key_values
+        1. Forward pass with current context + past_key_values (cache mode) OR complete sequence (non-cache mode)
         2. Extract last hidden state and project through reasoning_projector  
         3. Add reasoning embedding to context for next iteration
-        4. Update past_key_values with accumulated context
+        4. Update past_key_values (cache mode) OR accumulate in all_embeddings (non-cache mode)
         
+        all_embeddings is a list of all embeddings, and should be the basis for non-caching forward passes
+
+
         Args:
+            all_embeddings: All embeddings accumulated so far (for non-cache mode)
             inputs_embeds: Initial context embeddings to start reasoning from
-            past_key_values: Accumulated key/value cache from previous processing
+            past_key_values: Accumulated key/value cache from previous processing (for cache mode)
             complexity: Number of reasoning steps to generate
+            use_cache: Whether to use caching or pass complete sequences
             
         Returns:
             tuple: (reasoning_embeddings, accumulated_past_key_values)
         """
+        # USE_GRAD = True
+        USE_GRAD = False
         # Operate in embedding space
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        # Inputs embeds is the embedding of the section up to the special token
+        # all_embeddings is the embedding of the entire sequence up to this point
+        # when we are using caching, we want to ignore the all_embeddings,
+        # but we need it for non-caching forward passes
+        # Note: all_embeddings already contains inputs_embeds
+
+        # For non-cache mode, convert all_embeddings list to tensor
+        if not use_cache and all_embeddings is not None:
+            all_embeddings_tensor = torch.cat(all_embeddings, dim=1)
+        else:
+            all_embeddings_tensor = None
 
         num_reasoning_steps = 5 if complexity is None else complexity 
         current_past_key_values = past_key_values
         reasoning_embeddings = []
         
-        # print(f"Starting reasoning_forward with {num_reasoning_steps} steps")
-        # print(f"inputs_embeds shape: {inputs_embeds.shape}")
-        # if current_past_key_values is not None:
-        #     print(f"Initial past_key_values shape: {current_past_key_values.key_cache[0].shape}")
-        
         # Iterative reasoning generation - each step builds on previous context
         for step in range(num_reasoning_steps):
-            # Forward pass to get context representation
-            # Use torch.inference_mode() since we don't need gradients through base model
-            with torch.no_grad():
-                outputs = super().forward(
-                    input_ids=None,
-                    # attention_mask=attention_mask,
-                    # position_ids=position_ids,
-                    past_key_values=current_past_key_values,
-                    inputs_embeds=inputs_embeds,
-                    use_cache=True,
-                    output_hidden_states=True,
-                    # cache_position=cache_position,
-                    **flash_attn_kwargs,
-                )
-            
-            # Extract context hidden state (last token, last layer)
+            # if current_past_key_values is not None:
+            #     print(f"Step {step}: past_key_values shape: {current_past_key_values.key_cache[0].shape}")
+            # else:
+            #     print(f"Step {step}: No past_key_values")
+            if USE_GRAD:
+                # Forward pass to get context representation
+                if use_cache:
+                    # Cache mode: Use past_key_values and only pass current inputs_embeds
+                    outputs = super().forward(
+                        input_ids=None,
+                        past_key_values=current_past_key_values,
+                        inputs_embeds=inputs_embeds,
+                        use_cache=True,
+                        output_hidden_states=True,
+                        **flash_attn_kwargs,
+                    )
+                else:
+                    # Non-cache mode: Pass complete sequence of embeddings each time
+                    # print(f"Step {step}: combined_embeddings shape: {all_embeddings_tensor.shape}")
+                    outputs = super().forward(
+                        inputs_embeds=all_embeddings_tensor,
+                        use_cache=False,
+                        output_hidden_states=True,
+                        **flash_attn_kwargs,
+                    )
+            else:
+                with torch.no_grad():
+                    # Forward pass to get context representation
+                    if use_cache:
+                        # Cache mode: Use past_key_values and only pass current inputs_embeds
+                        outputs = super().forward(
+                            input_ids=None,
+                            past_key_values=current_past_key_values,
+                            inputs_embeds=inputs_embeds,
+                            use_cache=True,
+                            output_hidden_states=True,
+                            **flash_attn_kwargs,
+                        )
+                    else:
+                        # Non-cache mode: Pass complete sequence of embeddings each time
+                        # print(f"Step {step}: combined_embeddings shape: {all_embeddings_tensor.shape}")
+                        outputs = super().forward(
+                            inputs_embeds=all_embeddings_tensor,
+                            use_cache=False,
+                            output_hidden_states=True,
+                            **flash_attn_kwargs,
+                        )
+        
+            # Extract context hidden state (last token processed, last layer)
+            # EXPECTED: This captures the full context up to this point for reasoning
             context_hidden = outputs.hidden_states[-1][:, -1, :]  # [batch_size, hidden_size]
             
-            # Generate reasoning embedding through projector (this needs gradients!)  
-            with torch.enable_grad():
-                reasoning_embedding = self.reasoning_projector(context_hidden)  # [batch_size, hidden_size]
+            # Generate reasoning embedding through projector (NEEDS GRADIENTS for training!)
+            reasoning_embedding = self.reasoning_projector(context_hidden)  # [batch_size, hidden_size]
             
             # Store reasoning embedding
             reasoning_embeddings.append(reasoning_embedding)
             
-            # Update context for next iteration: use reasoning embedding as next input
+            # Update context for next iteration
             inputs_embeds = reasoning_embedding.unsqueeze(1)  # [batch_size, 1, hidden_size]
             
-            # Update past_key_values with accumulated context
-            current_past_key_values = outputs.past_key_values
-            
-            # print(f"Step {step}: Generated reasoning embedding, cache size: {current_past_key_values.key_cache[0].shape[2] if current_past_key_values else 'None'}")
+            if use_cache:
+                # Cache mode: Update past_key_values with accumulated context
+                current_past_key_values = outputs.past_key_values
+            else:
+                # Non-cache mode: update all_embeddings_tensor with the reasoning embedding
+                all_embeddings_tensor = torch.cat([all_embeddings_tensor, reasoning_embedding.unsqueeze(1)], dim=1)
         
-        # CRITICAL: Extra forward pass to consume the last reasoning embedding
-        # Without this, the past_key_values doesn't include the last reasoning embedding!
-        if len(reasoning_embeddings) > 0:
-            with torch.no_grad():
+        # CRITICAL: Extra forward pass to consume the last reasoning embedding, only necessary for caching
+        # Non-caching modes don't need this because they pass the entire sequence each time
+        # This ensures the last reasoning embedding is properly processed
+        if len(reasoning_embeddings) > 0 and use_cache:
+            if USE_GRAD:
+                # Cache mode: Use past_key_values
                 final_outputs = super().forward(
                     input_ids=None,
-                    # attention_mask=attention_mask,
-                    # position_ids=position_ids,
                     past_key_values=current_past_key_values,
                     inputs_embeds=reasoning_embeddings[-1].unsqueeze(1),  # Last reasoning embedding
                     use_cache=True,
-                    # cache_position=cache_position,
                     **flash_attn_kwargs,
                 )
                 # Update past_key_values to include the last reasoning embedding
                 current_past_key_values = final_outputs.past_key_values
-        
-        # print(f"Reasoning generation complete. Generated {len(reasoning_embeddings)} embeddings")
-        # print(f"new current_past_key_values shape: {current_past_key_values.key_cache[0].shape}")
+            else:
+                with torch.no_grad():
+                    # Cache mode: Use past_key_values
+                    final_outputs = super().forward(
+                        input_ids=None,
+                        past_key_values=current_past_key_values,
+                        inputs_embeds=reasoning_embeddings[-1].unsqueeze(1),  # Last reasoning embedding
+                        use_cache=True,
+                        **flash_attn_kwargs,
+                    )
+                    # Update past_key_values to include the last reasoning embedding
+                    current_past_key_values = final_outputs.past_key_values
+            # else:
+            #     # Non-cache mode: Pass complete sequence including last reasoning embedding
+            #     final_outputs = super().forward(
+            #         inputs_embeds=all_embeddings_tensor,
+            #         use_cache=False,
+            #         **flash_attn_kwargs,
+            #     )
+            #     # No past_key_values to update in non-cache mode
         
         return reasoning_embeddings, current_past_key_values
 
@@ -244,6 +333,11 @@ class Qwen2Model(Qwen2Model):
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
+        # note about caching:
+        # gradient checkpointing doesn't allow caching so we need to 
+        # keep track of all of the embeddings and pass them through each time
+        # this is notably slower, but should only be needed for training
+        # during inference use_cache=True is much faster
         # special_start_token = 151657
         # special_end_token = 151658
         # Pre-create tensors for efficient vectorized matching
@@ -272,15 +366,19 @@ class Qwen2Model(Qwen2Model):
             # print("No input_ids, running normal forward")
             return super().forward(
                 input_ids=input_ids,
-                inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                cache_position=cache_position,
                 **flash_attn_kwargs,
             )
         # first we check if the input_ids contains <thought> (we actually do <|quad_start|> so it's only one token)
         else:
-            original_past_key_values = copy.deepcopy(past_key_values)
+            # original_past_key_values = copy.deepcopy(past_key_values)
             # For now, assume batch size 1 as requested
             if input_ids.shape[0] != 1:
                 raise ValueError(
@@ -305,6 +403,11 @@ class Qwen2Model(Qwen2Model):
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    cache_position=cache_position,
                     **flash_attn_kwargs,
                 )
 
@@ -349,11 +452,29 @@ class Qwen2Model(Qwen2Model):
                 if (len(complexity_str) <= 3 and len(complexity_str) > 0 and 
                     complexity_str.isdigit()):
                     complexity = int(complexity_str)
+                    # FAKE COMPLEXITY VALUE
+                    # complexity = 1
                     correct_complexity_indices.append(thought_start_idx)
                     num_complexity_tokens.append(len(complexity_tokens))
                     complexities.append(complexity)
 
             thought_start_indices = correct_complexity_indices
+
+            if len(thought_start_indices) == 0:
+                print("No full thought found, running normal forward")
+                return super().forward(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    cache_position=cache_position,
+                    **flash_attn_kwargs,
+                )
+
             # print(f"length of thought_start_indices: {len(thought_start_indices)}")
 
             # print(f"thought_start_indices: {thought_start_indices}")
@@ -372,7 +493,7 @@ class Qwen2Model(Qwen2Model):
                     + special_start_sequences.shape[1]  # Length of start sequence
                     + length_complexity_tokens
                     + special_end_sequences.shape[1]    # Length of end sequence
-                    + 1
+                    # + 1
                 )
                 end_of_thought_idx = min(end_of_thought_idx, input_ids.shape[1])
 
@@ -382,29 +503,41 @@ class Qwen2Model(Qwen2Model):
                     batch_idx : batch_idx + 1, section_start:end_of_thought_idx
                 ]
                 # decoded_section = self.safe_decode(section_input_ids[0])
-                # print(f"handling (complexity: {complexity}) section: {decoded_section}")
+                # print(f"handling (complexity: {complexity}) section: {repr(decoded_section)}")
+                # x = 1/0
 
                 section_input_embeds = self.embed_tokens(section_input_ids)
                 all_embeddings.extend(
                     [inp.unsqueeze(0) for inp in section_input_embeds]
                 )
+                # We mask out everything up until the reasoning embeddings
+                num_to_not_mask = section_input_embeds.shape[1] - 1
+                num_to_not_mask = max(num_to_not_mask, 0)
                 is_reasoning_embedding_mask.extend(
-                    [False] * section_input_embeds.shape[1]
+                    # [False] * section_input_embeds.shape[1]
+                    [False] * num_to_not_mask
                 )
+                is_reasoning_embedding_mask.append(True)
                 # Run reasoning_forward on this section to generate reasoning embeddings
-                # print(f"Running reasoning_forward on section_input_embeds shape: {section_input_embeds.shape}")
+                # For non-cache mode, pass all_embeddings so reasoning_forward can build complete sequences
+                # Note: section_input_embeds are already included in all_embeddings at this point
                 reasoning_embeddings, updated_past_key_values = self.reasoning_forward(
+                    all_embeddings=all_embeddings if not use_cache else None,
                     inputs_embeds=section_input_embeds,
                     past_key_values=current_past_key_values,
-                    use_cache=True,
+                    use_cache=use_cache,
                     complexity=complexity,
                     **flash_attn_kwargs,
                 )
                 
                 # Add reasoning embeddings to sequence (these need gradients for training!)
-                for reasoning_emb in reasoning_embeddings:
-                    all_embeddings.append(reasoning_emb.unsqueeze(1))  # [batch_size, 1, hidden_size]
-                is_reasoning_embedding_mask.extend([True] * len(reasoning_embeddings))
+                all_embeddings.extend(
+                    [inp.unsqueeze(0) for inp in reasoning_embeddings]
+                )
+                num_reasoning_embeddings = len(reasoning_embeddings)
+                num_reasoning_to_mask = max(num_reasoning_embeddings - 1, 0)
+                is_reasoning_embedding_mask.extend([True] * num_reasoning_to_mask)
+                is_reasoning_embedding_mask.append(False)
 
                 # Update past_key_values with accumulated reasoning context
                 current_past_key_values = updated_past_key_values
@@ -438,8 +571,7 @@ class Qwen2Model(Qwen2Model):
         )
 
         # Single final forward pass with all embeddings (normal + reasoning)
-        # Use past_key_values=None for clean slate to avoid dimension mismatches
-        # print(f"Final forward pass with all_embeddings shape: {all_embeddings.shape}")
+        # Handle cache vs non-cache modes appropriately for gradient correctness
         
         # Update attention mask to cover all embeddings (original + reasoning)  
         if attention_mask is not None:
@@ -451,22 +583,23 @@ class Qwen2Model(Qwen2Model):
                 )
                 attention_mask = torch.cat([attention_mask, additional_mask], dim=1)
         
-        # For cache_position and position_ids, set to None to let transformer handle automatically
-        # This avoids complexity with manual position tracking across reasoning iterations
-        # print(f"final all_embeddings shape: {all_embeddings.shape}")
-        # print(f"final attention_mask shape: {attention_mask.shape}")
-        # print(f"all_embeddings: {all_embeddings}")
+        # EXPECTED STATE: all_embeddings contains complete sequence (original + reasoning embeddings)
+        # - Cache mode: We could use accumulated past_key_values, but for consistency use full sequence
+        # - Non-cache mode: Must use full sequence for proper gradient flow
+        
+        # Always use full sequence mode for final pass to ensure proper gradients
+        # This is critical for training the reasoning projector
         outputs = super().forward(
             inputs_embeds=all_embeddings,
-            # attention_mask=attention_mask,
-            attention_mask=None,
-            position_ids=None,  # Let transformer compute positions automatically
-            past_key_values=None,  # Clean slate - no past context for final pass
-            # use_cache=True,
-            use_cache=False,
-            cache_position=None,  # Let transformer handle cache positions automatically
+            attention_mask=None,  # Let transformer handle attention automatically
+            position_ids=None,   # Let transformer compute positions automatically
+            past_key_values=None,  # Clean slate - ensures all embeddings get proper attention
+            use_cache=False,     # Force non-cache to ensure gradients flow through reasoning embeddings
+            cache_position=None, # Let transformer handle cache positions automatically
             **flash_attn_kwargs,
         )
+        # print(f"original input_ids shape: {input_ids.shape}")
+        # print(f"all_embeddings shape: {all_embeddings.shape}")
         print(f"is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
         # mask out the reasoning embeddings
         # print(f"outputs.last_hidden_state shape: {outputs.last_hidden_state.shape}")
@@ -478,17 +611,19 @@ class Qwen2Model(Qwen2Model):
         # print(f"outputs.last_hidden_state shape: {outputs.last_hidden_state.shape}")
         # print(outouts.last_hidden_state)
         if outputs.hidden_states is not None:
-            outputs.hidden_states = tuple(
-                hidden_state
-                for i, hidden_state in enumerate(outputs.hidden_states)
-                if not is_reasoning_embedding_mask[i]
-            )
+            # outputs.hidden_states = tuple(
+            #     hidden_state
+            #     for i, hidden_state in enumerate(outputs.hidden_states)
+            #     if not is_reasoning_embedding_mask[i]
+            # )
+            outputs.hidden_states = tuple(hs[:, ~is_reasoning_embedding_mask, :] for hs in outputs.hidden_states)
         if outputs.attentions is not None:
-            outputs.attentions = tuple(
-                attention
-                for i, attention in enumerate(outputs.attentions)
-                if not is_reasoning_embedding_mask[i]
-            )
+            # outputs.attentions = tuple(
+            #     attention
+            #     for i, attention in enumerate(outputs.attentions)
+            #     if not is_reasoning_embedding_mask[i]
+            # )
+            outputs.attentions = tuple(attn[:, :, ~is_reasoning_embedding_mask, ~is_reasoning_embedding_mask] for attn in outputs.attentions)
         # print(f"RETURN PAST KEY VALUES: {outputs.past_key_values}")
         # x = 1/0
         return outputs
