@@ -11,6 +11,7 @@ class SamplesGeneratorAsync(SamplesGenerator):
         super().__init__(*args, **kwargs)
 
     def _generate_vllm(self, all_prompts: List[str], all_labels, **kwargs) -> List[Experience]:
+        x = 1/0
         from vllm import SamplingParams
 
         llms = self.vllm_engines
