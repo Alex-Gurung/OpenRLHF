@@ -97,9 +97,18 @@ class LLMRayActor(BaseLLMRayActor):
         Since only rank0 will send requests, we don't need to track actor ranks.
         """
         from vllm.inputs import TokensPrompt
+        # import vllm
+
+        # print(f"vllm version: {vllm.__version__}")
+        # print(f"vllm file: {vllm.__file__}")
 
         requests = [TokensPrompt(prompt_token_ids=r) for r in prompt_token_ids]
+        print(f"RUNNING GENERATE")
         responses = self.llm.generate(prompts=requests, sampling_params=sampling_params)
+        print(f"GENERATE COMPLETED")
+        print(f"PUTTING RESPONSES")
+        # print(f"RESPONSES: {responses}")
+        # x = 1/0
         self.response_queues.put(responses)
 
     def get_responses(self):
