@@ -209,6 +209,12 @@ class Qwen2Model(Qwen2Model):
         num_reasoning_steps = 5 if complexity is None else complexity 
         current_past_key_values = past_key_values
         reasoning_embeddings = []
+
+        if use_cache:
+            if current_past_key_values is not None:
+                print(f"pre-reasoning current_past_key_values shape: {current_past_key_values.key_cache[0].shape}")
+            else:
+                print(f"pre-reasoning current_past_key_values is None")
         
         # Iterative reasoning generation - each step builds on previous context
         for step in range(num_reasoning_steps):
@@ -276,6 +282,10 @@ class Qwen2Model(Qwen2Model):
             if use_cache:
                 # Cache mode: Update past_key_values with accumulated context
                 current_past_key_values = outputs.past_key_values
+                if current_past_key_values is not None:
+                    print(f"mid {step} current_past_key_values shape: {current_past_key_values.key_cache[0].shape}")
+                else:
+                    print(f"mid {step} current_past_key_values is None")
             else:
                 # Non-cache mode: update all_embeddings_tensor with the reasoning embedding
                 all_embeddings_tensor = torch.cat([all_embeddings_tensor, reasoning_embedding.unsqueeze(1)], dim=1)
@@ -315,7 +325,12 @@ class Qwen2Model(Qwen2Model):
             #         **flash_attn_kwargs,
             #     )
             #     # No past_key_values to update in non-cache mode
-        
+        if use_cache:
+            if current_past_key_values is not None:
+                print(f"post-reasoning final current_past_key_values shape: {current_past_key_values.key_cache[0].shape}")
+            else:
+                print(f"post-reasoning final current_past_key_values is None")
+            # x = 1/0
         return reasoning_embeddings, current_past_key_values
 
     @can_return_tuple
@@ -414,7 +429,7 @@ class Qwen2Model(Qwen2Model):
             # Vectorized contiguous sequence matching
             thought_start_indices = []
             input_len = input_seq.shape[0]
-            
+            print(f"input_len: {input_len}")
             # Slide window approach - check all possible positions for start sequences
             for i in range(input_len - seq_len + 1):
                 window = input_seq[i:i + seq_len].unsqueeze(0)  # [1, seq_len]
@@ -601,6 +616,7 @@ class Qwen2Model(Qwen2Model):
         # print(f"original input_ids shape: {input_ids.shape}")
         # print(f"all_embeddings shape: {all_embeddings.shape}")
         print(f"is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
+        print(f"all embeddings shape: {all_embeddings.shape}")
         # mask out the reasoning embeddings
         # print(f"outputs.last_hidden_state shape: {outputs.last_hidden_state.shape}")
         outputs.last_hidden_state = outputs.last_hidden_state[

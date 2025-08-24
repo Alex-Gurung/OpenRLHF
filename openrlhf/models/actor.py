@@ -171,8 +171,12 @@ class Actor(nn.Module):
             rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-
-        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels)
+        
+        # print(f"RUNNING FORWARD WITH USE_CACHE = True")
+        # print(f"self.model")
+        # print(self.model)
+        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels, use_cache=True)
+        # x = 1/0
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
         
