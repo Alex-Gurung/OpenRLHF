@@ -276,8 +276,10 @@ class ActorPPOTrainer(ABC):
         if self.args.use_dynamic_batch:
             if self.replay_buffer.dynamic_optimizer_step[step]:
                 self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+                self.actor.ensure_still_tied(every_n=50, deep_every=1000)
         else:
             self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
+            self.actor.ensure_still_tied(every_n=50, deep_every=1000)
 
         if self.ema_model:
             if self.args.use_dynamic_batch:
@@ -285,7 +287,6 @@ class ActorPPOTrainer(ABC):
                     self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
             else:
                 self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
-
         # status
         status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
         if self.args.entropy_loss_coef is not None:
@@ -423,6 +424,7 @@ class PolicyModelActor(BaseModelActor):
             packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,
             use_liger_kernel=strategy.args.use_liger_kernel,
+            use_shadow_model=True,
         )
         strategy.print(actor)
 
@@ -482,6 +484,7 @@ class PolicyModelActor(BaseModelActor):
             self.checkpoint_states["global_step"] = states["global_step"]
             self.checkpoint_states["episode"] = states["episode"]
             self.checkpoint_states["data_loader_state_dict"] = states["data_loader_state_dict"]
+            self.actor._shadow_tied = False
 
         # initial offload
         if strategy.args.deepspeed_enable_sleep:
@@ -556,6 +559,7 @@ class PolicyModelActor(BaseModelActor):
 
     def reload_states(self):
         reload_deepspeed_states(self.actor.model)
+        self.actor._shadow_tied = False
 
     def offload_states(self):
         offload_deepspeed_states(self.actor.model)

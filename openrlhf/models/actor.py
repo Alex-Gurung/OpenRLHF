@@ -50,11 +50,14 @@ class Actor(nn.Module):
         packing_samples=False,
         temperature=1.0,
         use_liger_kernel=False,
+        use_shadow_model=False,
+        ignore_grad=False,
         **kwargs,
     ) -> None:
         super().__init__()
         self.temperature = temperature
-
+        self.use_shadow_model = use_shadow_model
+        self.ignore_grad = ignore_grad
         if isinstance(pretrain_or_model, str):
             # Support multiple attention mechanism implementations
             attn_impl = attn_implementation
@@ -96,6 +99,20 @@ class Actor(nn.Module):
                 torch_dtype=torch.bfloat16 if bf16 else "auto",
                 device_map=device_map,
             )
+            
+            if use_shadow_model:
+                self.shadow_model = model_class.from_pretrained(
+                    pretrain_or_model,
+                    trust_remote_code=True,
+                    attn_implementation=attn_impl,
+                    quantization_config=nf4_config,
+                    torch_dtype=torch.bfloat16 if bf16 else "auto",
+                    device_map=None,
+                )
+                self.shadow_model.eval()
+                self.shadow_model.gradient_checkpointing_disable()
+                self.shadow_model.config.use_cache = True
+                self._shadow_tied = False
 
             # LoRA
             if lora_rank > 0:
@@ -144,6 +161,81 @@ class Actor(nn.Module):
         else:
             self.model = pretrain_or_model
 
+    def _tie_shadow_to_train_if_needed(self):
+        if not self.use_shadow_model:
+            return
+        if self._shadow_tied:
+            return
+        # unwrap if DeepSpeed engine
+        train = self.model
+        if hasattr(train, "module"):
+            train = train.module
+
+        # tie parameters: same storage, no grads on shadow
+        t_params = dict(train.named_parameters())
+        for name, p_s in self.shadow_model.named_parameters():
+            p_s.requires_grad_(False)
+            p_t = t_params[name]
+            # rebind storage; no allocation
+            if p_s.data.data_ptr() != p_t.data.data_ptr():
+                p_s.data = p_t.data
+
+        # (Optional) tie buffers as well (also rebind)
+        t_bufs = dict(train.named_buffers())
+        for name, b_s in self.shadow_model.named_buffers():
+            if name in t_bufs:
+                b_t = t_bufs[name]
+                if b_s.data.data_ptr() != b_t.data.data_ptr():
+                    b_s.data = b_t.data
+
+        self._shadow_tied = True
+
+    def ensure_still_tied(self, sample_names=None, every_n: int = 1, deep_every: int = 0):
+        """
+        Verify that shadow params still alias train params.
+        - every_n: do the (cheap) sampled check every N calls (default 1 = every step).
+        - deep_every: do a full scan every deep_every calls (0 = never).
+        Auto re-ties if linkage was lost.
+        """
+        # lazy tie if not done yet
+        if not self.use_shadow_model:
+            return
+        if not getattr(self, "_shadow_tied", False):
+            self._tie_shadow_to_train_if_needed()
+            return
+
+        # throttle
+        c = getattr(self, "_tie_chk_ctr", 0) + 1
+        self._tie_chk_ctr = c
+        if every_n > 1 and (c % every_n) != 0:
+            return
+
+        train = self.model.module if hasattr(self.model, "module") else self.model
+        t_params = dict(train.named_parameters())
+        s_params = dict(self.shadow_model.named_parameters())
+
+        # fast/sampled check
+        sample_names = sample_names or [
+            "model.embed_tokens.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "lm_head.weight",
+        ]
+        for n in sample_names:
+            if n not in t_params or n not in s_params or \
+            t_params[n].data.data_ptr() != s_params[n].data.data_ptr():
+                self._shadow_tied = False
+                self._tie_shadow_to_train_if_needed()
+                return
+
+        # optional full sweep every deep_every calls
+        if deep_every and (c % deep_every) == 0:
+            for n, tp in t_params.items():
+                sp = s_params.get(n, None)
+                if sp is None or tp.data.data_ptr() != sp.data.data_ptr():
+                    self._shadow_tied = False
+                    self._tie_shadow_to_train_if_needed()
+                    return
+
     def forward(
         self,
         sequences: torch.LongTensor,
@@ -156,6 +248,7 @@ class Actor(nn.Module):
         packed_seq_lens: Optional[list[int]] = None,
         return_entropy=False,
         labels: Optional[torch.Tensor] = None,
+        use_shadow_model=False,
         return_loss=False,
     ) -> torch.Tensor:
         """Returns action log probs"""
@@ -175,7 +268,23 @@ class Actor(nn.Module):
         # print(f"RUNNING FORWARD WITH USE_CACHE = True")
         # print(f"self.model")
         # print(self.model)
-        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels, use_cache=True)
+        # output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels)
+        is_reasoning_embedding_mask = None
+        input_embeds = None
+        print(f"use_shadow_model: {self.use_shadow_model}; ignore_grad: {self.ignore_grad}")
+        if self.use_shadow_model:
+            self._tie_shadow_to_train_if_needed()
+        
+            with torch.no_grad():
+                # never use shadow model for gradient computation
+                input_embeds, is_reasoning_embedding_mask = self.shadow_model.shadow_forward(sequences, attention_mask=foward_attention_mask, position_ids=position_ids)
+            sequences = None
+        # output = self.model(input_ids=None, inputs_embeds=input_embeds, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels, is_reasoning_embedding_mask=is_reasoning_embedding_mask)
+        if self.ignore_grad:
+            with torch.no_grad():
+                output = self.model(input_ids=sequences, inputs_embeds=input_embeds, labels=labels, given_is_reasoning_embedding_mask=is_reasoning_embedding_mask)
+        else:
+            output = self.model(input_ids=sequences, inputs_embeds=input_embeds, labels=labels, given_is_reasoning_embedding_mask=is_reasoning_embedding_mask)
         # x = 1/0
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)

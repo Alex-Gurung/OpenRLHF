@@ -346,6 +346,7 @@ class Qwen2Model(Qwen2Model):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        given_is_reasoning_embedding_mask: Optional[torch.BoolTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
         # note about caching:
@@ -377,9 +378,9 @@ class Qwen2Model(Qwen2Model):
         all_embeddings = []
         is_reasoning_embedding_mask = []
         original_past_key_values = None
-        if input_ids is None:
-            # print("No input_ids, running normal forward")
-            return super().forward(
+        if input_ids is None or inputs_embeds is not None:
+            print("No input_ids or inputs_embeds is not None, running normal forward")
+            outputs = super().forward(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -391,6 +392,22 @@ class Qwen2Model(Qwen2Model):
                 cache_position=cache_position,
                 **flash_attn_kwargs,
             )
+            if given_is_reasoning_embedding_mask is not None:
+                print("Given is reasoning embedding mask, masking")
+                is_reasoning_embedding_mask = given_is_reasoning_embedding_mask
+                # do the masking
+                print(f"is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
+                print(f"input_embeds shape: {inputs_embeds.shape}")
+                # mask out the reasoning embeddings
+                outputs.last_hidden_state = outputs.last_hidden_state[
+                    :, ~is_reasoning_embedding_mask, :
+                ]
+                if outputs.hidden_states is not None:
+                    outputs.hidden_states = tuple(hs[:, ~is_reasoning_embedding_mask, :] for hs in outputs.hidden_states)
+                if outputs.attentions is not None:
+                    outputs.attentions = tuple(attn[:, :, ~is_reasoning_embedding_mask, ~is_reasoning_embedding_mask] for attn in outputs.attentions)
+                
+            return outputs
         # first we check if the input_ids contains <thought> (we actually do <|quad_start|> so it's only one token)
         else:
             # original_past_key_values = copy.deepcopy(past_key_values)
@@ -644,6 +661,253 @@ class Qwen2Model(Qwen2Model):
         # x = 1/0
         return outputs
 
+    @can_return_tuple
+    @auto_docstring
+    @torch.no_grad()
+    def shadow_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+    ) -> BaseModelOutputWithPast:
+        # This method should use the cache when applicable, 
+        # and returns all_embeddings and the reasoning embedding mask
+        # we will then pass this to the normal forward model who cannot use the cache
+        # for the final forward
+        # Pre-create tensors for efficient vectorized matching
+        special_start_sequences = torch.tensor([
+            [27, 30940, 5854, 2450, 29],  # <implicit_thought>
+            [366, 30940, 5854, 2450, 29],  # " <implicit_thought>"
+            [15757, 30940, 5854, 2450, 29],
+            [1784, 30940, 5854, 2450, 29],
+            [22476, 30940, 5854, 2450, 29]
+        ], dtype=torch.long)
+        special_end_sequences = torch.tensor([
+            [522, 30940, 5854, 2450, 29],
+            [522, 30940, 5854, 2450, 397],
+            [522, 30940, 5854, 2450, 1339],
+            [522, 30940, 5854, 2450, 10370],
+            [522, 30940, 5854, 2450, 14276],
+            [522, 30940, 5854, 2450, 1472],
+            [522, 30940, 5854, 2450, 9877],
+        ], dtype=torch.long)
+        # print("INSIDE BIG FORWARD")
+        # print(f"attention mask shape: {attention_mask.shape if attention_mask is not None else None}")
+        all_embeddings = []
+        is_reasoning_embedding_mask = []
+        original_past_key_values = None
+        if input_ids is None:
+            print(f"No input_ids (shadow), returning all false mask")
+            # get embeddings and return mask with all false
+            is_reasoning_embedding_mask = torch.zeros(inputs_embeds.shape[1], dtype=torch.bool)
+            return inputs_embeds, is_reasoning_embedding_mask
+        # first we check if the input_ids contains <thought> (we actually do <|quad_start|> so it's only one token)
+        else:
+            # original_past_key_values = copy.deepcopy(past_key_values)
+            # For now, assume batch size 1 as requested
+            if input_ids.shape[0] != 1:
+                raise ValueError(
+                    "Currently only batch size 1 is supported for reasoning"
+                )
+
+            batch_idx = 0  # Since we only support batch size 1
+
+            # Move sequences to device for vectorized operations
+            device_start_seqs = special_start_sequences.to(input_ids.device)
+            seq_len = device_start_seqs.shape[1]
+            input_seq = input_ids[batch_idx]
+            
+            # Fast check: does input contain any start sequence tokens at all?
+            start_tokens = device_start_seqs[:, 0]  # First tokens of start sequences
+            has_any_start_token = torch.isin(input_seq, start_tokens).any()
+            
+            if not has_any_start_token:
+                print("No thought start id found (shadow), returning all false mask")
+                input_embeds = self.embed_tokens(input_ids)
+                is_reasoning_embedding_mask = torch.zeros(input_embeds.shape[1], dtype=torch.bool)
+                return input_embeds, is_reasoning_embedding_mask
+
+            # Vectorized contiguous sequence matching
+            thought_start_indices = []
+            input_len = input_seq.shape[0]
+            print(f"input_len: {input_len}")
+            # Slide window approach - check all possible positions for start sequences
+            for i in range(input_len - seq_len + 1):
+                window = input_seq[i:i + seq_len].unsqueeze(0)  # [1, seq_len]
+                # Check if this window matches any start sequence
+                matches = (window == device_start_seqs).all(dim=1).any()
+                if matches:
+                    thought_start_indices.append(i)
+            # Vectorized complexity validation
+            correct_complexity_indices = []  
+            num_complexity_tokens = []
+            complexities = []
+            
+            # Move special sequences to input device for vectorized operations
+            device_start_seqs = special_start_sequences.to(input_ids.device)
+            device_end_seqs = special_end_sequences.to(input_ids.device)
+            
+            for thought_start_idx in thought_start_indices:
+                # Extract window for sequence matching (vectorized slice)
+                window_end = min(thought_start_idx + 15, input_ids.shape[1])
+                token_window = input_ids[batch_idx, thought_start_idx:window_end]
+                
+                # Use vectorized sequence matching
+                complexity_tokens = check_if_matches_special_sequence(
+                    token_window,
+                    device_start_seqs,
+                    device_end_seqs,
+                    self.TOKENIZER,
+                )
+                
+                if complexity_tokens is None:
+                    continue
+                    
+                # Decode and validate complexity (minimal .decode() usage)
+                complexity_str = self.safe_decode(complexity_tokens)
+                if (len(complexity_str) <= 3 and len(complexity_str) > 0 and 
+                    complexity_str.isdigit()):
+                    complexity = int(complexity_str)
+                    # FAKE COMPLEXITY VALUE
+                    # complexity = 1
+                    correct_complexity_indices.append(thought_start_idx)
+                    num_complexity_tokens.append(len(complexity_tokens))
+                    complexities.append(complexity)
+
+            thought_start_indices = correct_complexity_indices
+
+            if len(thought_start_indices) == 0:
+                print("No full thought found (shadow), returning all false mask")
+                input_embeds = self.embed_tokens(input_ids)
+                is_reasoning_embedding_mask = torch.zeros(input_embeds.shape[1], dtype=torch.bool)
+                return input_embeds, is_reasoning_embedding_mask
+
+            # print(f"length of thought_start_indices: {len(thought_start_indices)}")
+
+            # print(f"thought_start_indices: {thought_start_indices}")
+            # Process each section that ends with a thought_start_id
+            current_past_key_values = past_key_values
+            processed_tokens = 0
+
+            for thought_start_idx, length_complexity_tokens, complexity in zip(
+                thought_start_indices, num_complexity_tokens, complexities
+            ):
+                # print(f"thought_start_idx: {thought_start_idx}")
+                # Get the tokens from the last processed position up to and including the thought_start_id
+                section_start = processed_tokens
+                end_of_thought_idx = (
+                    thought_start_idx
+                    + special_start_sequences.shape[1]  # Length of start sequence
+                    + length_complexity_tokens
+                    + special_end_sequences.shape[1]    # Length of end sequence
+                    # + 1
+                )
+                end_of_thought_idx = min(end_of_thought_idx, input_ids.shape[1])
+
+                # Extract the section input_ids
+                # section_input_ids = input_ids[batch_idx:batch_idx+1, section_start:section_end]
+                section_input_ids = input_ids[
+                    batch_idx : batch_idx + 1, section_start:end_of_thought_idx
+                ]
+                # decoded_section = self.safe_decode(section_input_ids[0])
+                # print(f"handling (complexity: {complexity}) section: {repr(decoded_section)}")
+                # x = 1/0
+
+                section_input_embeds = self.embed_tokens(section_input_ids)
+                all_embeddings.extend(
+                    [inp.unsqueeze(0) for inp in section_input_embeds]
+                )
+                # We mask out everything up until the reasoning embeddings
+                num_to_not_mask = section_input_embeds.shape[1] - 1
+                num_to_not_mask = max(num_to_not_mask, 0)
+                is_reasoning_embedding_mask.extend(
+                    # [False] * section_input_embeds.shape[1]
+                    [False] * num_to_not_mask
+                )
+                is_reasoning_embedding_mask.append(True)
+                # Run reasoning_forward on this section to generate reasoning embeddings
+                # For non-cache mode, pass all_embeddings so reasoning_forward can build complete sequences
+                # Note: section_input_embeds are already included in all_embeddings at this point
+                reasoning_embeddings, updated_past_key_values = self.reasoning_forward(
+                    all_embeddings=all_embeddings if not use_cache else None,
+                    inputs_embeds=section_input_embeds,
+                    past_key_values=current_past_key_values,
+                    use_cache=use_cache,
+                    complexity=complexity,
+                    **flash_attn_kwargs,
+                )
+                
+                # Add reasoning embeddings to sequence (these need gradients for training!)
+                all_embeddings.extend(
+                    [inp.unsqueeze(0) for inp in reasoning_embeddings]
+                )
+                num_reasoning_embeddings = len(reasoning_embeddings)
+                num_reasoning_to_mask = max(num_reasoning_embeddings - 1, 0)
+                is_reasoning_embedding_mask.extend([True] * num_reasoning_to_mask)
+                is_reasoning_embedding_mask.append(False)
+
+                # Update past_key_values with accumulated reasoning context
+                current_past_key_values = updated_past_key_values
+                # processed_tokens = section_end
+                processed_tokens = end_of_thought_idx
+
+            # Now process any remaining tokens after the last thought_start_id
+            if processed_tokens < input_ids.shape[1]:
+                remaining_input_ids = input_ids[
+                    batch_idx : batch_idx + 1, processed_tokens:
+                ]
+                # print(f"remaining_input_ids shape: {remaining_input_ids.shape}")
+
+                remaining_input_embeds = self.embed_tokens(remaining_input_ids)
+                all_embeddings.extend(
+                    [inp.unsqueeze(0) for inp in remaining_input_embeds]
+                )
+                is_reasoning_embedding_mask.extend(
+                    [False] * remaining_input_embeds.shape[1]
+                )
+
+        # print('embedding shapes')
+        # for e in all_embeddings:
+        #     print(f"shape: {e.shape}")
+
+        all_embeddings = torch.cat(
+            [e.to(all_embeddings[0].device) for e in all_embeddings], dim=1
+        )
+        is_reasoning_embedding_mask = torch.tensor(
+            is_reasoning_embedding_mask, dtype=torch.bool
+        )
+
+        # Single final forward pass with all embeddings (normal + reasoning)
+        # Handle cache vs non-cache modes appropriately for gradient correctness
+        
+        # Update attention mask to cover all embeddings (original + reasoning)  
+        if attention_mask is not None:
+            difference = all_embeddings.shape[1] - attention_mask.shape[1]
+            if difference > 0:
+                # Add attention for reasoning embeddings
+                additional_mask = torch.ones(
+                    attention_mask.shape[0], difference, device=attention_mask.device
+                )
+                attention_mask = torch.cat([attention_mask, additional_mask], dim=1)
+        
+        # EXPECTED STATE: all_embeddings contains complete sequence (original + reasoning embeddings)
+        # - Cache mode: We could use accumulated past_key_values, but for consistency use full sequence
+        # - Non-cache mode: Must use full sequence for proper gradient flow
+        
+        # Always use full sequence mode for final pass to ensure proper gradients
+        # This is critical for training the reasoning projector
+        print(f"shadow_forward returning all_embeddings shape: {all_embeddings.shape}")
+        print(f"shadow_forward returning is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
+        return all_embeddings, is_reasoning_embedding_mask
+    
+
 @auto_docstring
 class Qwen2ForCausalLM(Qwen2ForCausalLM):
     
@@ -656,6 +920,141 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    @can_return_tuple
+    @auto_docstring
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        given_is_reasoning_embedding_mask: Optional[torch.BoolTensor] = None,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> CausalLMOutputWithPast:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
+
+        >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs: BaseModelOutputWithPast = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            given_is_reasoning_embedding_mask=given_is_reasoning_embedding_mask,
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    @can_return_tuple
+    def shadow_forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: Union[int, torch.Tensor] = 0,
+        **kwargs: Unpack[KwargsForCausalLM],
+    ) -> tuple[torch.FloatTensor, torch.BoolTensor]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+            config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+            (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, Qwen2ForCausalLM
+
+        >>> model = Qwen2ForCausalLM.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+        >>> tokenizer = AutoTokenizer.from_pretrained("meta-qwen2/Qwen2-2-7b-hf")
+
+        >>> prompt = "Hey, are you conscious? Can you talk to me?"
+        >>> inputs = tokenizer(prompt, return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(inputs.input_ids, max_length=30)
+        >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        return self.model.shadow_forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
 
 __all__ = [
     "Qwen2PreTrainedModel",
