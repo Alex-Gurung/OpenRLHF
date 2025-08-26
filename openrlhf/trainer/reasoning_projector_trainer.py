@@ -9,6 +9,45 @@ from openrlhf.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+import re
+import spacy
+from spacy.language import Language
+
+# 1) Pre-compile regex (non-greedy, dot-all; supports attributes on the opening tag)
+IMPLICIT_RE = re.compile(r"<implicit_thought\b[^>]*>.*?</implicit_thought>", flags=re.DOTALL)
+
+nlp = spacy.blank("en")
+nlp.add_pipe("sentencizer")  # keep normal punctuation-based splits (., !, ?)
+
+@Language.component("merge_implicit_thought")
+def merge_implicit_thought(doc):
+    # Merge each implicit_thought span into a single token
+    text = doc.text
+    matches = list(IMPLICIT_RE.finditer(text))
+    if not matches:
+        return doc
+    with doc.retokenize() as retok:
+        for m in matches:
+            span = doc.char_span(m.start(), m.end(), alignment_mode="expand")
+            if span is not None:
+                retok.merge(span)
+    return doc
+
+@Language.component("split_around_implicit_thought")
+def split_around_implicit_thought(doc):
+    # Make the merged implicit_thought token its OWN sentence,
+    # and also start a new sentence right after it.
+    for i, tok in enumerate(doc):
+        if tok.text.startswith("<implicit_thought"):
+            tok.is_sent_start = True
+            if i + 1 < len(doc):
+                doc[i + 1].is_sent_start = True
+    return doc
+
+# Order: first do normal sentencizer, then merge, then fix boundaries
+nlp.add_pipe("merge_implicit_thought", after="sentencizer")
+nlp.add_pipe("split_around_implicit_thought", last=True)
+
 @dataclass 
 class ReasoningProjectorBatch:
     input_ids: torch.Tensor
@@ -27,6 +66,26 @@ class ReasoningProjectorDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
+
+def find_index_of_last_system_message(
+    input_ids, special_token, offset_after_token=4, end_offset=4
+):
+    # find the index of the last system message in the input_ids
+    # offset is to avoid encoding the special tokens from tokenization
+    for i in range(len(input_ids) - end_offset - 1, 0, -1):
+        if input_ids[i] == special_token:
+            return i + offset_after_token
+    print("DIDNT FIND IT, RETURNING -1")
+    return -1
+
+def get_model_response(sequence, tokenizer):
+    start_of_system_message = find_index_of_last_system_message(
+        sequence, tokenizer.eos_token_id, offset_after_token=5
+    )
+    original_model_response = tokenizer.decode(
+        sequence[start_of_system_message:], skip_special_tokens=True
+    ).strip()
+    return original_model_response
 
 class ReasoningProjectorTrainer:
     def __init__(self, tokenizer, strategy, args):
@@ -51,7 +110,7 @@ class ReasoningProjectorTrainer:
             # Decode the generated sequences from experiences
             for seq_idx in range(experience.sequences.shape[0]):
                 text = self.tokenizer.decode(experience.sequences[seq_idx], skip_special_tokens=False)
-                
+                text = get_model_response(experience.sequences[seq_idx], self.tokenizer)
                 # Find "In summary:" marker
                 summary_idx = text.find("In summary:")
                 if summary_idx == -1:
@@ -61,6 +120,7 @@ class ReasoningProjectorTrainer:
                 reasoning_text = text[:summary_idx].strip()
                 if reasoning_text:
                     reasoning_traces.append(reasoning_text)
+                    print(f"added reasoning trace: {reasoning_text}")
                     
         return reasoning_traces
         
@@ -77,25 +137,30 @@ class ReasoningProjectorTrainer:
             for i, sentence in enumerate(sentences):
                 if not ('<implicit_thought>' in sentence and '</implicit_thought>' in sentence):
                     non_special_sentences.append((i, sentence))
-            
+            num_special_already = len(sentences) - len(non_special_sentences) 
             if len(non_special_sentences) < 2:
                 continue  # Need at least 2 non-special sentences to swap
                 
             # Randomly select sentences to swap with special tokens
-            num_to_swap = max(1, int(len(non_special_sentences) * self.args.reasoning_projector_swap_ratio))
-            
-            import random
-            selected_sentences = random.sample(non_special_sentences, num_to_swap)
-            
-            # Create modified trace with special tokens
-            modified_sentences = sentences.copy()
-            
-            for original_idx, _ in selected_sentences:
-                # Random depth between 1-5 (based on old_train_sft special sequences)
-                depth = random.randint(1, 5)
-                modified_sentences[original_idx] = f"<implicit_thought>{depth}</implicit_thought>"
+            num_to_swap = int(len(non_special_sentences) * self.args.reasoning_projector_swap_ratio)
+            if num_to_swap == 0 and num_special_already == 0:
+                continue # Nothing to swap
+
+            modified_trace = self._recombine_sentences(sentences) 
+            if num_to_swap > 0:
+                import random
+                selected_sentences = random.sample(non_special_sentences, num_to_swap)
                 
-            modified_trace = self._recombine_sentences(modified_sentences)
+                # Create modified trace with special tokens
+                modified_sentences = sentences.copy()
+            
+                for original_idx, original_sentence in selected_sentences:
+                    depth = int(len(original_sentence.split(" ")) * self.args.reasoning_projector_word_ratio)
+                    depth = min(5, max(1, depth))
+                    depth = str(depth)
+                    modified_sentences[original_idx] = f"<implicit_thought>{depth}</implicit_thought>"
+                
+                modified_trace = self._recombine_sentences(modified_sentences)
             
             # Tokenize and create training sample
             tokenized = self.tokenizer(
@@ -119,28 +184,9 @@ class ReasoningProjectorTrainer:
         
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences using spaCy for better accuracy"""
-        try:
-            import spacy
-            # Load English model (install with: python -m spacy download en_core_web_sm)
-            nlp = spacy.load("en_core_web_sm")
-            doc = nlp(text)
-            sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-            return sentences
-        except (ImportError, OSError):
-            # Fallback to simple regex splitting if spaCy is not available
-            logger.warning("spaCy not available, falling back to regex sentence splitting")
-            import re
-            sentences = re.split(r'([.!?]+)', text)
-            result = []
-            for i in range(0, len(sentences)-1, 2):
-                if i+1 < len(sentences):
-                    sentence = (sentences[i] + sentences[i+1]).strip()
-                    if sentence:
-                        result.append(sentence)
-                else:
-                    if sentences[i].strip():
-                        result.append(sentences[i].strip())
-            return result
+        doc = nlp(text)
+        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()] 
+        return sentences 
         
     def _recombine_sentences(self, sentences: List[str]) -> str:
         """Recombine sentences preserving original spacing"""
@@ -181,7 +227,8 @@ class ReasoningProjectorTrainer:
         logger.info("🚀 [REASONING PROJECTOR] Step 1: Sleeping unused components...")
         self._sleep_unused_components(critic_model_group, reward_model_group, vllm_engines)
         
-        try:
+        # try:
+        if True:
             # Step 2: Extract and prepare training data
             logger.info("🚀 [REASONING PROJECTOR] Step 2: Extracting reasoning traces...")
             reasoning_traces = self.extract_reasoning_traces_from_experiences(experiences)
@@ -215,7 +262,8 @@ class ReasoningProjectorTrainer:
             logger.info(f"✅ [REASONING PROJECTOR] Training completed! Loss: {metrics['loss']:.4f}")
             return metrics
             
-        finally:
+        # finally:
+        if True:
             # Step 5: Wake up components for next PPO iteration
             logger.info("🚀 [REASONING PROJECTOR] Step 5: Waking up components for next PPO iteration...")
             self._wake_unused_components(critic_model_group, reward_model_group, vllm_engines)
@@ -247,7 +295,7 @@ class ReasoningProjectorTrainer:
             
         # Clear cache after offloading
         torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         logger.info("Completed sleeping unused components - freed GPU memory for reasoning projector training")
     
     def _wake_unused_components(self, critic_model_group, reward_model_group, vllm_engines):

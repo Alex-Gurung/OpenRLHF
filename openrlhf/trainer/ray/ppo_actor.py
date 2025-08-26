@@ -748,16 +748,16 @@ class PolicyModelActor(BaseModelActor):
                 input_ids = batch.input_ids.to(device, non_blocking=True)
                 attention_mask = batch.attention_mask.to(device, non_blocking=True)
                 labels = batch.labels.to(device, non_blocking=True)
-                
                 # Forward pass
                 outputs = self.actor.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
-                    return_dict=True
+                    return_dict=True,
                 )
                 
                 loss = outputs.loss
+                print(f"rp; epoch: {epoch}; epoch_steps: {epoch_steps}; loss: {loss.item()}")
                 
                 # Backward and optimizer step using strategy for efficiency
                 self.strategy.backward(loss, self.actor, optimizer)
@@ -786,7 +786,9 @@ class PolicyModelActor(BaseModelActor):
         # Re-enable all parameters for normal training
         for param in self.actor.model.parameters():
             param.requires_grad = True
-            
+        
+        self.actor.ensure_still_tied(every_n=0)
+
         avg_total_loss = total_loss / step_count if step_count > 0 else 0.0
         
         # All-reduce final loss across all ranks
@@ -805,7 +807,8 @@ class PolicyModelActor(BaseModelActor):
             "gpu_memory_allocated": torch.cuda.memory_allocated(device) / 1024**3,  # GB
             "gpu_memory_reserved": torch.cuda.memory_reserved(device) / 1024**3,    # GB
         }
-            
+        del scheduler
+        del optimizer
         return training_metrics
     
     def _collate_reasoning_samples(self, batch):

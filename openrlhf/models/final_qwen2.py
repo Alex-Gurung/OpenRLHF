@@ -484,6 +484,8 @@ class Qwen2Model(Qwen2Model):
                 if (len(complexity_str) <= 3 and len(complexity_str) > 0 and 
                     complexity_str.isdigit()):
                     complexity = int(complexity_str)
+                    if complexity <= 0:
+                        continue
                     # FAKE COMPLEXITY VALUE
                     # complexity = 1
                     correct_complexity_indices.append(thought_start_idx)
@@ -517,7 +519,7 @@ class Qwen2Model(Qwen2Model):
             for thought_start_idx, length_complexity_tokens, complexity in zip(
                 thought_start_indices, num_complexity_tokens, complexities
             ):
-                # print(f"thought_start_idx: {thought_start_idx}")
+                print(f"thought_start_idx: {thought_start_idx}; processed_tokens: {processed_tokens}")
                 # Get the tokens from the last processed position up to and including the thought_start_id
                 section_start = processed_tokens
                 end_of_thought_idx = (
@@ -775,6 +777,8 @@ class Qwen2Model(Qwen2Model):
                 if (len(complexity_str) <= 3 and len(complexity_str) > 0 and 
                     complexity_str.isdigit()):
                     complexity = int(complexity_str)
+                    if complexity <= 0:
+                        continue
                     # FAKE COMPLEXITY VALUE
                     # complexity = 1
                     correct_complexity_indices.append(thought_start_idx)
@@ -799,6 +803,7 @@ class Qwen2Model(Qwen2Model):
             for thought_start_idx, length_complexity_tokens, complexity in zip(
                 thought_start_indices, num_complexity_tokens, complexities
             ):
+                print(f"thought_start_idx: {thought_start_idx}; processed_tokens: {processed_tokens}")
                 # print(f"thought_start_idx: {thought_start_idx}")
                 # Get the tokens from the last processed position up to and including the thought_start_id
                 section_start = processed_tokens

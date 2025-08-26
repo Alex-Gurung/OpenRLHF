@@ -585,6 +585,18 @@ class PPOTrainer(BasePPOTrainer):
                 self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
 
                 steps = steps + 1
+                # print(f"self.args.enable_reasoning_projector_training {self.args.enable_reasoning_projector_training}")
+                # print(f"self has attr episode experiences {hasattr(self, 'episode_experiences')}")
+                # print("GOING FOR TRAINING??")
+                # Run training of reasoning projector if enabled
+                # if self.args.enable_reasoning_projector_training and hasattr(self, 'episode_experiences'):
+                #     self._train_reasoning_projector(episode)
+                #     self.episode_experiences.clear()  # Clear for next episode
+
+
+
+            print(f"self.args.enable_reasoning_projector_training {self.args.enable_reasoning_projector_training}")
+            print(f"self has attr episode experiences {hasattr(self, 'episode_experiences')}")
 
             # Run training of reasoning projector if enabled
             if self.args.enable_reasoning_projector_training and hasattr(self, 'episode_experiences'):
