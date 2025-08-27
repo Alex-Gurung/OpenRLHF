@@ -635,7 +635,12 @@ class PolicyModelActor(BaseModelActor):
                 )
                 
                 loss = outputs.loss
-                
+                if torch.all(labels == -100):
+                    logger.info("RP: skip step – all labels masked")
+                    continue 
+                if (not torch.is_tensor(loss)) or (not loss.requires_grad) or (loss.numel() == 0):
+                    logger.info("RP: skip step – loss has no grad (projector path inactive)")
+                    continue
                 # Backward and optimizer step (strategy handles gradient accumulation internally)
                 self.strategy.backward(loss, self.actor, optimizer)
                 self.strategy.optimizer_step(optimizer, self.actor, None, name="reasoning_projector")

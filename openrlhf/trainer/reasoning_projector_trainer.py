@@ -8,35 +8,57 @@ from openrlhf.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-
 import re
 import spacy
 from spacy.language import Language
+from spacy.util import filter_spans
 
-# 1) Pre-compile regex (non-greedy, dot-all; supports attributes on the opening tag)
-IMPLICIT_RE = re.compile(r"<implicit_thought\b[^>]*>.*?</implicit_thought>", flags=re.DOTALL)
+# Tempered pattern: don't cross the closing tag
+IMPLICIT_RE = re.compile(
+    r"<implicit_thought\b[^>]*>(?:(?!</implicit_thought>).)*</implicit_thought>",
+    flags=re.DOTALL
+)
 
 nlp = spacy.blank("en")
 nlp.add_pipe("sentencizer")  # keep normal punctuation-based splits (., !, ?)
 
+def _preclean_text(text: str) -> str:
+    # Ensure a space between back-to-back tags (helps avoid accidental joins)
+    return re.sub(r"</implicit_thought>(?=<implicit_thought\b)",
+                  "</implicit_thought> ", text)
+
 @Language.component("merge_implicit_thought")
 def merge_implicit_thought(doc):
-    # Merge each implicit_thought span into a single token
-    text = doc.text
+    # Build spans from the ORIGINAL doc text
+    text = _preclean_text(doc.text)
     matches = list(IMPLICIT_RE.finditer(text))
     if not matches:
         return doc
+
+    # Map to doc spans safely
+    spans = []
+    for m in matches:
+        span = doc.char_span(m.start(), m.end(), alignment_mode="expand")
+        if span is not None:
+            spans.append(span)
+
+    # Drop overlaps; keep the longest non-overlapping set
+    spans = filter_spans(spans)
+
+    # Merge right->left so token indices don't shift under us
     with doc.retokenize() as retok:
-        for m in matches:
-            span = doc.char_span(m.start(), m.end(), alignment_mode="expand")
-            if span is not None:
+        for span in sorted(spans, key=lambda s: s.start, reverse=True):
+            try:
                 retok.merge(span)
+            except ValueError:
+                # Skip any problematic span instead of killing the run
+                continue
     return doc
 
 @Language.component("split_around_implicit_thought")
 def split_around_implicit_thought(doc):
-    # Make the merged implicit_thought token its OWN sentence,
-    # and also start a new sentence right after it.
+    # Make each merged implicit_thought token its own sentence and
+    # start the next token as a sentence as well.
     for i, tok in enumerate(doc):
         if tok.text.startswith("<implicit_thought"):
             tok.is_sent_start = True
@@ -44,9 +66,20 @@ def split_around_implicit_thought(doc):
                 doc[i + 1].is_sent_start = True
     return doc
 
-# Order: first do normal sentencizer, then merge, then fix boundaries
+# Order: sentencize -> merge tags -> repair sentence boundaries
 nlp.add_pipe("merge_implicit_thought", after="sentencizer")
 nlp.add_pipe("split_around_implicit_thought", last=True)
+
+# Optional: nuclear fallback that guarantees progress during training.
+# Use this wrapper wherever you do `doc = nlp(text)`.
+def safe_nlp(text: str):
+    try:
+        return nlp(text)
+    except Exception:
+        # Replace bad spans and retry so the trainer never dies
+        safe_text = IMPLICIT_RE.sub("[IMPL]", _preclean_text(text))
+        return nlp(safe_text)
+
 
 @dataclass 
 class ReasoningProjectorBatch:
@@ -184,7 +217,7 @@ class ReasoningProjectorTrainer:
         
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences using spaCy for better accuracy"""
-        doc = nlp(text)
+        doc = safe_nlp(text)
         sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()] 
         return sentences 
         
