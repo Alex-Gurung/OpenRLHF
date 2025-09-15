@@ -87,8 +87,19 @@ class Actor(nn.Module):
             else:
                 model_class = AutoModelForCausalLM
 
+            from liger_kernel.transformers import apply_liger_kernel_to_qwen2
+
+            apply_liger_kernel_to_qwen2(
+                rope=True,
+                rms_norm=True,
+                swiglu=True,
+                cross_entropy=True,              # set True if you're TRAINING and computing CE loss
+                fused_linear_cross_entropy=False  # set True only for TRAINING with fused head+CE
+            )
+
             # TODO: FIX THIS HACK FOR NOW
             from .final_qwen2 import Qwen2ForCausalLM
+            
             model_class = Qwen2ForCausalLM
 
             self.model = model_class.from_pretrained(
