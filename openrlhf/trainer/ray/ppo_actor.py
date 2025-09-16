@@ -762,8 +762,30 @@ class PolicyModelActor(BaseModelActor):
                 )
                 
                 loss = outputs.loss
-                print(f"rp; epoch: {epoch}; epoch_steps: {epoch_steps}; loss: {loss.item()}")
-                
+                print(f"rp; epoch: {epoch}; epoch_steps: {epoch_steps}; loss: {loss.item()}; loss.requires_grad: {loss.requires_grad}")
+                # If this batch didn’t touch any trainable params (e.g., projector not used),
+                # anchor the loss to a known trainable param with a 0.0 multiplier.
+                if not loss.requires_grad:
+                    # Prefer a param from the small module you’re training
+                    anchor_param = None
+                    if hasattr(self.actor.model, "reasoning_projector"):
+                        for p in self.actor.model.reasoning_projector.parameters():
+                            if p.requires_grad:
+                                anchor_param = p
+                                break
+                    # Fallback: any trainable param in the model
+                    if anchor_param is None:
+                        for p in self.actor.model.parameters():
+                            if p.requires_grad:
+                                anchor_param = p
+                                break
+
+                    if anchor_param is not None:
+                        # attach a zero-grad term that forces a grad_fn
+                        loss = loss + 0.0 * anchor_param.view(-1)[0]
+                    else:
+                        # truly nothing is trainable; safest is to skip this batch
+                        continue
                 # Backward and optimizer step using strategy for efficiency
                 self.strategy.backward(loss, self.actor, optimizer)
                 self.strategy.optimizer_step(optimizer, self.actor, scheduler, name="reasoning_projector")
