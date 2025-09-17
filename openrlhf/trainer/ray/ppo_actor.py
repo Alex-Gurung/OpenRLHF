@@ -673,15 +673,22 @@ class PolicyModelActor(BaseModelActor):
             param.requires_grad = False
         
         # Check if reasoning projector exists
-        if not hasattr(self.actor.model.model, 'reasoning_projector'):
+        # if not hasattr(self.actor.model.model, 'reasoning_projector'):
+        #     logger.warning("Model does not have reasoning_projector module. Skipping training.")
+        #     return 0.0
+        projector_mod = getattr(self.actor.model.model, "reasoning_projector", None)
+        if projector_mod is None:
             logger.warning("Model does not have reasoning_projector module. Skipping training.")
             return 0.0
-            
-        for param in self.actor.model.model.reasoning_projector.parameters():
+        for param in projector_mod.parameters():
             param.requires_grad = True
+            
+        # for param in self.actor.model.model.reasoning_projector.parameters():
+        #     param.requires_grad = True
         
         # Get reasoning projector parameters
-        projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+        # projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+        projector_params = list(projector_mod.parameters())
         if not projector_params:
             logger.warning("No reasoning projector parameters found. Skipping training.")
             return 0.0
@@ -693,12 +700,6 @@ class PolicyModelActor(BaseModelActor):
             betas=(0.9, 0.95),  # Standard for LLM training
             weight_decay=0.1,
             eps=1e-8
-        )
-        
-        # Calculate total steps for scheduler
-        total_steps = len(dataset) // per_gpu_batch_size * epochs
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=learning_rate * 0.1
         )
         
         # Setup distributed dataloader
@@ -723,6 +724,13 @@ class PolicyModelActor(BaseModelActor):
             drop_last=True,
             collate_fn=self._collate_reasoning_samples
         )
+
+        # Calculate total steps for scheduler
+        # total_steps = len(dataset) // per_gpu_batch_size * epochs
+        total_steps = len(dataloader) * epochs
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps, eta_min=learning_rate * 0.1
+        )
         
         device = torch.cuda.current_device()
         total_loss = 0.0
@@ -731,11 +739,13 @@ class PolicyModelActor(BaseModelActor):
         logger.info(f"🚀 [REASONING PROJECTOR] Rank {rank}: Starting training - {epochs} epochs, {len(dataloader)} steps/epoch")
         
         # Check if reasoning projector exists
-        has_projector = hasattr(self.actor.model.model, 'reasoning_projector')
+        # has_projector = hasattr(self.actor.model.model, 'reasoning_projector')
+        has_projector = projector_mod is not None
         logger.info(f"🚀 [REASONING PROJECTOR] Model has reasoning_projector: {has_projector}")
         
         if has_projector:
-            projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+            # projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+            projector_params = list(projector_mod.parameters())
             logger.info(f"🚀 [REASONING PROJECTOR] Reasoning projector has {len(projector_params)} parameters")
         else:
             logger.warning("❌ [REASONING PROJECTOR] No reasoning_projector found in model!")
@@ -766,26 +776,18 @@ class PolicyModelActor(BaseModelActor):
                 # If this batch didn’t touch any trainable params (e.g., projector not used),
                 # anchor the loss to a known trainable param with a 0.0 multiplier.
                 if not loss.requires_grad:
-                    # Prefer a param from the small module you’re training
-                    anchor_param = None
-                    if hasattr(self.actor.model, "reasoning_projector"):
-                        for p in self.actor.model.reasoning_projector.parameters():
-                            if p.requires_grad:
-                                anchor_param = p
-                                break
-                    # Fallback: any trainable param in the model
-                    if anchor_param is None:
-                        for p in self.actor.model.parameters():
-                            if p.requires_grad:
-                                anchor_param = p
-                                break
+                    try:
+                        anchor_param = next(p for p in projector_mod.parameters() if p.requires_grad)
+                    except StopIteration:
+                        anchor_param = None
 
                     if anchor_param is not None:
-                        # attach a zero-grad term that forces a grad_fn
+                        # attach a zero-grad term that forces a grad_fn on projector params
                         loss = loss + 0.0 * anchor_param.view(-1)[0]
                     else:
-                        # truly nothing is trainable; safest is to skip this batch
-                        continue
+                        # extremely unlikely here, but still avoid desync by making a grad scalar
+                        loss = loss + torch.zeros((), device=device, requires_grad=True)
+                
                 # Backward and optimizer step using strategy for efficiency
                 self.strategy.backward(loss, self.actor, optimizer)
                 self.strategy.optimizer_step(optimizer, self.actor, scheduler, name="reasoning_projector")
