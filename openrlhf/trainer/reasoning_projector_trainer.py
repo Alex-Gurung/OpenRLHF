@@ -358,42 +358,189 @@ class ReasoningProjectorTrainer:
         logger.info("Completed waking unused components - ready for next PPO iteration")
     
     def _distributed_training_loop(self, actor_model_group, training_samples):
-        """Efficient distributed training loop with proper dataloading"""
-        # Create dataset and distributed sampler
-        dataset = ReasoningProjectorDataset(training_samples)
-        
-        # Calculate effective batch size across all GPUs
-        num_actors = len(actor_model_group._actor_handlers)
-        global_batch_size = (self.args.reasoning_projector_batch_size or 
-                           self.args.micro_train_batch_size) * num_actors
-        per_gpu_batch_size = global_batch_size // num_actors
-        
-        logger.info(f"Distributed reasoning projector training: {num_actors} GPUs, "
-                   f"global_batch_size={global_batch_size}, per_gpu_batch_size={per_gpu_batch_size}")
-        
-        # Use Ray actor to handle distributed training with optimized dataloading
-        loss_results = actor_model_group.async_run_method(
-            method_name="train_reasoning_projector_distributed",
-            dataset=dataset,
-            per_gpu_batch_size=per_gpu_batch_size,
-            epochs=self.args.reasoning_projector_epochs,
-            learning_rate=self.args.reasoning_projector_lr
+        """Efficient distributed training loop with strong logging, validation, and aggregation.
+
+        Orchestrates projector-SFT across all actor ranks via Ray, logs dataset and run stats,
+        and returns aggregated metrics suitable for external dashboards.
+        """
+        import time
+
+        # ---------- helpers ----------
+        def _percentiles(sorted_vals, ps=(50, 95)):
+            if not sorted_vals:
+                return {p: 0 for p in ps}
+            n = len(sorted_vals)
+            out = {}
+            for p in ps:
+                if n == 1:
+                    out[p] = sorted_vals[0]
+                    continue
+                k = (p / 100.0) * (n - 1)
+                f = int(k)
+                c = min(f + 1, n - 1)
+                frac = k - f
+                out[p] = sorted_vals[f] * (1 - frac) + sorted_vals[c] * frac
+            return out
+
+        # ---------- dataset stats (pre-run) ----------
+        num_actors = len(getattr(actor_model_group, "_actor_handlers", []))
+        if num_actors <= 0:
+            logger.warning("[RP] No actor handlers found; skipping distributed training loop.")
+            return {"loss": 0.0, "total_steps": 0, "num_actors": 0}
+
+        num_samples = len(training_samples)
+        # Sequence lengths (count of attended tokens). Each sample is shaped [1, L].
+        seq_lens = []
+        masked_counts = 0
+        total_label_elems = 0
+        for s in training_samples:
+            # attention_mask.sum() counts non-padding tokens
+            try:
+                seq_lens.append(int(s.attention_mask.sum().item()))
+            except Exception:
+                # fallback if attention_mask missing/malformed
+                seq_lens.append(int(s.input_ids.size(1)))
+            if hasattr(s, "labels") and s.labels is not None:
+                total_label_elems += int(s.labels.numel())
+                masked_counts += int((s.labels == -100).sum().item())
+
+        seq_lens_sorted = sorted(seq_lens) if seq_lens else []
+        pct = _percentiles(seq_lens_sorted, ps=(50, 95))
+        total_tokens = int(sum(seq_lens)) if seq_lens else 0
+        masked_ratio = (masked_counts / total_label_elems) if total_label_elems > 0 else 0.0
+
+        global_batch_size = (self.args.reasoning_projector_batch_size
+                            or self.args.micro_train_batch_size) * num_actors
+        per_gpu_batch_size = max(1, global_batch_size // num_actors)
+
+        logger.info(
+            "🚀 [REASONING PROJECTOR/DIST] Start | "
+            f"actors={num_actors} | samples={num_samples} | tokens={total_tokens} | "
+            f"seq_len[mean/med/p95]={ (sum(seq_lens)/num_samples if num_samples else 0):.1f}/{pct[50]:.1f}/{pct[95]:.1f} | "
+            f"masked_label_ratio={masked_ratio:.3f} | "
+            f"global_bs={global_batch_size} | per_gpu_bs={per_gpu_batch_size} | "
+            f"epochs={self.args.reasoning_projector_epochs} | lr={self.args.reasoning_projector_lr:.2e}"
         )
-        
-        # Get results from all actors and aggregate metrics
-        results = ray.get(loss_results)
-        
+
+        # ---------- build dataset & kick off Ray calls ----------
+        dataset = ReasoningProjectorDataset(training_samples)
+
+        t0 = time.perf_counter()
+        try:
+            loss_results = actor_model_group.async_run_method(
+                method_name="train_reasoning_projector_distributed",
+                dataset=dataset,
+                per_gpu_batch_size=per_gpu_batch_size,
+                epochs=self.args.reasoning_projector_epochs,
+                learning_rate=self.args.reasoning_projector_lr,
+            )
+            results = ray.get(loss_results)
+        except Exception as e:
+            logger.exception(f"❌ [REASONING PROJECTOR/DIST] Ray run failed: {e}")
+            return {"loss": 0.0, "total_steps": 0, "num_actors": num_actors}
+
+        dur_s = time.perf_counter() - t0
+
         if not results:
-            return {"loss": 0.0}
-        
-        # Aggregate metrics across all actors
-        aggregated_metrics = {}
-        for key in results[0].keys():
-            if key in ["loss", "gpu_memory_allocated", "gpu_memory_reserved"]:
-                # Average these metrics
-                aggregated_metrics[key] = sum(result[key] for result in results) / len(results)
-            else:
-                # Take from first actor (learning_rate, total_steps, etc. should be same across actors)
-                aggregated_metrics[key] = results[0][key]
-        
+            logger.warning("❌ [REASONING PROJECTOR/DIST] No metrics returned from actors.")
+            return {"loss": 0.0, "total_steps": 0, "num_actors": num_actors, "duration_sec": dur_s}
+
+        if len(results) != num_actors:
+            logger.warning(
+                f"⚠️ [REASONING PROJECTOR/DIST] Expected {num_actors} actor results, got {len(results)}."
+            )
+
+        # ---------- per-actor logging ----------
+        # We log a tidy per-actor line to help spot stragglers or OOMs.
+        for i, r in enumerate(results):
+            lr_i = r.get("learning_rate", None)
+            steps_i = r.get("total_steps", 0)
+            loss_i = r.get("loss", 0.0)
+            galloc_i = r.get("gpu_memory_allocated", 0.0)
+            gres_i = r.get("gpu_memory_reserved", 0.0)
+            logger.info(
+                f"  • [RP/ACTOR {i}] steps={steps_i} | loss={loss_i:.4f} | "
+                f"lr={lr_i if lr_i is not None else 'NA'} | "
+                f"gpu_mem[alloc/resv]=[{galloc_i:.2f}GB/{gres_i:.2f}GB]"
+            )
+
+        # ---------- aggregation ----------
+        # Weighted-average the loss by per-actor total_steps (more faithful than a plain mean).
+        total_steps_all = sum(int(r.get("total_steps", 0)) for r in results)
+        weighted_loss = (
+            sum(float(r.get("loss", 0.0)) * max(1, int(r.get("total_steps", 0))) for r in results)
+            / max(1, total_steps_all)
+        )
+
+        # Learning rate sanity (should be identical across actors).
+        lr_set = {r.get("learning_rate") for r in results if "learning_rate" in r}
+        lr_value = next(iter(lr_set)) if lr_set else None
+        if len(lr_set) > 1:
+            logger.warning(f"⚠️ [RP] Learning rate mismatch across actors: {sorted(lr_set)}")
+
+        # Epochs sanity.
+        epochs_set = {r.get("epochs") for r in results if "epochs" in r}
+        epochs_value = next(iter(epochs_set)) if epochs_set else None
+        if len(epochs_set) > 1:
+            logger.warning(f"⚠️ [RP] Epochs mismatch across actors: {sorted(epochs_set)}")
+
+        # Samples processed (sum across actors is fine; duplicates are expected by design in data-parallel).
+        samples_total = sum(int(r.get("samples_processed", 0)) for r in results)
+
+        # GPU mem summaries
+        ga_vals = [float(r.get("gpu_memory_allocated", 0.0)) for r in results]
+        gr_vals = [float(r.get("gpu_memory_reserved", 0.0)) for r in results]
+        gpu_alloc_avg = (sum(ga_vals) / len(ga_vals)) if ga_vals else 0.0
+        gpu_alloc_max = max(ga_vals) if ga_vals else 0.0
+        gpu_resv_avg = (sum(gr_vals) / len(gr_vals)) if gr_vals else 0.0
+        gpu_resv_max = max(gr_vals) if gr_vals else 0.0
+
+        # Optional: grad_scale check (should match if you used the same lr/base_lr everywhere)
+        gscale_set = {r.get("grad_scale") for r in results if "grad_scale" in r}
+        gscale_value = next(iter(gscale_set)) if gscale_set else None
+        if len(gscale_set) > 1:
+            logger.info(f"ℹ️ [RP] grad_scale varied across actors: {sorted(gscale_set)}")
+
+        # ---------- final log summary ----------
+        logger.info(
+            "✅ [REASONING PROJECTOR/DIST] Done | "
+            f"actors={num_actors} | duration={dur_s:.2f}s | "
+            f"loss[wavg]={weighted_loss:.4f} | steps={total_steps_all} | "
+            f"lr={lr_value if lr_value is not None else 'NA'} | "
+            f"samples_processed(sum)={samples_total} | "
+            f"gpu_alloc[avg/max]={gpu_alloc_avg:.2f}/{gpu_alloc_max:.2f} GB | "
+            f"gpu_resv[avg/max]={gpu_resv_avg:.2f}/{gpu_resv_max:.2f} GB"
+        )
+
+        # ---------- return richer aggregated metrics ----------
+        aggregated_metrics = {
+            # core training results
+            "loss": weighted_loss,
+            "total_steps": total_steps_all,
+            "learning_rate": lr_value,
+            "epochs": epochs_value,
+            "samples_processed": samples_total,
+
+            # orchestration context
+            "num_actors": num_actors,
+            "duration_sec": dur_s,
+
+            # dataset/run stats (helpful for dashboards)
+            "dataset_samples": num_samples,
+            "dataset_tokens": total_tokens,
+            "seq_len_mean": (sum(seq_lens) / num_samples) if num_samples else 0.0,
+            "seq_len_p50": pct[50],
+            "seq_len_p95": pct[95],
+            "masked_label_ratio": masked_ratio,
+
+            # memory summaries
+            "gpu_memory_allocated_avg": gpu_alloc_avg,
+            "gpu_memory_allocated_max": gpu_alloc_max,
+            "gpu_memory_reserved_avg": gpu_resv_avg,
+            "gpu_memory_reserved_max": gpu_resv_max,
+
+            # projector-specific (if your per-actor returns include grad_scale)
+            "grad_scale": gscale_value,
+        }
         return aggregated_metrics
+

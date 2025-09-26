@@ -29,6 +29,36 @@ logger = init_logger(__name__)
 from .launcher import BaseModelActor
 from .utils import get_physical_gpu_id
 
+from contextlib import contextmanager
+import torch
+
+import math
+from torch.utils.data import DataLoader, DistributedSampler
+
+@contextmanager
+def freeze_except(module, predicate):
+    """
+    Temporarily set requires_grad=True only for params satisfying predicate(name, param).
+    Restores original flags on exit.
+    """
+    orig = {}
+    for name, p in module.named_parameters():
+        orig[p] = p.requires_grad
+        p.requires_grad = bool(predicate(name, p))
+    try:
+        yield
+    finally:
+        for p, rg in orig.items():
+            p.requires_grad = rg
+
+def scale_grads(params, factor: float):
+    """Multiply .grad of each tensor in params by 'factor' if grad is not None."""
+    if factor == 1.0:
+        return
+    for p in params:
+        if p.grad is not None:
+            p.grad.mul_(factor)
+
 
 class ActorPPOTrainer(ABC):
     def __init__(
@@ -396,6 +426,15 @@ class ActorPPOTrainer(ABC):
 
 @ray.remote(num_gpus=1)
 class PolicyModelActor(BaseModelActor):
+    def _projector_params(self):
+        proj = getattr(self.actor.model.model, "reasoning_projector", None)
+        return [] if proj is None else list(proj.parameters())
+
+    def _is_projector_param_name(self, name: str) -> bool:
+        # tolerant: allow nested modules; adjust if your naming differs
+        return "model.reasoning_projector" in name or name.endswith("reasoning_projector") or ".reasoning_projector." in name
+
+
     def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps=None, vllm_engines=None):
         args = strategy.args
         self.save_hf_ckpt = args.save_hf_ckpt
@@ -660,185 +699,204 @@ class PolicyModelActor(BaseModelActor):
         return avg_total_loss
     
     def train_reasoning_projector_distributed(self, dataset, per_gpu_batch_size, epochs, learning_rate):
-        """Efficient distributed reasoning projector training"""
-        from torch.utils.data import DataLoader, DistributedSampler
-        
-        # Ensure model is in training mode
-        self.actor.train()
-        
-        # Freeze all parameters except reasoning projector
-        for param in self.actor.model.model.parameters():
-            param.requires_grad = False
-        for param in self.actor.model.lm_head.parameters():
-            param.requires_grad = False
-        
-        # Check if reasoning projector exists
-        # if not hasattr(self.actor.model.model, 'reasoning_projector'):
-        #     logger.warning("Model does not have reasoning_projector module. Skipping training.")
-        #     return 0.0
-        projector_mod = getattr(self.actor.model.model, "reasoning_projector", None)
-        if projector_mod is None:
-            logger.warning("Model does not have reasoning_projector module. Skipping training.")
-            return 0.0
-        for param in projector_mod.parameters():
-            param.requires_grad = True
-            
-        # for param in self.actor.model.model.reasoning_projector.parameters():
-        #     param.requires_grad = True
-        
-        # Get reasoning projector parameters
-        # projector_params = list(self.actor.model.model.reasoning_projector.parameters())
-        projector_params = list(projector_mod.parameters())
-        if not projector_params:
-            logger.warning("No reasoning projector parameters found. Skipping training.")
-            return 0.0
-        
-        # Create fresh optimizer and scheduler (as you requested)
-        optimizer = torch.optim.AdamW(
-            projector_params, 
-            lr=learning_rate,
-            betas=(0.9, 0.95),  # Standard for LLM training
-            weight_decay=0.1,
-            eps=1e-8
-        )
-        
-        # Setup distributed dataloader
+        """DeepSpeed-safe projector SFT with many tiny steps (projector-only), strong logging."""
+
+        # ---------- helpers ----------
+        def _snapshot_requires_grad(module):
+            return {p: p.requires_grad for p in module.parameters()}
+
+        def _restore_requires_grad(mask):
+            for p, rg in mask.items():
+                p.requires_grad = rg
+
+        def _projector_module():
+            return getattr(self.actor.model.model, "reasoning_projector", None)
+
+        def _projector_params():
+            mod = _projector_module()
+            return [] if mod is None else list(mod.parameters())
+
+        def _scale_grads(params, factor: float):
+            if abs(factor - 1.0) < 1e-12:
+                return
+            for p in params:
+                if p.grad is not None:
+                    p.grad.mul_(factor)
+
+        def _is_rank0():
+            return (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
+
+        # Optional: true global grad-norm (across ranks) for projector (for logging only)
+        def _global_l2_grad_norm(params):
+            sq = torch.zeros((), device=device)
+            for p in params:
+                if p.grad is not None:
+                    sq = sq + p.grad.detach().pow(2).sum()
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(sq, op=torch.distributed.ReduceOp.SUM)
+            return float(torch.sqrt(sq).item())
+
+        # ---------- rank/world ----------
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        
+
+        # ---------- engine/device; training mode ----------
+        device = torch.cuda.current_device()
+        self.actor.train()
+
+        # ---------- freeze: projector-only trainable ----------
+        proj_mod = _projector_module()
+        if proj_mod is None:
+            logger.warning("[RP] No reasoning_projector module. Skipping training.")
+            return {"loss": 0.0, "learning_rate": learning_rate, "total_steps": 0, "epochs": epochs, "samples_processed": len(dataset)}
+
+        proj_params = _projector_params()
+        if not proj_params:
+            logger.warning("[RP] Projector has 0 parameters. Skipping training.")
+            return {"loss": 0.0, "learning_rate": learning_rate, "total_steps": 0, "epochs": epochs, "samples_processed": len(dataset)}
+
+        rg_mask = _snapshot_requires_grad(self.actor.model)
+        for p in self.actor.model.parameters():
+            p.requires_grad = False
+        for p in proj_params:
+            p.requires_grad = True
+
+        # ---------- dataloader ----------
         sampler = DistributedSampler(
-            dataset, 
-            num_replicas=world_size, 
-            rank=rank,
-            shuffle=True,
-            drop_last=True
+            dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
         ) if world_size > 1 else None
-        
+
         dataloader = DataLoader(
             dataset,
             batch_size=per_gpu_batch_size,
             sampler=sampler,
             shuffle=(sampler is None),
             pin_memory=True,
-            num_workers=2,  # Efficient dataloading
+            num_workers=2,
             drop_last=True,
-            collate_fn=self._collate_reasoning_samples
+            collate_fn=self._collate_reasoning_samples,
         )
 
-        # Calculate total steps for scheduler
-        # total_steps = len(dataset) // per_gpu_batch_size * epochs
-        total_steps = len(dataloader) * epochs
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps, eta_min=learning_rate * 0.1
-        )
-        
-        device = torch.cuda.current_device()
+        # ---------- effective LR via projector-only grad scaling ----------
+        try:
+            base_lr = float(self.actor_optim.param_groups[0]["lr"])
+        except Exception:
+            base_lr = float(learning_rate)
+
+        rp_lr = float(learning_rate)
+        rp_grad_scale = rp_lr / max(base_lr, 1e-12)
+        clip_norm = float(getattr(self.args, "rp_clip_norm", 0.0) or 0.0)
+        log_every = 10
+
+        if _is_rank0():
+            logger.info(
+                f"🚀 [RP] rank={rank} epochs={epochs} steps/epoch={len(dataloader)} "
+                f"rp_lr={rp_lr:.2e} base_lr={base_lr:.2e} grad_scale={rp_grad_scale:.3g} "
+                f"clip_norm={clip_norm if clip_norm>0 else 'off'} per_gpu_bs={per_gpu_batch_size} "
+                f"proj_params={sum(p.numel() for p in proj_params):,d}"
+            )
+
+        # ---------- training ----------
         total_loss = 0.0
-        step_count = 0
-        
-        logger.info(f"🚀 [REASONING PROJECTOR] Rank {rank}: Starting training - {epochs} epochs, {len(dataloader)} steps/epoch")
-        
-        # Check if reasoning projector exists
-        # has_projector = hasattr(self.actor.model.model, 'reasoning_projector')
-        has_projector = projector_mod is not None
-        logger.info(f"🚀 [REASONING PROJECTOR] Model has reasoning_projector: {has_projector}")
-        
-        if has_projector:
-            # projector_params = list(self.actor.model.model.reasoning_projector.parameters())
-            projector_params = list(projector_mod.parameters())
-            logger.info(f"🚀 [REASONING PROJECTOR] Reasoning projector has {len(projector_params)} parameters")
-        else:
-            logger.warning("❌ [REASONING PROJECTOR] No reasoning_projector found in model!")
-        
-        # Training loop with distributed reductions
+        total_steps = 0
+
         for epoch in range(epochs):
             if sampler:
                 sampler.set_epoch(epoch)
-                
+
             epoch_loss = 0.0
             epoch_steps = 0
-            
-            for batch_idx, batch in enumerate(dataloader):
-                # Move batch to device
+
+            for bidx, batch in enumerate(dataloader):
                 input_ids = batch.input_ids.to(device, non_blocking=True)
                 attention_mask = batch.attention_mask.to(device, non_blocking=True)
                 labels = batch.labels.to(device, non_blocking=True)
-                # Forward pass
+
+                # Forward through the underlying HF model to get CE loss
                 outputs = self.actor.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
                     return_dict=True,
                 )
-                
                 loss = outputs.loss
-                print(f"rp; epoch: {epoch}; epoch_steps: {epoch_steps}; loss: {loss.item()}; loss.requires_grad: {loss.requires_grad}")
-                # If this batch didn’t touch any trainable params (e.g., projector not used),
-                # anchor the loss to a known trainable param with a 0.0 multiplier.
-                if not loss.requires_grad:
-                    try:
-                        anchor_param = next(p for p in projector_mod.parameters() if p.requires_grad)
-                    except StopIteration:
-                        anchor_param = None
 
-                    if anchor_param is not None:
-                        # attach a zero-grad term that forces a grad_fn on projector params
-                        loss = loss + 0.0 * anchor_param.view(-1)[0]
-                    else:
-                        # extremely unlikely here, but still avoid desync by making a grad scalar
-                        loss = loss + torch.zeros((), device=device, requires_grad=True)
-                
-                # Backward and optimizer step using strategy for efficiency
-                self.strategy.backward(loss, self.actor, optimizer)
-                self.strategy.optimizer_step(optimizer, self.actor, scheduler, name="reasoning_projector")
-                
-                epoch_loss += loss.item()
-                step_count += 1
+                # If projector path inactive, skip (do not anchor; avoid bogus step)
+                if (not torch.is_tensor(loss)) or (not loss.requires_grad) or (loss.numel() == 0):
+                    if _is_rank0() and (bidx % log_every == 0):
+                        logger.info(f"[RP] epoch {epoch} step {bidx}/{len(dataloader)}: SKIP (no grad)")
+                    continue
+
+                # Backward via the same strategy used in PPO (keep optimizer consistent)
+                self.strategy.backward(loss, self.actor, self.actor_optim)
+
+                # Projector-only LR via grad scaling
+                _scale_grads(proj_params, rp_grad_scale)
+
+                # Optional: clip projector gradients (after scaling, before the step)
+                if clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(proj_params, max_norm=clip_norm, error_if_nonfinite=False)
+
+                # Step WITHOUT scheduler (do not advance PPO LR schedule)
+                self.strategy.optimizer_step(self.actor_optim, self.actor, None, name="reasoning_projector")
+
+                # Clear grads to avoid leaking into the next micro-step
+                self.actor.zero_grad(set_to_none=True)
+
+                # Logging
+                lval = float(loss.item())
+                epoch_loss += lval
                 epoch_steps += 1
-                
-                # Log progress periodically
-                if batch_idx % 10 == 0 and rank == 0:
-                    logger.info(f"Epoch {epoch}, Step {batch_idx}/{len(dataloader)}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}")
-            
-            total_loss += epoch_loss
-            avg_epoch_loss = epoch_loss / epoch_steps if epoch_steps > 0 else 0.0
-            
-            # All-reduce epoch loss for logging
-            if world_size > 1:
-                epoch_loss_tensor = torch.tensor(avg_epoch_loss, device=device)
-                torch.distributed.all_reduce(epoch_loss_tensor)
-                avg_epoch_loss = epoch_loss_tensor.item() / world_size
-            
-            if rank == 0:
-                logger.info(f"Reasoning projector epoch {epoch}: avg_loss={avg_epoch_loss:.4f}")
-        
-        # Re-enable all parameters for normal training
-        for param in self.actor.model.parameters():
-            param.requires_grad = True
-        
+                total_loss += lval
+                total_steps += 1
+
+                if _is_rank0() and (bidx % log_every == 0):
+                    msg = f"[RP] epoch {epoch} step {bidx}/{len(dataloader)}: loss={lval:.4f} grad_scale={rp_grad_scale:.3g} lr_eff={rp_lr:.2e}"
+                    # Optional global grad norm readout (costs one all-reduce per log)
+                    if getattr(self.args, "rp_log_global_grad_norm", False):
+                        gnorm = _global_l2_grad_norm(proj_params)
+                        msg += f" | gnorm={gnorm:.3f}"
+                    logger.info(msg)
+
+            # Per-epoch average on this rank
+            avg_epoch_loss = epoch_loss / max(1, epoch_steps)
+            if torch.distributed.is_initialized() and world_size > 1:
+                t = torch.tensor(avg_epoch_loss, device=device)
+                torch.distributed.all_reduce(t)
+                avg_epoch_loss = t.item() / world_size
+
+            if _is_rank0():
+                logger.info(f"[RP] epoch {epoch}: avg_loss={avg_epoch_loss:.4f} steps={epoch_steps}")
+
+        # ---------- restore state & sync ----------
+        _restore_requires_grad(rg_mask)
         self.actor.ensure_still_tied(every_n=0)
 
-        avg_total_loss = total_loss / step_count if step_count > 0 else 0.0
-        
-        # All-reduce final loss across all ranks
-        if world_size > 1:
-            loss_tensor = torch.tensor(avg_total_loss, device=device)
-            torch.distributed.all_reduce(loss_tensor)
-            avg_total_loss = loss_tensor.item() / world_size
-        
-        # Collect comprehensive training metrics
-        training_metrics = {
+        if getattr(self, "vllm_engines", None):
+            try:
+                self.trainer._broadcast_to_vllm()
+            except Exception as e:
+                logger.warning(f"[RP] vLLM broadcast failed: {e}")
+
+        # Final averaged loss across ranks
+        avg_total_loss = total_loss / max(1, total_steps)
+        if torch.distributed.is_initialized() and world_size > 1:
+            t = torch.tensor(avg_total_loss, device=device)
+            torch.distributed.all_reduce(t)
+            avg_total_loss = t.item() / world_size
+
+        return {
             "loss": avg_total_loss,
-            "learning_rate": scheduler.get_last_lr()[0] if scheduler else learning_rate,
-            "total_steps": step_count,
+            "learning_rate": rp_lr,
+            "total_steps": total_steps,
             "epochs": epochs,
             "samples_processed": len(dataset),
-            "gpu_memory_allocated": torch.cuda.memory_allocated(device) / 1024**3,  # GB
-            "gpu_memory_reserved": torch.cuda.memory_reserved(device) / 1024**3,    # GB
+            "gpu_memory_allocated": torch.cuda.memory_allocated(device) / 1024**3,
+            "gpu_memory_reserved": torch.cuda.memory_reserved(device) / 1024**3,
+            "grad_scale": rp_grad_scale,
+            "clip_norm": clip_norm if clip_norm > 0 else None,
         }
-        del scheduler
-        del optimizer
-        return training_metrics
+
     
     def _collate_reasoning_samples(self, batch):
         """Collate function for reasoning projector samples"""
