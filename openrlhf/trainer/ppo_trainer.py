@@ -589,9 +589,10 @@ class PPOTrainer(BasePPOTrainer):
                 # print(f"self has attr episode experiences {hasattr(self, 'episode_experiences')}")
                 # print("GOING FOR TRAINING??")
                 # Run training of reasoning projector if enabled
-                # if self.args.enable_reasoning_projector_training and hasattr(self, 'episode_experiences'):
-                #     self._train_reasoning_projector(episode)
-                #     self.episode_experiences.clear()  # Clear for next episode
+                if steps > 2:
+                    if self.args.enable_reasoning_projector_training and hasattr(self, 'episode_experiences'):
+                        self._train_reasoning_projector(episode)
+                        self.episode_experiences.clear()  # Clear for next episode
 
 
 
