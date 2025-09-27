@@ -623,80 +623,80 @@ class PolicyModelActor(BaseModelActor):
         # wait
         torch_dist_barrier_and_cuda_sync()
 
-    def train_reasoning_projector_full_loop(self, training_batches, epochs):
-        """Full training loop for reasoning projector (called via Ray)"""
+    # def train_reasoning_projector_full_loop(self, training_batches, epochs):
+    #     """Full training loop for reasoning projector (called via Ray)"""
         
-        # Ensure model is in training mode
-        self.actor.train()
+    #     # Ensure model is in training mode
+    #     self.actor.train()
         
-        # Freeze all parameters except reasoning projector (following old_train_sft.py pattern)
-        for param in self.actor.model.model.parameters():
-            param.requires_grad = False
-        for param in self.actor.model.lm_head.parameters():
-            param.requires_grad = False
+    #     # Freeze all parameters except reasoning projector (following old_train_sft.py pattern)
+    #     for param in self.actor.model.model.parameters():
+    #         param.requires_grad = False
+    #     for param in self.actor.model.lm_head.parameters():
+    #         param.requires_grad = False
         
-        # Check if reasoning projector exists
-        if not hasattr(self.actor.model.model, 'reasoning_projector'):
-            logger.warning("Model does not have reasoning_projector module. Skipping training.")
-            return 0.0
+    #     # Check if reasoning projector exists
+    #     if not hasattr(self.actor.model.model, 'reasoning_projector'):
+    #         logger.warning("Model does not have reasoning_projector module. Skipping training.")
+    #         return 0.0
             
-        for param in self.actor.model.model.reasoning_projector.parameters():
-            param.requires_grad = True
+    #     for param in self.actor.model.model.reasoning_projector.parameters():
+    #         param.requires_grad = True
             
-        # Create optimizer once for the entire training loop
-        projector_params = list(self.actor.model.model.reasoning_projector.parameters())
-        if not projector_params:
-            logger.warning("No reasoning projector parameters found. Skipping training.")
-            return 0.0
+    #     # Create optimizer once for the entire training loop
+    #     projector_params = list(self.actor.model.model.reasoning_projector.parameters())
+    #     if not projector_params:
+    #         logger.warning("No reasoning projector parameters found. Skipping training.")
+    #         return 0.0
             
-        optimizer = torch.optim.AdamW(projector_params, lr=self.args.reasoning_projector_lr)
+    #     optimizer = torch.optim.AdamW(projector_params, lr=self.args.reasoning_projector_lr)
         
-        device = torch.cuda.current_device()
-        total_loss = 0.0
-        step_count = 0
+    #     device = torch.cuda.current_device()
+    #     total_loss = 0.0
+    #     step_count = 0
         
-        # Training loop (following SFT/PPO actor patterns)
-        for epoch in range(epochs):
-            epoch_loss = 0.0
+    #     # Training loop (following SFT/PPO actor patterns)
+    #     for epoch in range(epochs):
+    #         epoch_loss = 0.0
             
-            for batch_idx, batch in enumerate(training_batches):
-                # Move batch to device
-                input_ids = batch.input_ids.to(device)
-                attention_mask = batch.attention_mask.to(device)
-                labels = batch.labels.to(device)
+    #         for batch_idx, batch in enumerate(training_batches):
+    #             # Move batch to device
+    #             input_ids = batch.input_ids.to(device)
+    #             attention_mask = batch.attention_mask.to(device)
+    #             labels = batch.labels.to(device)
                 
-                # Forward pass
-                outputs = self.actor.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                    return_dict=True
-                )
+    #             # Forward pass
+    #             outputs = self.actor.model(
+    #                 input_ids=input_ids,
+    #                 attention_mask=attention_mask,
+    #                 labels=labels,
+    #                 return_dict=True
+    #             )
                 
-                loss = outputs.loss
-                if torch.all(labels == -100):
-                    logger.info("RP: skip step – all labels masked")
-                    continue 
-                if (not torch.is_tensor(loss)) or (not loss.requires_grad) or (loss.numel() == 0):
-                    logger.info("RP: skip step – loss has no grad (projector path inactive)")
-                    continue
-                # Backward and optimizer step (strategy handles gradient accumulation internally)
-                self.strategy.backward(loss, self.actor, optimizer)
-                self.strategy.optimizer_step(optimizer, self.actor, None, name="reasoning_projector")
+    #             loss = outputs.loss
+    #             if torch.all(labels == -100):
+    #                 logger.info("RP: skip step – all labels masked")
+    #                 continue 
+    #             if (not torch.is_tensor(loss)) or (not loss.requires_grad) or (loss.numel() == 0):
+    #                 logger.info("RP: skip step – loss has no grad (projector path inactive)")
+    #                 continue
+    #             # Backward and optimizer step (strategy handles gradient accumulation internally)
+    #             self.strategy.backward(loss, self.actor, optimizer)
+    #             self.strategy.optimizer_step(optimizer, self.actor, None, name="reasoning_projector")
                 
-                epoch_loss += loss.item()
-                step_count += 1
+    #             epoch_loss += loss.item()
+    #             step_count += 1
                 
-            total_loss += epoch_loss
-            avg_epoch_loss = epoch_loss / len(training_batches)
-            logger.info(f"Reasoning projector epoch {epoch}: loss={avg_epoch_loss:.4f}")
+    #         total_loss += epoch_loss
+    #         avg_epoch_loss = epoch_loss / len(training_batches)
+    #         logger.info(f"Reasoning projector epoch {epoch}: loss={avg_epoch_loss:.4f}")
         
-        # Re-enable all parameters for normal training
-        for param in self.actor.model.parameters():
-            param.requires_grad = True
+    #     # Re-enable all parameters for normal training
+    #     for param in self.actor.model.parameters():
+    #         param.requires_grad = True
             
-        avg_total_loss = total_loss / step_count if step_count > 0 else 0.0
-        return avg_total_loss
+    #     avg_total_loss = total_loss / step_count if step_count > 0 else 0.0
+    #     return avg_total_loss
     
     def train_reasoning_projector_distributed(self, dataset, per_gpu_batch_size, epochs, learning_rate):
         """DeepSpeed-safe projector SFT with many tiny steps (projector-only), strong logging."""
@@ -785,8 +785,9 @@ class PolicyModelActor(BaseModelActor):
 
         rp_lr = float(learning_rate)
         rp_grad_scale = rp_lr / max(base_lr, 1e-12)
-        clip_norm = float(getattr(self.args, "rp_clip_norm", 0.0) or 0.0)
-        log_every = 10
+        args = self.strategy.args
+        clip_norm = float(getattr(args, "rp_clip_norm", 0.0) or 0.0)
+        log_every = int(getattr(args, "rp_log_every", 10))
 
         if _is_rank0():
             logger.info(
@@ -853,7 +854,7 @@ class PolicyModelActor(BaseModelActor):
                 if _is_rank0() and (bidx % log_every == 0):
                     msg = f"[RP] epoch {epoch} step {bidx}/{len(dataloader)}: loss={lval:.4f} grad_scale={rp_grad_scale:.3g} lr_eff={rp_lr:.2e}"
                     # Optional global grad norm readout (costs one all-reduce per log)
-                    if getattr(self.args, "rp_log_global_grad_norm", False):
+                    if getattr(args, "rp_log_global_grad_norm", False):
                         gnorm = _global_l2_grad_norm(proj_params)
                         msg += f" | gnorm={gnorm:.3f}"
                     logger.info(msg)

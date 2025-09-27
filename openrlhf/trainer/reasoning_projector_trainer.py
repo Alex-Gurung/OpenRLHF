@@ -437,13 +437,42 @@ class ReasoningProjectorTrainer:
             results = ray.get(loss_results)
         except Exception as e:
             logger.exception(f"❌ [REASONING PROJECTOR/DIST] Ray run failed: {e}")
-            return {"loss": 0.0, "total_steps": 0, "num_actors": num_actors}
+            # Return a complete dict so callers never KeyError
+            return {
+                "loss": 0.0,
+                "learning_rate": self.args.reasoning_projector_lr,
+                "total_steps": 0,
+                "epochs": self.args.reasoning_projector_epochs,
+                "samples_processed": len(dataset),
+                "num_actors": len(getattr(actor_model_group, "_actor_handlers", [])) or 0,
+                "duration_sec": 0.0,
+                "gpu_memory_allocated_avg": 0.0,
+                "gpu_memory_allocated_max": 0.0,
+                "gpu_memory_reserved_avg": 0.0,
+                "gpu_memory_reserved_max": 0.0,
+                "grad_scale": 0.0,
+                "clip_norm": (getattr(self.args, "rp_clip_norm", 0.0) or 0.0) or None,
+            }
 
         dur_s = time.perf_counter() - t0
 
         if not results:
             logger.warning("❌ [REASONING PROJECTOR/DIST] No metrics returned from actors.")
-            return {"loss": 0.0, "total_steps": 0, "num_actors": num_actors, "duration_sec": dur_s}
+            return {
+                "loss": 0.0,
+                "learning_rate": self.args.reasoning_projector_lr,
+                "total_steps": 0,
+                "epochs": self.args.reasoning_projector_epochs,
+                "samples_processed": len(dataset),
+                "num_actors": len(getattr(actor_model_group, "_actor_handlers", [])) or 0,
+                "duration_sec": 0.0,
+                "gpu_memory_allocated_avg": 0.0,
+                "gpu_memory_allocated_max": 0.0,
+                "gpu_memory_reserved_avg": 0.0,
+                "gpu_memory_reserved_max": 0.0,
+                "grad_scale": 0.0,
+                "clip_norm": (getattr(self.args, "rp_clip_norm", 0.0) or 0.0) or None,
+            }
 
         if len(results) != num_actors:
             logger.warning(
