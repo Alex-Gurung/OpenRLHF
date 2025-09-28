@@ -663,8 +663,10 @@ class PPOTrainer(BasePPOTrainer):
             "reasoning_projector_total_steps": metrics["total_steps"],
             "reasoning_projector_epochs": metrics["epochs"],
             "reasoning_projector_samples_processed": metrics["samples_processed"],
-            "reasoning_projector_gpu_memory_allocated_gb": metrics["gpu_memory_allocated"],
-            "reasoning_projector_gpu_memory_reserved_gb": metrics["gpu_memory_reserved"],
+            "reasoning_projector_gpu_memory_allocated_avg_gb": metrics["gpu_memory_allocated_avg"],
+            "reasoning_projector_gpu_memory_reserved_gb": metrics["gpu_memory_reserved_avg"],
+            "reasoning_projector_gpu_memory_allocated_max_gb": metrics["gpu_memory_allocated_max"],
+            "reasoning_projector_gpu_memory_reserved_max_gb": metrics["gpu_memory_reserved_max"],
             "reasoning_projector_episode": episode,
         }
         
