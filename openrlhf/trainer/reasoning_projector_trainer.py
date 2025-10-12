@@ -7,7 +7,8 @@ from torch.utils.data import Dataset
 from openrlhf.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
+import random
+import math
 import re
 import spacy
 from spacy.language import Language
@@ -158,62 +159,97 @@ class ReasoningProjectorTrainer:
         return reasoning_traces
         
     def process_reasoning_for_training(self, reasoning_traces) -> List[ReasoningProjectorBatch]:
-        """Convert reasoning traces to training batches with sentence swapping"""
+        """Convert reasoning traces to training samples with optional sentence swapping.
+        Preserves original whitespace/newlines using spaCy sentence char spans.
+        """
         training_samples = []
-        
-        for trace in reasoning_traces:
-            # Smart sentence splitting using spaCy
-            sentences = self._split_into_sentences(trace)
-            
-            # Filter out sentences that already contain special tokens
-            non_special_sentences = []
-            for i, sentence in enumerate(sentences):
-                if not ('<implicit_thought>' in sentence and '</implicit_thought>' in sentence):
-                    non_special_sentences.append((i, sentence))
-            num_special_already = len(sentences) - len(non_special_sentences) 
-            if len(non_special_sentences) < 2:
-                continue  # Need at least 2 non-special sentences to swap
-                
-            # Randomly select sentences to swap with special tokens
-            num_to_swap = int(len(non_special_sentences) * self.args.reasoning_projector_swap_ratio)
-            if num_to_swap == 0 and num_special_already == 0:
-                continue # Nothing to swap
 
-            modified_trace = self._recombine_sentences(sentences) 
-            if num_to_swap > 0:
-                import random
-                selected_sentences = random.sample(non_special_sentences, num_to_swap)
-                
-                # Create modified trace with special tokens
-                modified_sentences = sentences.copy()
-            
-                for original_idx, original_sentence in selected_sentences:
-                    depth = int(len(original_sentence.split(" ")) * self.args.reasoning_projector_word_ratio)
-                    depth = min(5, max(1, depth))
-                    depth = str(depth)
-                    modified_sentences[original_idx] = f"<implicit_thought>{depth}</implicit_thought>"
-                
-                modified_trace = self._recombine_sentences(modified_sentences)
-            
-            # Tokenize and create training sample
-            tokenized = self.tokenizer(
-                modified_trace, 
-                return_tensors="pt", 
-                padding=True, 
+        # safety: make sure pad_token_id exists (LLaMA often needs this)
+        if getattr(self.tokenizer, "pad_token_id", None) is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        ratio = float(self.args.reasoning_projector_swap_ratio)
+        word_ratio = float(self.args.reasoning_projector_word_ratio)
+        max_len = int(self.args.max_len)
+
+        for trace in reasoning_traces:
+            # 1) Sentence spans with exact char offsets (preserve formatting)
+            doc = safe_nlp(trace)  # your pipeline: sentencizer -> merge_implicit_thought -> split_around_implicit_thought
+            sents = list(doc.sents)
+            if not sents:
+                continue
+
+            # 2) Classify sentences
+            non_special = []
+            special_count = 0
+            for i, s in enumerate(sents):
+                txt = s.text
+                if "<implicit_thought>" in txt and "</implicit_thought>" in txt:
+                    special_count += 1
+                else:
+                    non_special.append((i, s))  # keep the Span so we have start/end_char
+
+            # 3) Decide path based on ratio and availability
+            if ratio == 0.0:
+                # keep only if there are already special sentences; else skip
+                if special_count == 0:
+                    continue
+                # unchanged text
+                modified_text = trace
+
+            else:  # ratio > 0
+                # how many to swap? if there aren't enough non-special sentences, don't swap
+                num_to_swap = int(len(non_special) * ratio)
+                if num_to_swap == 0:
+                    continue
+                chosen = set(idx for idx, _ in random.sample(non_special, k=num_to_swap))
+
+                # build replacement via char spans to preserve whitespace/newlines
+                out_chunks = []
+                cursor = 0
+                for i, s in enumerate(sents):
+                    start, end = s.start_char, s.end_char
+                    # add untouched text between last end and this start (usually empty, but keeps exact gaps)
+                    if cursor < start:
+                        out_chunks.append(trace[cursor:start])
+
+                    if i in chosen:
+                        # compute depth from THIS sentence
+                        n_words = max(1, len(s.text.split()))
+                        depth = int(n_words * word_ratio)
+                        depth = min(5, max(1, depth))
+                        out_chunks.append(f"<implicit_thought>{depth}</implicit_thought>")
+                    else:
+                        # keep original sentence slice
+                        out_chunks.append(trace[start:end])
+
+                    cursor = end
+                # tail
+                if cursor < len(trace):
+                    out_chunks.append(trace[cursor:])
+
+                modified_text = "".join(out_chunks)
+
+            # 4) Tokenize (fixed shape so later torch.cat works)
+            tok = self.tokenizer(
+                modified_text,
+                return_tensors="pt",
+                padding="max_length",     # IMPORTANT: fixed length so cat()-based collate won’t error
                 truncation=True,
-                max_length=self.args.max_len
+                max_length=max_len,
             )
-            
-            # Create labels (same as input_ids, will mask appropriately)
-            labels = tokenized["input_ids"].clone()
-            
-            training_samples.append(ReasoningProjectorBatch(
-                input_ids=tokenized["input_ids"],
-                attention_mask=tokenized["attention_mask"],
-                labels=labels
-            ))
-            
+            labels = tok["input_ids"].clone()
+
+            training_samples.append(
+                ReasoningProjectorBatch(
+                    input_ids=tok["input_ids"],
+                    attention_mask=tok["attention_mask"],
+                    labels=labels,
+                )
+            )
+
         return training_samples
+
         
     def _split_into_sentences(self, text: str) -> List[str]:
         """Split text into sentences using spaCy for better accuracy"""
@@ -268,26 +304,34 @@ class ReasoningProjectorTrainer:
             reasoning_traces = self.extract_reasoning_traces_from_experiences(experiences)
             
             if not reasoning_traces:
-                logger.info("❌ [REASONING PROJECTOR] No reasoning traces found for projector training")
+                logger.info("❌ [REASONING PROJECTOR] Extracting reasoning traces from experiences created no reasoning traces")
                 return {"loss": 0.0}
                 
             logger.info(f"✅ [REASONING PROJECTOR] Found {len(reasoning_traces)} reasoning traces")
                 
             # Sample subset of traces for efficiency
-            max_samples = int(len(reasoning_traces) * self.args.reasoning_projector_data_ratio)
-            if max_samples < len(reasoning_traces):
-                import random
-                reasoning_traces = random.sample(reasoning_traces, max_samples)
-                logger.info(f"🚀 [REASONING PROJECTOR] Sampled {len(reasoning_traces)} traces (ratio={self.args.reasoning_projector_data_ratio})")
+            # max_samples = int(len(reasoning_traces) * self.args.reasoning_projector_data_ratio)
+            # if max_samples < len(reasoning_traces):
+            #     reasoning_traces = random.sample(reasoning_traces, max_samples)
+            #     logger.info(f"🚀 [REASONING PROJECTOR] Sampled {len(reasoning_traces)} traces (ratio={self.args.reasoning_projector_data_ratio})")
             
             # Step 3: Process into training samples
             logger.info("🚀 [REASONING PROJECTOR] Step 3: Processing traces into training samples...")
             training_samples = self.process_reasoning_for_training(reasoning_traces)
             if not training_samples:
-                logger.info("❌ [REASONING PROJECTOR] No valid training samples created")
+                logger.info("❌ [REASONING PROJECTOR] Processing traces into training samples created no training samples")
                 return {"loss": 0.0}
             
-            logger.info(f"✅ [REASONING PROJECTOR] Created {len(training_samples)} training samples")
+            logger.info(f"✅ [REASONING PROJECTOR] Created {len(training_samples)} training samples out of {len(reasoning_traces)} original reasoning traces")
+
+            # Subsample training samples based on data ratio of original reasoning traces
+            max_samples = int(len(reasoning_traces) * self.args.reasoning_projector_data_ratio)
+            if max_samples < len(training_samples):
+                training_samples = random.sample(training_samples, max_samples)
+                logger.info(f"🚀 [REASONING PROJECTOR] Subsampled to {len(training_samples)} samples out of {len(reasoning_traces)} original reasoning traces (ratio={self.args.reasoning_projector_data_ratio})")
+            if len(training_samples) == 0:
+                logger.info("❌ [REASONING PROJECTOR] Subsampling created no training samples")
+                return {"loss": 0.0}
             
             # Step 4: Distributed training with efficient batching
             logger.info("🚀 [REASONING PROJECTOR] Step 4: Starting distributed training loop...")
