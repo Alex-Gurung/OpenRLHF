@@ -257,8 +257,9 @@ class ReasoningProjectorTrainer:
         logger.info(f"🚀 [REASONING PROJECTOR] Got {len(experiences)} experiences to process")
         
         # Step 1: Sleep unused components to free GPU memory
-        logger.info("🚀 [REASONING PROJECTOR] Step 1: Sleeping unused components...")
-        self._sleep_unused_components(critic_model_group, reward_model_group, vllm_engines)
+        # logger.info("🚀 [REASONING PROJECTOR] Step 1: Sleeping unused components...")
+        logger.info("🚀 [REASONING PROJECTOR] Step 1: Sleeping unused components (Not actually doing this now)...")
+        # self._sleep_unused_components(critic_model_group, reward_model_group, vllm_engines)
         
         # try:
         if True:
@@ -298,8 +299,8 @@ class ReasoningProjectorTrainer:
         # finally:
         if True:
             # Step 5: Wake up components for next PPO iteration
-            logger.info("🚀 [REASONING PROJECTOR] Step 5: Waking up components for next PPO iteration...")
-            self._wake_unused_components(critic_model_group, reward_model_group, vllm_engines)
+            logger.info("🚀 [REASONING PROJECTOR] Step 5: Waking up components for next PPO iteration (Not actually doing this now)...")
+            # self._wake_unused_components(critic_model_group, reward_model_group, vllm_engines)
             logger.info("✅ [REASONING PROJECTOR] All components restored - ready for next PPO iteration")
     
     def _sleep_unused_components(self, critic_model_group, reward_model_group, vllm_engines):
@@ -428,7 +429,8 @@ class ReasoningProjectorTrainer:
         t0 = time.perf_counter()
         try:
             loss_results = actor_model_group.async_run_method(
-                method_name="train_reasoning_projector_distributed",
+                # method_name="train_reasoning_projector_distributed",
+                method_name="fit_reasoning_projector",
                 dataset=dataset,
                 per_gpu_batch_size=per_gpu_batch_size,
                 epochs=self.args.reasoning_projector_epochs,

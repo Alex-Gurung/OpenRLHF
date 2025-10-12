@@ -612,6 +612,10 @@ class PPOTrainer(BasePPOTrainer):
         if not self.episode_experiences:
             logger.warning("No experiences available for reasoning projector training")
             return
+
+        # 1) If we're sleeping, wake the actor before training (PPO parity)
+        if self.strategy.args.deepspeed_enable_sleep:
+            ray.get(self.actor_model_group.async_run_method(method_name="reload_states"))
             
         logger.info(f"Starting distributed reasoning projector training for episode {episode}")
         
@@ -641,6 +645,11 @@ class PPOTrainer(BasePPOTrainer):
         metrics["training_time_seconds"] = training_time
         metrics["samples_per_second"] = metrics.get("samples_processed", 0) / max(training_time, 0.001)
         
+
+        # 2) After RP, offload actor again (PPO parity)
+        if self.strategy.args.deepspeed_enable_sleep:
+            ray.get(self.actor_model_group.async_run_method(method_name="offload_states"))
+            
         # Broadcast updated weights to vLLM engines using existing method
         if self.vllm_engines is not None:
             logger.info("Broadcasting updated reasoning projector weights to vLLM")
