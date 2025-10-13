@@ -154,7 +154,8 @@ class ReasoningProjectorTrainer:
                 reasoning_text = text[:summary_idx].strip()
                 if reasoning_text:
                     reasoning_traces.append(reasoning_text)
-                    print(f"added reasoning trace: {reasoning_text}")
+                    if random.random() < 0.01:
+                        print(f"added reasoning trace: {reasoning_text}")
                     
         return reasoning_traces
         
@@ -233,7 +234,7 @@ class ReasoningProjectorTrainer:
             tok = self.tokenizer(
                 modified_text,
                 return_tensors="pt",
-                padding="max_length",     # IMPORTANT: fixed length so cat()-based collate won’t error
+                # padding="max_length",     # IMPORTANT: fixed length so cat()-based collate won’t error
                 truncation=True,
             )
             labels = tok["input_ids"].clone()
@@ -481,6 +482,8 @@ class ReasoningProjectorTrainer:
             results = ray.get(loss_results)
         except Exception as e:
             logger.exception(f"❌ [REASONING PROJECTOR/DIST] Ray run failed: {e}")
+            if isinstance(e, RuntimeError):
+                raise e
             # Return a complete dict so callers never KeyError
             return {
                 "loss": 0.0,

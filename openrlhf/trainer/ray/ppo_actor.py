@@ -34,6 +34,7 @@ import torch
 
 import math
 from torch.utils.data import DataLoader, DistributedSampler
+from openrlhf.trainer.reasoning_projector_trainer import ReasoningProjectorBatch
 
 @contextmanager
 def freeze_except(module, predicate):
@@ -631,7 +632,6 @@ class ActorPPOTrainer(ABC):
         attention_mask = torch.cat([sample.attention_mask for sample in batch], dim=0)
         labels = torch.cat([sample.labels for sample in batch], dim=0)
         
-        from openrlhf.trainer.reasoning_projector_trainer import ReasoningProjectorBatch
         return ReasoningProjectorBatch(
             input_ids=input_ids,
             attention_mask=attention_mask,
