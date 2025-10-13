@@ -170,7 +170,6 @@ class ReasoningProjectorTrainer:
 
         ratio = float(self.args.reasoning_projector_swap_ratio)
         word_ratio = float(self.args.reasoning_projector_word_ratio)
-        max_len = int(self.args.max_len)
 
         for trace in reasoning_traces:
             # 1) Sentence spans with exact char offsets (preserve formatting)
@@ -236,7 +235,6 @@ class ReasoningProjectorTrainer:
                 return_tensors="pt",
                 padding="max_length",     # IMPORTANT: fixed length so cat()-based collate won’t error
                 truncation=True,
-                max_length=max_len,
             )
             labels = tok["input_ids"].clone()
 
