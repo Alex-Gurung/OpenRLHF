@@ -398,6 +398,9 @@ class Qwen2Model(Qwen2Model):
                 # do the masking
                 print(f"is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
                 print(f"input_embeds shape: {inputs_embeds.shape}")
+                if is_reasoning_embedding_mask.sum() <= 0:
+                    print("ignoring masking because sum is zero")
+                    return outputs
                 # mask out the reasoning embeddings
                 outputs.last_hidden_state = outputs.last_hidden_state[
                     :, ~is_reasoning_embedding_mask, :
