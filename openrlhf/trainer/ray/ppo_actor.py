@@ -369,8 +369,12 @@ class ActorPPOTrainer(ABC):
                 if (not torch.is_tensor(loss)) or (not loss.requires_grad) or (loss.numel() == 0):
                     if _is_rank0() and (bidx % log_every == 0):
                         logger.info(f"[RP] epoch {epoch} step {bidx}/{len(dataloader)}: SKIP (no grad)")
-                    continue
-
+                    # continue # instead of continue, we force the loss to be 0
+                    dummy = torch.zeros([], device=device, dtype=loss.dtype)
+                    for p in proj_params:
+                        dummy = dummy + 0.0 * p.float().sum()
+                    loss = dummy
+                assert loss.requires_grad
                 # Backward via the same strategy used in PPO (keep optimizer consistent)
                 self.strategy.backward(loss, self.actor, self.actor_optim)
 
