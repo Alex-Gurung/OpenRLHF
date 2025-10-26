@@ -272,8 +272,8 @@ class BasePPOTrainer(ABC):
             generate_kwargs["temperature"] = temperature
             generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
             samples_list = self.samples_generator.generate_samples(
-                # all_prompts, all_labels, remote_reward_model=self.remote_reward_model, **generate_kwargs
-                all_prompts, all_labels, remote_reward_model=self.reference_model_group, **generate_kwargs
+                all_prompts, all_labels, remote_reward_model=self.remote_reward_model, **generate_kwargs
+                # all_prompts, all_labels, remote_reward_model=self.reference_model_group, **generate_kwargs
             )
 
             # duplicate prompts and labels for each sample
