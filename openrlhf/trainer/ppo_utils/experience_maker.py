@@ -215,9 +215,9 @@ def update_samples_with_rewards(rewards_info, samples_list):
     # Process rewards and scores
     samples_len = [len(sample.sequences) for sample in samples_list]
 
-    rewards_list = torch.cat([info["rewards"] for info in rewards_info], dim=0).split(samples_len)
+    rewards_list = torch.cat([torch.as_tensor(info["rewards"]) for info in rewards_info], dim=0).split(samples_len)
     if "scores" in rewards_info[0]:
-        scores_list = torch.cat([info["scores"] for info in rewards_info], dim=0).split(samples_len)
+        scores_list = torch.cat([torch.as_tensor(info["scores"]) for info in rewards_info], dim=0).split(samples_len)
     else:
         scores_list = rewards_list
 
@@ -225,9 +225,9 @@ def update_samples_with_rewards(rewards_info, samples_list):
     if "extra_logs" in rewards_info[0]:
         # Merge all extra_logs tensors first
         merged_logs = {
-            key: torch.cat([logs[key] for logs in [info["extra_logs"] for info in rewards_info]], dim=0).split(
-                samples_len
-            )
+            key: torch.cat(
+                [torch.as_tensor(logs[key]) for logs in [info["extra_logs"] for info in rewards_info]], dim=0
+            ).split(samples_len)
             for key in rewards_info[0]["extra_logs"].keys()
         }
 
