@@ -28,6 +28,23 @@ def _preclean_text(text: str) -> str:
     return re.sub(r"</implicit_thought>(?=<implicit_thought\b)",
                   "</implicit_thought> ", text)
 
+BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}", re.IGNORECASE)
+
+
+def extract_last_boxed(text: str) -> str:
+    matches = list(BOXED_RE.finditer(text or ""))
+    if matches:
+        return matches[-1].group(1).strip()
+    return text or ""
+
+
+def parse_prediction(raw_text: str) -> float:
+    candidate = extract_last_boxed(raw_text)
+    candidate = (candidate or raw_text or "").strip().lower()
+    if "yes" in candidate and "no" not in candidate:
+        return 1.0
+    return 0.0
+
 @Language.component("merge_implicit_thought")
 def merge_implicit_thought(doc):
     # Build spans from the ORIGINAL doc text
@@ -139,19 +156,27 @@ class ReasoningProjectorTrainer:
     def extract_reasoning_traces_from_experiences(self, experiences) -> List[str]:
         """Extract reasoning content from PPO experiences"""
         reasoning_traces = []
-        
+        print(f"found {len(experiences)} experiences")
         for experience in experiences:
             # Decode the generated sequences from experiences
             for seq_idx in range(experience.sequences.shape[0]):
                 text = self.tokenizer.decode(experience.sequences[seq_idx], skip_special_tokens=False)
                 text = get_model_response(experience.sequences[seq_idx], self.tokenizer)
+                
+                answer = extract_last_boxed(text)
+                if len(answer) == 0:
+                    continue
+                answer_idx = text.rfind(answer)
+                if answer_idx == -1:
+                    continue
+                reasoning_text = text[:answer_idx].strip()
                 # Find "In summary:" marker
-                summary_idx = text.find("In summary:")
-                if summary_idx == -1:
-                    continue  # Skip samples without reasoning
+                # summary_idx = text.find("In summary:")
+                # if summary_idx == -1:
+                #     continue  # Skip samples without reasoning
                     
                 # Extract reasoning part (everything before "In summary:")
-                reasoning_text = text[:summary_idx].strip()
+                # reasoning_text = text[:summary_idx].strip()
                 if reasoning_text:
                     reasoning_traces.append(reasoning_text)
                     if random.random() < 0.01:
