@@ -285,17 +285,81 @@ class Actor(nn.Module):
         print(f"use_shadow_model: {self.use_shadow_model}; ignore_grad: {self.ignore_grad}")
         if self.use_shadow_model:
             self._tie_shadow_to_train_if_needed()
-        
+
+            # We batch only the final full forward. Here we prepare per-sample
+            # extended embeddings + remove masks using the shadow model, then
+            # pad/stack them and pass to the train model in one batched call.
             with torch.no_grad():
-                # never use shadow model for gradient computation
-                input_embeds, is_reasoning_embedding_mask = self.shadow_model.shadow_forward(sequences, attention_mask=foward_attention_mask, position_ids=position_ids)
-            sequences = None
+                if sequences is None:
+                    # If sequences is already None, we simply pass through.
+                    # (Uncommon, but keep behavior consistent.)
+                    input_embeds, is_reasoning_embedding_mask = None, None
+                else:
+                    bsz = sequences.shape[0]
+                    if bsz == 1:
+                        # Fast path: use existing behavior for single sample
+                        input_embeds, is_reasoning_embedding_mask = self.shadow_model.shadow_forward(
+                            sequences, attention_mask=foward_attention_mask, position_ids=position_ids
+                        )
+                    else:
+                        # Per-sample shadow prep, then batch the final pass only
+                        per_embeds = []     # list of tensors [1, L_ext_b, H]
+                        per_masks = []      # list of tensors [L_ext_b]
+
+                        # Slice per-sample inputs to satisfy shadow_forward(batch=1)
+                        for i in range(bsz):
+                            seq_i = sequences[i : i + 1]
+                            attn_i = None if foward_attention_mask is None else foward_attention_mask[i : i + 1]
+                            pos_i = None if position_ids is None else position_ids[i : i + 1]
+
+                            emb_i, mask_i = self.shadow_model.shadow_forward(
+                                seq_i, attention_mask=attn_i, position_ids=pos_i
+                            )
+                            # Sanity checks: shapes and dtypes
+                            assert emb_i.dim() == 3 and emb_i.size(0) == 1, (
+                                f"shadow_forward expected [1, L_ext, H]; got {tuple(emb_i.shape)}"
+                            )
+                            assert mask_i.dim() == 1 and mask_i.dtype == torch.bool, (
+                                f"shadow_forward mask should be 1D bool; got {tuple(mask_i.shape)} / {mask_i.dtype}"
+                            )
+                            per_embeds.append(emb_i)
+                            per_masks.append(mask_i)
+
+                        # Compute padding sizes
+                        ext_lens = [int(e.size(1)) for e in per_embeds]
+                        L_ext_max = max(ext_lens)
+                        H = int(per_embeds[0].size(2))
+                        dtype = per_embeds[0].dtype
+                        device = per_embeds[0].device
+
+                        # Allocate batched tensors. We fill pad positions with zeros and
+                        # mark them as True in the remove-mask, so they are removed post-forward.
+                        input_embeds = torch.zeros((bsz, L_ext_max, H), dtype=dtype, device=device)
+                        is_reasoning_embedding_mask = torch.ones((bsz, L_ext_max), dtype=torch.bool, device=device)
+
+                        for i, (emb_i, mask_i) in enumerate(zip(per_embeds, per_masks)):
+                            L_i = ext_lens[i]
+                            input_embeds[i, :L_i, :] = emb_i[0]
+                            is_reasoning_embedding_mask[i, :L_i] = mask_i
+
+                # Downstream we pass inputs_embeds and mask; ignore input_ids
+                sequences = None
         # output = self.model(input_ids=None, inputs_embeds=input_embeds, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels, is_reasoning_embedding_mask=is_reasoning_embedding_mask)
         if self.ignore_grad:
             with torch.no_grad():
-                output = self.model(input_ids=sequences, inputs_embeds=input_embeds, labels=labels, given_is_reasoning_embedding_mask=is_reasoning_embedding_mask)
+                output = self.model(
+                    input_ids=sequences,
+                    inputs_embeds=input_embeds,
+                    labels=labels,
+                    given_is_reasoning_embedding_mask=is_reasoning_embedding_mask,
+                )
         else:
-            output = self.model(input_ids=sequences, inputs_embeds=input_embeds, labels=labels, given_is_reasoning_embedding_mask=is_reasoning_embedding_mask)
+            output = self.model(
+                input_ids=sequences,
+                inputs_embeds=input_embeds,
+                labels=labels,
+                given_is_reasoning_embedding_mask=is_reasoning_embedding_mask,
+            )
         # x = 1/0
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)

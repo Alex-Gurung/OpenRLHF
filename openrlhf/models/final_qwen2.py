@@ -395,20 +395,81 @@ class Qwen2Model(Qwen2Model):
             if given_is_reasoning_embedding_mask is not None:
                 print("Given is reasoning embedding mask, masking")
                 is_reasoning_embedding_mask = given_is_reasoning_embedding_mask
-                # do the masking
-                print(f"is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
-                print(f"input_embeds shape: {inputs_embeds.shape}")
-                if is_reasoning_embedding_mask.sum() <= 0:
-                    print("ignoring masking because sum is zero")
-                    return outputs
-                # mask out the reasoning embeddings
-                outputs.last_hidden_state = outputs.last_hidden_state[
-                    :, ~is_reasoning_embedding_mask, :
-                ]
-                if outputs.hidden_states is not None:
-                    outputs.hidden_states = tuple(hs[:, ~is_reasoning_embedding_mask, :] for hs in outputs.hidden_states)
-                if outputs.attentions is not None:
-                    outputs.attentions = tuple(attn[:, :, ~is_reasoning_embedding_mask, ~is_reasoning_embedding_mask] for attn in outputs.attentions)
+                # Perform masking to remove injected reasoning and any right padding.
+                # Supports both 1D masks (B==1) and 2D masks (B>1).
+                if is_reasoning_embedding_mask.dim() == 1:
+                    # 1D case (legacy single-sample path)
+                    print(f"is_reasoning_embedding_mask sum: {is_reasoning_embedding_mask.sum()}")
+                    print(f"input_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
+                    if is_reasoning_embedding_mask.sum() <= 0:
+                        print("ignoring masking because sum is zero")
+                        return outputs
+                    outputs.last_hidden_state = outputs.last_hidden_state[:, ~is_reasoning_embedding_mask, :]
+                    if outputs.hidden_states is not None:
+                        outputs.hidden_states = tuple(
+                            hs[:, ~is_reasoning_embedding_mask, :] for hs in outputs.hidden_states
+                        )
+                    if outputs.attentions is not None:
+                        outputs.attentions = tuple(
+                            attn[:, :, ~is_reasoning_embedding_mask, ~is_reasoning_embedding_mask]
+                            for attn in outputs.attentions
+                        )
+                elif is_reasoning_embedding_mask.dim() == 2:
+                    # 2D case (batched): gather per sample.
+                    B, T_ext = is_reasoning_embedding_mask.shape
+                    lh = outputs.last_hidden_state
+                    assert lh.dim() == 3 and lh.size(0) == B and lh.size(1) == T_ext, (
+                        f"last_hidden_state shape {tuple(lh.shape)} incompatible with mask {tuple(is_reasoning_embedding_mask.shape)}"
+                    )
+                    keep_counts = (~is_reasoning_embedding_mask).sum(dim=1)  # [B]
+                    if int(keep_counts.min().item()) <= 0:
+                        print("ignoring masking because min kept count is zero")
+                        return outputs
+                    # Sanity: all samples should reduce to the same output length (original sequence length)
+                    uniq = torch.unique(keep_counts)
+                    assert uniq.numel() == 1, (
+                        f"Inconsistent kept lengths across batch: {keep_counts.tolist()}"
+                    )
+                    T_out = int(uniq.item())
+                    H = lh.size(-1)
+
+                    # Precompute keep indices per sample for reuse across tensors
+                    keep_idxs = [(~is_reasoning_embedding_mask[b]).nonzero(as_tuple=True)[0] for b in range(B)]
+
+                    # last_hidden_state
+                    new_lh = lh.new_empty((B, T_out, H))
+                    for b in range(B):
+                        new_lh[b] = lh[b, keep_idxs[b], :]
+                    outputs.last_hidden_state = new_lh
+
+                    # hidden_states (if returned)
+                    if outputs.hidden_states is not None:
+                        new_hs = []
+                        for hs in outputs.hidden_states:
+                            assert hs.dim() == 3 and hs.size(0) == B and hs.size(1) == T_ext
+                            nlayer = hs.new_empty((B, T_out, H))
+                            for b in range(B):
+                                nlayer[b] = hs[b, keep_idxs[b], :]
+                            new_hs.append(nlayer)
+                        outputs.hidden_states = tuple(new_hs)
+
+                    # attentions (if returned): [B, num_heads, T, T]
+                    if outputs.attentions is not None:
+                        new_atts = []
+                        for attn in outputs.attentions:
+                            assert attn.dim() == 4 and attn.size(0) == B and attn.size(2) == T_ext and attn.size(3) == T_ext
+                            heads = attn.size(1)
+                            nlayer = attn.new_empty((B, heads, T_out, T_out))
+                            for b in range(B):
+                                idx = keep_idxs[b]
+                                # Select on both time dimensions
+                                nlayer[b] = attn[b][:, idx, :][:, :, idx]
+                            new_atts.append(nlayer)
+                        outputs.attentions = tuple(new_atts)
+                else:
+                    raise ValueError(
+                        f"Unsupported mask ndim: {is_reasoning_embedding_mask.dim()}"
+                    )
                 
             return outputs
         # first we check if the input_ids contains <thought> (we actually do <|quad_start|> so it's only one token)
