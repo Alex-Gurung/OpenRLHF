@@ -11,6 +11,12 @@ from openrlhf.datasets import PromptDataset
 from openrlhf.datasets.utils import blending_datasets
 from openrlhf.trainer.ppo_utils import AdaptiveKLController, FixedKLController
 from openrlhf.trainer.ppo_utils.experience_maker import RemoteExperienceMaker
+from openrlhf.trainer.ppo_utils.group_aggregation import (
+    LeaveOneOutAggregator,
+    apply_aggregation_results_to_rollouts,
+    build_groups_from_rollouts,
+    default_aggregation_template,
+)
 from openrlhf.trainer.ppo_utils.replay_buffer import balance_experiences
 from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.utils.deepspeed import DeepspeedStrategy
@@ -356,6 +362,139 @@ class BasePPOTrainer(ABC):
     def get_max_steps(self):
         return self.max_steps
 
+    # ===== Two-stage aggregation helpers =====
+    def _aggregate_generate_fn(self, prompts: list[str], labels: list) -> list[str]:
+        """Use the shared vLLM generator to produce aggregator answers."""
+        samples = self.aggregator_generator.generate_samples(
+            prompts,
+            labels,
+            n_samples_per_prompt=1,
+            max_new_tokens=self.aggregator_max_new_tokens,
+            temperature=self.aggregator_temperature,
+            top_p=self.aggregator_top_p,
+        )
+        answers = []
+        for sample in samples:
+            # prefer cached text, otherwise decode from response tokens
+            if sample.info and "response_text" in sample.info:
+                answers.append(sample.info["response_text"][0])
+            else:
+                response_tokens = sample.sequences[0][sample.action_mask[0].bool()]
+                answers.append(self.tokenizer.decode(response_tokens, skip_special_tokens=True))
+        # Cache last aggregator samples for reward computation
+        self._last_aggregator_samples = samples
+        self._last_aggregator_prompts = prompts
+        self._last_aggregator_labels = labels
+        # Track full-group sample (first entry) for optional aggregator PPO
+        if len(samples) > 0 and self._agg_context is not None:
+            self._agg_context["full_samples"].append(samples[0])
+        return answers
+
+    def _aggregate_reward_fn(self, prompts: list[str], answers: list[str], labels: list) -> torch.Tensor:
+        """Compute rewards for aggregator prompts using any configured reward source (local RM or remote)."""
+        # Use cached samples from generation to avoid re-tokenizing.
+        samples = getattr(self, "_last_aggregator_samples", None)
+        assert samples is not None and len(samples) == len(prompts), "Aggregator samples missing"
+
+        # Local reward model
+        if self.reward_model_group is not None:
+            sequences_list = [s.sequences for s in samples]
+            attention_mask_list = [s.attention_mask for s in samples]
+
+            r_refs = self.reward_model_group.async_run_method_batch(
+                method_name="forward",
+                sequences=sequences_list,
+                attention_mask=attention_mask_list,
+                pad_sequence=[True] * len(samples),
+            )
+            rewards_list = sum(
+                ray.get(r_refs)[:: self.args.ring_attn_size * self.args.ds_tensor_parallel_size],
+                [],
+            )
+            rewards = torch.cat(rewards_list, dim=0)
+        elif self.remote_rm_url:
+            # remote reward model: decode queries and forward
+            from openrlhf.utils.utils import remove_pad_token
+
+            queries_list = sum(
+                [
+                    self.tokenizer.batch_decode(remove_pad_token(s.sequences, s.attention_mask), skip_special_tokens=False)
+                    for s in samples
+                ],
+                [],
+            )
+            prompts_list = prompts
+            labels_list = labels
+            if self.remote_reward_model is not None:
+                rewards_info = ray.get(
+                    self.remote_reward_model.get_rewards.remote(queries_list, prompts_list, labels_list)
+                )
+                rewards = torch.cat([torch.as_tensor(info["rewards"]) for info in rewards_info], dim=0)
+            elif self.reward_model_group is not None:
+                # Fallback to local RM even if remote_rm_url is set but not initialized (e.g., agent path).
+                r_refs = self.reward_model_group.async_run_method_batch(
+                    method_name="forward",
+                    sequences=[s.sequences for s in samples],
+                    attention_mask=[s.attention_mask for s in samples],
+                    pad_sequence=[True] * len(samples),
+                )
+                rewards_list = sum(
+                    ray.get(r_refs)[:: self.args.ring_attn_size * self.args.ds_tensor_parallel_size],
+                    [],
+                )
+                rewards = torch.cat(rewards_list, dim=0)
+            else:
+                raise RuntimeError("remote_rm_url is set but no reward model (local or remote) is available.")
+        else:
+            raise RuntimeError("Two-stage aggregation requires either a local reward model or remote_rm_url.")
+
+        # stash rewards on samples for optional logging
+        for sample, reward in zip(samples, rewards):
+            if sample.info is None or not isinstance(sample.info, dict):
+                sample.info = {}
+            sample.info["reward"] = reward.unsqueeze(0)
+        # Track full-group reward (first entry) aligned with full-group sample
+        if len(rewards) > 0 and self._agg_context is not None:
+            self._agg_context["full_rewards"].append(rewards[0])
+        return rewards
+
+    def _run_two_stage_rewards(self, rollout_samples: list) -> tuple[list, list]:
+        """Compute generator LOO rewards (if enabled) and build aggregator rollouts."""
+        # Set per-call context to avoid stale state across async batches
+        self._agg_context = {"full_samples": [], "full_rewards": []}
+
+        groups = build_groups_from_rollouts(rollout_samples, tokenizer=self.tokenizer)
+        if len(groups) == 0:
+            self._agg_context = None
+            return rollout_samples, []
+
+        # Generator LOO rewards (only when training generator)
+        if self.train_generator:
+            loo = self.leave_one_out
+            agg_results = loo(groups)
+            apply_aggregation_results_to_rollouts(rollout_samples, agg_results)
+
+        # Aggregator rollouts: always build if aggregator is being trained
+        aggregator_rollouts = []
+        if self.train_aggregator:
+            for group in groups:
+                responses = [t.response_text for t in group.traces]
+                prompt_text = default_aggregation_template(group.prompt, responses)
+                agg_samples = self.aggregator_generator.generate_samples(
+                    [prompt_text],
+                    [group.label],
+                    n_samples_per_prompt=self.args.n_samples_per_prompt,
+                    max_new_tokens=self.aggregator_max_new_tokens,
+                    temperature=self.aggregator_temperature,
+                    top_p=self.aggregator_top_p,
+                )
+                aggregator_rollouts.extend(agg_samples)
+
+        # Clear context to avoid accidental reuse
+        self._agg_context = None
+
+        return rollout_samples, aggregator_rollouts
+
 
 @ray.remote
 class PPOTrainer(BasePPOTrainer):
@@ -410,6 +549,38 @@ class PPOTrainer(BasePPOTrainer):
             self.tokenizer,
             self.prompt_max_len,
         )
+
+        # Two-stage control: generator_only / aggregator_only / both
+        self.two_stage_mode = getattr(self.args, "two_stage_mode", "both")
+        self.train_generator = self.two_stage_mode in ["both", "generator_only", "generator"]
+        self.train_aggregator = self.args.use_two_stage and self.two_stage_mode in [
+            "both",
+            "aggregator_only",
+            "aggregator",
+        ]
+
+        # Optional two-stage aggregation (shared actor/vLLM by default)
+        self.use_two_stage = getattr(self.args, "use_two_stage", False)
+        if self.use_two_stage:
+            self.aggregator_max_new_tokens = getattr(self.args, "aggregator_max_new_tokens", 64)
+            self.aggregator_prompt_max_len = getattr(self.args, "aggregator_prompt_max_len", self.prompt_max_len)
+            self.aggregator_temperature = getattr(self.args, "aggregator_temperature", 0.7)
+            self.aggregator_top_p = getattr(self.args, "aggregator_top_p", 1.0)
+
+            self.aggregator_generator = self.generator_cls(
+                self.vllm_engines,
+                self.strategy,
+                self.tokenizer,
+                self.aggregator_prompt_max_len,
+            )
+            self.leave_one_out = LeaveOneOutAggregator(
+                generate_fn=self._aggregate_generate_fn,
+                reward_fn=self._aggregate_reward_fn,
+                template_fn=default_aggregation_template,
+                include_full_group=True,
+            )
+            # Per-call context for aggregator full-group caching
+            self._agg_context = None
 
         self.experience_maker = RemoteExperienceMaker(
             self.actor_model_group,
@@ -504,33 +675,99 @@ class PPOTrainer(BasePPOTrainer):
                     filtered_samples = []
                     number_of_samples = 0
 
-                experiences = self.experience_maker.make_experience_batch(rollout_samples)
-                sample0 = self.tokenizer.batch_decode(
-                    experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
+                # Two-stage aggregation: compute LOO generator rewards unless aggregator-only
+                aggregator_rollouts = []
+                if self.use_two_stage:
+                    if self.train_generator:
+                        rollout_samples, aggregator_rollouts = self._run_two_stage_rewards(rollout_samples)
+                    else:
+                        # Aggregator-only: skip LOO, build aggregator prompts directly from rollouts.
+                        groups = build_groups_from_rollouts(rollout_samples, tokenizer=self.tokenizer)
+                        aggregator_rollouts = []
+                        for group in groups:
+                            responses = [t.response_text for t in group.traces]
+                            prompt_text = default_aggregation_template(group.prompt, responses)
+                            # Build a single Experience for the aggregator prompt
+                            agg_samples = self.aggregator_generator.generate_samples(
+                                [prompt_text],
+                                [group.label],
+                                n_samples_per_prompt=1,
+                                max_new_tokens=self.aggregator_max_new_tokens,
+                                temperature=self.aggregator_temperature,
+                                top_p=self.aggregator_top_p,
+                            )
+                            aggregator_rollouts.extend(agg_samples)
+
+                experiences = (
+                    self.experience_maker.make_experience_batch(rollout_samples) if self.train_generator else []
+                )
+                sample0 = (
+                    self.tokenizer.batch_decode(experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True)
+                    if experiences
+                    else ["", 0]
                 )
                 print(sample0)
 
-                # balance experiences across dp
-                if args.use_dynamic_batch:
-                    experiences = balance_experiences(experiences, args)
+                # Aggregator experiences (full-group prompts/answers)
+                aggregator_experiences = (
+                    self.experience_maker.make_experience_batch(aggregator_rollouts)
+                    if self.train_aggregator and aggregator_rollouts
+                    else []
+                )
 
-                refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
-                if self.critic_model_group is not None:
-                    refs.extend(
-                        self.critic_model_group.async_run_method_batch(method_name="append", experience=experiences)
+                # balance experiences across dp
+                if args.use_dynamic_batch and experiences:
+                    experiences = balance_experiences(experiences, args)
+                if args.use_dynamic_batch and aggregator_experiences:
+                    aggregator_experiences = balance_experiences(aggregator_experiences, args)
+
+                # Append generator experiences
+                if self.train_generator and experiences:
+                    refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
+                    if self.critic_model_group is not None:
+                        refs.extend(
+                            self.critic_model_group.async_run_method_batch(method_name="append", experience=experiences)
+                        )
+                    ray.get(refs)
+
+                # Append aggregator experiences (sharing actor/critic weights)
+                if self.train_aggregator and aggregator_experiences:
+                    refs = self.actor_model_group.async_run_method_batch(
+                        method_name="append", experience=aggregator_experiences
                     )
-                ray.get(refs)
+                    if self.critic_model_group is not None:
+                        refs.extend(
+                            self.critic_model_group.async_run_method_batch(
+                                method_name="append", experience=aggregator_experiences
+                            )
+                        )
+                    ray.get(refs)
 
                 status = self.ppo_train(steps)
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
 
-                # Add generated samples to status dictionary
+                # Logging helpers
                 if self.args.dynamic_filtering:
                     status["dynamic_filtering_pass_rate"] = pass_rate
+
+                if experiences:
+                    gen_rewards = torch.cat([exp.info["reward"] for exp in experiences], dim=0)
+                    status["gen_reward/mean"] = gen_rewards.mean().item()
+                    status["gen_reward/std"] = gen_rewards.std(unbiased=False).item()
+                    status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+
+                if self.train_aggregator and aggregator_experiences:
+                    agg_text = self.tokenizer.batch_decode(
+                        aggregator_experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
+                    )[0]
+                    agg_rewards = torch.cat([exp.info["reward"] for exp in aggregator_experiences], dim=0)
+                    status["agg_reward/mean"] = agg_rewards.mean().item()
+                    status["agg_reward/std"] = agg_rewards.std(unbiased=False).item()
+                    status["aggregator_samples"] = [agg_text, aggregator_experiences[0].info["reward"][0]]
+
                 logger.info(f"✨ Global step {steps}: {status}")
-                status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
 
                 # logs/checkpoints
                 client_states = {

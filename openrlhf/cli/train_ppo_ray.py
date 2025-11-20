@@ -418,6 +418,26 @@ if __name__ == "__main__":
     parser.add_argument("--value_head_prefix", type=str, default="score")
     parser.add_argument("--ref_reward_offload", action="store_true", default=False)
     parser.add_argument("--agent_func_path", type=str, default=None, help="Agent script path")
+    # Two-stage aggregation
+    parser.add_argument("--use_two_stage", action="store_true", default=False, help="Enable generator LOO aggregation")
+    parser.add_argument(
+        "--aggregator_max_new_tokens", type=int, default=64, help="Max new tokens for aggregator generation"
+    )
+    parser.add_argument(
+        "--aggregator_prompt_max_len",
+        type=int,
+        default=None,
+        help="Prompt truncation length for aggregator serialization (defaults to prompt_max_len)",
+    )
+    parser.add_argument("--aggregator_temperature", type=float, default=0.7, help="Aggregator sampling temperature")
+    parser.add_argument("--aggregator_top_p", type=float, default=1.0, help="Aggregator top_p")
+    parser.add_argument(
+        "--two_stage_mode",
+        type=str,
+        default="both",
+        choices=["both", "generator_only", "aggregator_only", "generator", "aggregator"],
+        help="Train generator, aggregator, or both in two-stage mode",
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
@@ -500,6 +520,10 @@ if __name__ == "__main__":
             "[Warning] input_template contains \\n characters instead of newline. "
             "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
         )
+
+    if args.aggregator_prompt_max_len is None:
+        args.aggregator_prompt_max_len = args.prompt_max_len
+
 
     if args.ring_attn_size > 1:
         if not args.packing_samples:

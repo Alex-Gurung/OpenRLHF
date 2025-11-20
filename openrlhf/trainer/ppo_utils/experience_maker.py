@@ -327,8 +327,19 @@ class SamplesGenerator:
 
         # Expand prompt list based on the number of samples per prompt
         n_samples_per_prompt = kwargs.pop("n_samples_per_prompt", args.n_samples_per_prompt)
-        all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in all_prompts], [])
-        all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
+        group_ids = kwargs.pop("group_ids", None)
+        expanded_prompts = []
+        expanded_labels = []
+        expanded_group_ids = []
+        for group_id, (prompt, label) in enumerate(zip(all_prompts, all_labels)):
+            expanded_prompts.extend([prompt] * n_samples_per_prompt)
+            expanded_labels.extend([label] * n_samples_per_prompt)
+            expanded_group_ids.extend(
+                [group_id] * n_samples_per_prompt if group_ids is None else [group_ids[group_id]] * n_samples_per_prompt
+            )
+        all_prompts = expanded_prompts
+        all_labels = expanded_labels
+        group_ids = expanded_group_ids
         all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
 
         # Distribute requests to engines and collect responses
@@ -351,6 +362,7 @@ class SamplesGenerator:
             output = all_outputs[i]
             prompt = all_prompts[i]
             label = all_labels[i]
+            group_id = group_ids[i] if group_ids else i
 
             # Concatenate prompt and output tokens
             input_ids = list(output.prompt_token_ids) + list(output.outputs[0].token_ids)
@@ -385,7 +397,11 @@ class SamplesGenerator:
                 "response_length": torch.tensor([response_length]),
                 "total_length": torch.tensor([total_length]),
                 "response_clip_ratio": torch.tensor([is_clipped]),
+                "group_id": torch.tensor([group_id]),
             }
+            # Save decoded response for downstream grouping/aggregation if available
+            if hasattr(output.outputs[0], "text") and output.outputs[0].text is not None:
+                info["response_text"] = [output.outputs[0].text]
 
             rollout_samples = Experience(
                 sequences=sequences.unsqueeze(0),
