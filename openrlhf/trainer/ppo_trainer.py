@@ -721,7 +721,9 @@ class PPOTrainer(BasePPOTrainer):
                 if args.use_dynamic_batch and aggregator_experiences:
                     aggregator_experiences = balance_experiences(aggregator_experiences, args)
 
-                # Append generator experiences
+                status = {}
+
+                # Train generator first (if enabled)
                 if self.train_generator and experiences:
                     refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
                     if self.critic_model_group is not None:
@@ -729,8 +731,9 @@ class PPOTrainer(BasePPOTrainer):
                             self.critic_model_group.async_run_method_batch(method_name="append", experience=experiences)
                         )
                     ray.get(refs)
+                    status.update(self.ppo_train(steps))
 
-                # Append aggregator experiences (sharing actor/critic weights)
+                # Train aggregator separately to keep batches homogeneous
                 if self.train_aggregator and aggregator_experiences:
                     refs = self.actor_model_group.async_run_method_batch(
                         method_name="append", experience=aggregator_experiences
@@ -742,8 +745,10 @@ class PPOTrainer(BasePPOTrainer):
                             )
                         )
                     ray.get(refs)
-
-                status = self.ppo_train(steps)
+                    agg_status = self.ppo_train(steps)
+                    # namespace aggregator stats to avoid collisions
+                    agg_status = {f"agg_{k}": v for k, v in agg_status.items()}
+                    status.update(agg_status)
 
                 if "kl" in status:
                     self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
