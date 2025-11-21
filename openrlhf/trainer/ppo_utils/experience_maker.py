@@ -170,6 +170,9 @@ class Experience:
                     result[key].append(value)
             # Merge all values for each key at once
             return {key: Experience._merge_item(values, pad_value) for key, values in result.items()}
+        elif isinstance(items[0], str):
+            # Keep string fields (typically logging info) as a list of strings
+            return list(items)
         elif items[0] is None:
             return None
         else:
