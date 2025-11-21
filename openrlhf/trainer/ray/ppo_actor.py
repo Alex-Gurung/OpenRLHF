@@ -293,10 +293,22 @@ class ActorPPOTrainer(ABC):
 
         # merge logs from info field
         for k, v in experience.info.items():
+            # Skip non-numeric logs (e.g., strings)
             if isinstance(v, list):
-                status[k] = torch.tensor(v, dtype=torch.float).mean().item()
+                if len(v) == 0:
+                    continue
+                first = v[0]
+                if isinstance(first, torch.Tensor):
+                    vec = torch.stack([t.float() for t in v])
+                    status[k] = vec.mean().item()
+                elif isinstance(first, (float, int, bool)):
+                    status[k] = torch.tensor(v, dtype=torch.float).mean().item()
+                else:
+                    continue
             elif isinstance(v, torch.Tensor):
                 status[k] = v.float().mean().item()
+            else:
+                continue
         return status
 
     def _broadcast_to_vllm(self):
