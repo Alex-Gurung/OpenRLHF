@@ -95,19 +95,27 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
 
     # Process info dictionary
     kwargs["info"] = {}
-    for key in items[0].info.keys():
-        values = [item.info[key] for item in items]
+    # Use the union of keys but only keep those present in all items to avoid KeyError
+    all_keys = set().union(*[item.info.keys() for item in items])
+    for key in all_keys:
+        if any(key not in item.info for item in items):
+            continue  # skip keys missing in some items
+
+        values = [item.info.get(key) for item in items]
         if not values:
             continue
 
-        # Validate all items have the same type
-        first_type = type(values[0])
-        if not all(isinstance(v, first_type) for v in values):
-            raise TypeError(f"Inconsistent types in info[{key}]")
+        # Validate all values share the same type
+        non_none = [v for v in values if v is not None]
+        if not non_none:
+            continue
+        first_type = type(non_none[0])
+        if not all(isinstance(v, first_type) for v in non_none):
+            continue  # skip inconsistent types
 
         # Convert to tensor if all values are numeric
-        if all(isinstance(v, (int, float)) for v in values):
-            kwargs["info"][key] = torch.tensor(values)
+        if all(isinstance(v, (int, float, bool)) for v in non_none):
+            kwargs["info"][key] = torch.tensor(values, dtype=torch.float)
         else:
             kwargs["info"][key] = values
 
