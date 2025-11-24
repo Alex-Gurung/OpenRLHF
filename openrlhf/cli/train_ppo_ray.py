@@ -421,13 +421,13 @@ if __name__ == "__main__":
     # Two-stage aggregation
     parser.add_argument("--use_two_stage", action="store_true", default=False, help="Enable generator LOO aggregation")
     parser.add_argument(
-        "--aggregator_max_new_tokens", type=int, default=64, help="Max new tokens for aggregator generation"
+        "--aggregator_max_new_tokens", type=int, default=1024, help="Max new tokens for aggregator generation"
     )
     parser.add_argument(
         "--aggregator_prompt_max_len",
         type=int,
         default=None,
-        help="Prompt truncation length for aggregator serialization (defaults to prompt_max_len)",
+        help="Prompt truncation length for aggregator serialization (defaults to  (n_samples_per_prompt+1)*prompt_max_len, capped by max_len)",
     )
     parser.add_argument("--aggregator_temperature", type=float, default=0.7, help="Aggregator sampling temperature")
     parser.add_argument("--aggregator_top_p", type=float, default=1.0, help="Aggregator top_p")
@@ -437,6 +437,19 @@ if __name__ == "__main__":
         default="both",
         choices=["both", "generator_only", "aggregator_only", "generator", "aggregator"],
         help="Train generator, aggregator, or both in two-stage mode",
+    )
+    parser.add_argument(
+        "--generator_reward_mode",
+        type=str,
+        default="ll_delta",
+        choices=["ll_delta", "loo_generate"],
+        help="Generator reward mode in two-stage: ll_delta (likelihood delta) or loo_generate",
+    )
+    parser.add_argument(
+        "--reuse_aggregator_answers_for_ll",
+        action="store_true",
+        default=True,
+        help="Reuse aggregator PPO answers as targets for ll_delta generator rewards (avoids extra generation)",
     )
 
     # Custom dataset

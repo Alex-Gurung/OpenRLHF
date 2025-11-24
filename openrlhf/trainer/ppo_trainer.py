@@ -19,6 +19,7 @@ from openrlhf.trainer.ppo_utils.group_aggregation import (
 )
 from openrlhf.trainer.ppo_utils.replay_buffer import balance_experiences
 from openrlhf.trainer.ray.launcher import RayActorGroup
+from openrlhf.models.utils import masked_mean
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.logging_utils import init_logger
 from openrlhf.utils.utils import get_tokenizer
@@ -459,7 +460,7 @@ class BasePPOTrainer(ABC):
         return rewards
 
     def _run_two_stage_rewards(self, rollout_samples: list) -> tuple[list, list]:
-        """Compute generator LOO rewards (if enabled) and build aggregator rollouts."""
+        """Compute generator rewards and build aggregator rollouts."""
         # Set per-call context to avoid stale state across async batches
         self._agg_context = {"full_samples": [], "full_rewards": []}
 
@@ -468,32 +469,187 @@ class BasePPOTrainer(ABC):
             self._agg_context = None
             return rollout_samples, []
 
-        # Generator LOO rewards (only when training generator)
-        if self.train_generator:
-            loo = self.leave_one_out
-            agg_results = loo(groups)
-            apply_aggregation_results_to_rollouts(rollout_samples, agg_results)
-
         # Aggregator rollouts: always build if aggregator is being trained
         aggregator_rollouts = []
+        agg_answers = None
         if self.train_aggregator:
+            agg_prompts = []
+            agg_labels = []
             for group in groups:
                 responses = [t.response_text for t in group.traces]
-                prompt_text = default_aggregation_template(group.prompt, responses)
-                agg_samples = self.aggregator_generator.generate_samples(
-                    [prompt_text],
-                    [group.label],
-                    n_samples_per_prompt=self.args.n_samples_per_prompt,
-                    max_new_tokens=self.aggregator_max_new_tokens,
-                    temperature=self.aggregator_temperature,
-                    top_p=self.aggregator_top_p,
-                )
-                aggregator_rollouts.extend(agg_samples)
+                agg_prompts.append(default_aggregation_template(group.prompt, responses))
+                agg_labels.append(group.label)
+
+            agg_samples = self.aggregator_generator.generate_samples(
+                agg_prompts,
+                agg_labels,
+                n_samples_per_prompt=self.args.n_samples_per_prompt,
+                max_new_tokens=self.aggregator_max_new_tokens,
+                temperature=self.aggregator_temperature,
+                top_p=self.aggregator_top_p,
+            )
+            aggregator_rollouts.extend(agg_samples)
+
+            # Cache first sample per group as target answer (for LL-delta reuse)
+            if self.reuse_agg_answers_for_ll:
+                agg_answers = {}
+                per_group = self.args.n_samples_per_prompt
+                for i, prompt in enumerate(agg_prompts):
+                    sample = agg_samples[i * per_group]
+                    if sample.info and "response_text" in sample.info:
+                        agg_answers[i] = sample.info["response_text"][0]
+                    else:
+                        ans_tokens = sample.sequences[0][sample.action_mask[0].bool()]
+                        agg_answers[i] = self.tokenizer.decode(ans_tokens, skip_special_tokens=True)
+
+        # Generator rewards
+        if self.train_generator:
+            if self.generator_reward_mode == "loo_generate":
+                loo = self.leave_one_out
+                agg_results = loo(groups)
+                apply_aggregation_results_to_rollouts(rollout_samples, agg_results)
+            elif self.generator_reward_mode == "ll_delta":
+                self._apply_ll_delta_rewards(groups, rollout_samples, agg_answers)
+            else:
+                raise ValueError(f"Unknown generator_reward_mode {self.generator_reward_mode}")
 
         # Clear context to avoid accidental reuse
         self._agg_context = None
 
         return rollout_samples, aggregator_rollouts
+
+    def _tokenize_prompt_answer(self, prompt_text: str, answer_text: str):
+        """Tokenize prompt+answer and build masks."""
+        # Truncate prompt/answer to configured caps
+        prompt_ids = self.tokenizer(
+            prompt_text,
+            add_special_tokens=False,
+            max_length=self.aggregator_prompt_max_len,
+            truncation=True,
+        )["input_ids"]
+        answer_ids = self.tokenizer(
+            answer_text,
+            add_special_tokens=False,
+            max_length=self.aggregator_max_new_tokens,
+            truncation=True,
+        )["input_ids"]
+        input_ids = prompt_ids + answer_ids
+        attention_mask = [1] * len(input_ids)
+        action_mask = [0] * len(prompt_ids) + [1] * len(answer_ids)
+        return (
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(attention_mask, dtype=torch.long),
+            torch.tensor(action_mask, dtype=torch.long),
+        )
+
+    @torch.no_grad()
+    def _apply_ll_delta_rewards(self, groups, rollout_samples, cached_answers=None):
+        """Compute generator rewards as LL(full prompt) - LL(drop-one prompt) on a fixed answer."""
+
+        # 1) Build full-group prompts and trace index mapping
+        agg_prompts = []
+        trace_indices = []  # per group, maps local trace idx -> sample_index in rollout_samples
+        for group in groups:
+            responses = [t.response_text for t in group.traces]
+            agg_prompts.append(default_aggregation_template(group.prompt, responses))
+            trace_indices.append([t.sample_index for t in group.traces])
+
+        # 2) Get one answer per group (reuse cached when available)
+        agg_answers = []
+        if cached_answers is not None:
+            for i in range(len(groups)):
+                agg_answers.append(cached_answers[i])
+        else:
+            agg_samples = self.aggregator_generator.generate_samples(
+                agg_prompts,
+                [g.label for g in groups],
+                n_samples_per_prompt=1,
+                max_new_tokens=self.aggregator_max_new_tokens,
+                temperature=self.aggregator_temperature,
+                top_p=self.aggregator_top_p,
+            )
+            for sample in agg_samples:
+                if sample.info and "response_text" in sample.info:
+                    agg_answers.append(sample.info["response_text"][0])
+                else:
+                    answer_tokens = sample.sequences[0][sample.action_mask[0].bool()]
+                    agg_answers.append(self.tokenizer.decode(answer_tokens, skip_special_tokens=True))
+
+        # 3) Serialize prompts (full + drop-one) with the same answer target
+        seq_group_map = []  # (group_idx, drop_idx or None)
+        seqs, attns, acts = [], [], []
+        for g_idx, group in enumerate(groups):
+            responses = [t.response_text for t in group.traces]
+            # full
+            full_seq, full_attn, full_act = self._tokenize_prompt_answer(agg_prompts[g_idx], agg_answers[g_idx])
+            seqs.append(full_seq)
+            attns.append(full_attn)
+            acts.append(full_act)
+            seq_group_map.append((g_idx, None))
+
+            # drop-one variants
+            for drop_idx in range(len(responses)):
+                kept = [resp for j, resp in enumerate(responses) if j != drop_idx]
+                drop_prompt = default_aggregation_template(group.prompt, kept)
+                seq, attn, act = self._tokenize_prompt_answer(drop_prompt, agg_answers[g_idx])
+                seqs.append(seq)
+                attns.append(attn)
+                acts.append(act)
+                seq_group_map.append((g_idx, drop_idx))
+
+        # 4) Pad batch
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        max_len = max(seq.size(0) for seq in seqs)
+        seq_batch = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
+        attn_batch = torch.zeros((len(seqs), max_len), dtype=torch.long)
+        act_batch = torch.zeros((len(seqs), max_len - 1), dtype=torch.long)  # aligns to logits[:-1]
+        for i, (seq, attn, act) in enumerate(zip(seqs, attns, acts)):
+            L = seq.size(0)
+            seq_batch[i, :L] = seq
+            attn_batch[i, :L] = attn
+            # shift action_mask because actor uses logits[:, :-1]
+            act_batch[i, : L - 1] = act[1:]
+
+        # 5) Forward to get logprobs on answer tokens
+        log_probs = self.actor_model_group.async_run_method(
+            method_name="forward",
+            sequences=[seq_batch],
+            attention_mask=[attn_batch],
+            action_mask=[act_batch],
+            pad_sequence=[False],
+        )
+        log_probs = ray.get(log_probs)[0][0]  # unwrap duplicate_factor
+
+        # 6) Aggregate LL per sequence
+        ll_per_seq = []
+        for i in range(len(seqs)):
+            mask = act_batch[i].bool()
+            if mask.sum() == 0:
+                ll_per_seq.append(torch.tensor(0.0, device=log_probs.device))
+            else:
+                ll_per_seq.append(masked_mean(log_probs[i].unsqueeze(0), mask.unsqueeze(0)))
+        ll_per_seq = torch.stack(ll_per_seq)
+
+        # 7) Map back to groups and assign rewards
+        ll_full = {}
+        ll_drop = {}
+        for idx, (g_idx, drop_idx) in enumerate(seq_group_map):
+            if drop_idx is None:
+                ll_full[g_idx] = ll_per_seq[idx]
+            else:
+                ll_drop[(g_idx, drop_idx)] = ll_per_seq[idx]
+
+        for g_idx, group in enumerate(groups):
+            full_ll = ll_full[g_idx]
+            for local_idx, sample_idx in enumerate(trace_indices[g_idx]):
+                drop_ll = ll_drop[(g_idx, local_idx)]
+                reward = (full_ll - drop_ll).detach().clone()
+                sample = rollout_samples[sample_idx]
+                if sample.info is None or not isinstance(sample.info, dict):
+                    sample.info = {}
+                sample.rewards = reward.unsqueeze(0)
+                sample.info["reward"] = reward.unsqueeze(0)
+                sample.info["loo_reward"] = reward.unsqueeze(0)
 
 
 @ray.remote
@@ -558,12 +714,37 @@ class PPOTrainer(BasePPOTrainer):
             "aggregator_only",
             "aggregator",
         ]
+        self.generator_reward_mode = getattr(self.args, "generator_reward_mode", "ll_delta")
+        self.reuse_agg_answers_for_ll = getattr(self.args, "reuse_aggregator_answers_for_ll", True)
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
         if self.use_two_stage:
-            self.aggregator_max_new_tokens = getattr(self.args, "aggregator_max_new_tokens", 64)
-            self.aggregator_prompt_max_len = getattr(self.args, "aggregator_prompt_max_len", self.prompt_max_len)
+            # Defaults: match generator lengths, but allow aggregator prompt to include all traces
+            gen_max_new = self.generate_kwargs.get("max_new_tokens", self.args.generate_max_len)
+            gen_prompt_len = self.args.prompt_max_len
+            group_factor = self.args.n_samples_per_prompt + 1
+            default_agg_prompt_len = gen_prompt_len * group_factor
+
+            requested_max_new = self.args.aggregator_max_new_tokens
+            requested_prompt_len = self.args.aggregator_prompt_max_len or default_agg_prompt_len
+
+            # Clamp aggregator lengths to avoid oversized sequences that can break collectives
+            max_len_cap = self.args.max_len
+            self.aggregator_max_new_tokens = min(requested_max_new, gen_max_new, max_len_cap)
+            if self.aggregator_max_new_tokens < requested_max_new:
+                logger.warning(
+                    f"[two-stage] Clamping aggregator_max_new_tokens from {requested_max_new} to {self.aggregator_max_new_tokens} "
+                    f"(max_len={max_len_cap}, gen_max_new={gen_max_new})"
+                )
+
+            self.aggregator_prompt_max_len = min(requested_prompt_len, max_len_cap)
+            if self.aggregator_prompt_max_len < requested_prompt_len:
+                logger.warning(
+                    f"[two-stage] Clamping aggregator_prompt_max_len from {requested_prompt_len} to {self.aggregator_prompt_max_len} "
+                    f"(max_len={max_len_cap})"
+                )
+
             self.aggregator_temperature = getattr(self.args, "aggregator_temperature", 0.7)
             self.aggregator_top_p = getattr(self.args, "aggregator_top_p", 1.0)
 
