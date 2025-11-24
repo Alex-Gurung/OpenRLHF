@@ -611,14 +611,13 @@ class BasePPOTrainer(ABC):
             act_batch[i, : L - 1] = act[1:]
 
         # 5) Forward to get logprobs on answer tokens
-        log_probs = self.actor_model_group.async_run_method(
+        refs = self.actor_model_group.async_run_method(
             method_name="forward",
-            sequences=[seq_batch],
-            attention_mask=[attn_batch],
-            action_mask=[act_batch],
-            pad_sequence=[False],
+            sequences=seq_batch,
+            attention_mask=attn_batch,
+            action_mask=act_batch,
         )
-        log_probs = ray.get(log_probs)[0][0]  # unwrap duplicate_factor
+        log_probs = ray.get(refs)[0]  # (B, action_len) with non-action positions zeroed
 
         # 6) Aggregate LL per sequence
         ll_per_seq = []
