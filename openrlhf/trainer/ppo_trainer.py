@@ -575,17 +575,16 @@ class BasePPOTrainer(ABC):
                     answer_tokens = sample.sequences[0][sample.action_mask[0].bool()]
                     agg_answers.append(self.tokenizer.decode(answer_tokens, skip_special_tokens=True))
 
-        # 3) Serialize prompts (full + drop-one) with the same answer target
-        seq_group_map = []  # (group_idx, drop_idx or None)
-        seqs, attns, acts = [], [], []
+        # 3) Process each group independently to keep padding small
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         for g_idx, group in enumerate(groups):
             responses = [t.response_text for t in group.traces]
-            # full
+            # full prompt
             full_seq, full_attn, full_act = self._tokenize_prompt_answer(agg_prompts[g_idx], agg_answers[g_idx])
-            seqs.append(full_seq)
-            attns.append(full_attn)
-            acts.append(full_act)
-            seq_group_map.append((g_idx, None))
+            seqs = [full_seq]
+            attns = [full_attn]
+            acts = [full_act]
+            seq_map = [(g_idx, None)]
 
             # drop-one variants
             for drop_idx in range(len(responses)):
@@ -595,60 +594,45 @@ class BasePPOTrainer(ABC):
                 seqs.append(seq)
                 attns.append(attn)
                 acts.append(act)
-                seq_group_map.append((g_idx, drop_idx))
+                seq_map.append((g_idx, drop_idx))
 
-        # 4) Pad batch
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        max_len = max(seq.size(0) for seq in seqs)
-        seq_batch = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
-        attn_batch = torch.zeros((len(seqs), max_len), dtype=torch.long)
-        act_batch = torch.zeros((len(seqs), max_len - 1), dtype=torch.long)  # aligns to logits[:-1]
-        for i, (seq, attn, act) in enumerate(zip(seqs, attns, acts)):
-            L = seq.size(0)
-            seq_batch[i, :L] = seq
-            attn_batch[i, :L] = attn
-            # shift action_mask because actor uses logits[:, :-1]
-            act_batch[i, : L - 1] = act[1:]
+            # pad per-group batch
+            max_len = max(seq.size(0) for seq in seqs)
+            seq_batch = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
+            attn_batch = torch.zeros((len(seqs), max_len), dtype=torch.long)
+            act_batch = torch.zeros((len(seqs), max_len - 1), dtype=torch.long)
+            for i, (seq, attn, act) in enumerate(zip(seqs, attns, acts)):
+                L = seq.size(0)
+                seq_batch[i, :L] = seq
+                attn_batch[i, :L] = attn
+                act_batch[i, : L - 1] = act[1:]  # shift for logits[:, :-1]
 
-        # 5) Forward to get logprobs on answer tokens
-        refs = self.actor_model_group.async_run_method(
-            method_name="forward",
-            sequences=seq_batch,
-            attention_mask=attn_batch,
-            action_mask=act_batch,
-        )
-        log_probs = ray.get(refs)[0]  # (B, action_len) with non-action positions zeroed
+            # forward and aggregate LL
+            refs = self.actor_model_group.async_run_method(
+                method_name="forward",
+                sequences=seq_batch,
+                attention_mask=attn_batch,
+                action_mask=act_batch,
+            )
+            log_probs = ray.get(refs)[0]
 
-        # 6) Aggregate LL per sequence
-        ll_per_seq = []
-        for i in range(len(seqs)):
-            mask = act_batch[i].bool()
-            if mask.sum() == 0:
-                ll_per_seq.append(torch.tensor(0.0, device=log_probs.device))
-            else:
-                ll_per_seq.append(masked_mean(log_probs[i].unsqueeze(0), mask.unsqueeze(0)))
-        ll_per_seq = torch.stack(ll_per_seq)
-
-        # 7) Map back to groups and assign rewards
-        ll_full = {}
-        ll_drop = {}
-        for idx, (g_idx, drop_idx) in enumerate(seq_group_map):
-            if drop_idx is None:
-                ll_full[g_idx] = ll_per_seq[idx]
-            else:
-                ll_drop[(g_idx, drop_idx)] = ll_per_seq[idx]
-
-        for g_idx, group in enumerate(groups):
-            full_ll = ll_full[g_idx]
-            for local_idx, sample_idx in enumerate(trace_indices[g_idx]):
-                drop_ll = ll_drop[(g_idx, local_idx)]
-                reward = (full_ll - drop_ll).detach().clone()
-                sample = rollout_samples[sample_idx]
-                if sample.info is None or not isinstance(sample.info, dict):
-                    sample.info = {}
-                sample.rewards = reward.unsqueeze(0)
-                sample.info["reward"] = reward.unsqueeze(0)
-                sample.info["loo_reward"] = reward.unsqueeze(0)
+            ll_full = None
+            for i, (_, drop_idx) in enumerate(seq_map):
+                mask = act_batch[i].bool()
+                ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
+                    log_probs[i].unsqueeze(0), mask.unsqueeze(0)
+                )
+                if drop_idx is None:
+                    ll_full = ll
+                else:
+                    reward = (ll_full - ll).detach().clone()
+                    sample_idx = trace_indices[g_idx][drop_idx]
+                    sample = rollout_samples[sample_idx]
+                    if sample.info is None or not isinstance(sample.info, dict):
+                        sample.info = {}
+                    sample.rewards = reward.unsqueeze(0)
+                    sample.info["reward"] = reward.unsqueeze(0)
+                    sample.info["loo_reward"] = reward.unsqueeze(0)
 
 
 @ray.remote
