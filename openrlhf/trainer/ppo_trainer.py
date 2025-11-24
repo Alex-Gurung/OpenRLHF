@@ -658,28 +658,28 @@ class BasePPOTrainer(ABC):
 
                     for i, (_, drop_idx) in enumerate(chunk_map):
                         mask = act_batch[i].bool()
-                                ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
-                                    log_probs[i].unsqueeze(0), mask.unsqueeze(0)
-                                )
-                                if drop_idx is None:
-                                    ll_full = ll  # loglikelihood on full prompt
-                                else:
-                                    # log-likelihood ratio; >0 means trace helps this answer
-                                    contrib = ll_full - ll
-                                    if self.ll_delta_normalize:
-                                        contrib = contrib / (ll_full.abs() + 1e-6)
-                                    if self.ll_delta_weight_by_answer_reward:
-                                        # if answer reward is cached on the sample, use it; else weight=1
-                                        reward_val = 1.0
-                                        if cached_samples:
-                                            sample_idx = g_idx * self.args.n_samples_per_prompt + ans_idx
-                                            if (
-                                                cached_samples[sample_idx].info is not None
-                                                and cached_samples[sample_idx].info.get("reward") is not None
-                                            ):
-                                                reward_val = cached_samples[sample_idx].info["reward"][0].item()
-                                    contrib = contrib * reward_val
-                                per_trace_rewards[drop_idx] += contrib.detach().clone()
+                        ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
+                            log_probs[i].unsqueeze(0), mask.unsqueeze(0)
+                        )
+                        if drop_idx is None:
+                            ll_full = ll  # loglikelihood on full prompt
+                        else:
+                            # log-likelihood ratio; >0 means trace helps this answer
+                            contrib = ll_full - ll
+                            if self.ll_delta_normalize:
+                                contrib = contrib / (ll_full.abs() + 1e-6)
+                            if self.ll_delta_weight_by_answer_reward:
+                                # if answer reward is cached on the sample, use it; else weight=1
+                                reward_val = 1.0
+                                if cached_samples:
+                                    sample_idx = g_idx * self.args.n_samples_per_prompt + ans_idx
+                                    if (
+                                        cached_samples[sample_idx].info is not None
+                                        and cached_samples[sample_idx].info.get("reward") is not None
+                                    ):
+                                        reward_val = cached_samples[sample_idx].info["reward"][0].item()
+                            contrib = contrib * reward_val
+                        per_trace_rewards[drop_idx] += contrib.detach().clone()
 
                     # free chunk tensors
                     del seq_batch, attn_batch, act_batch, log_probs
