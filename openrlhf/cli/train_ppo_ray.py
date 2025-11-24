@@ -487,6 +487,24 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval_n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
     )
+    parser.add_argument(
+        "--eval_two_stage",
+        action="store_true",
+        default=None,
+        help="Enable two-stage evaluation with aggregation (defaults to matching --use_two_stage)",
+    )
+    parser.add_argument(
+        "--eval_aggregator_temperature",
+        type=float,
+        default=0.1,
+        help="Temperature for aggregator generation during evaluation (lower = more deterministic)",
+    )
+    parser.add_argument(
+        "--eval_aggregator_samples",
+        type=int,
+        default=1,
+        help="Number of aggregator samples to generate per group during evaluation",
+    )
 
     parser.add_argument("--input_key", type=str, default="input", help="JSON dataset key")
     parser.add_argument("--label_key", type=str, default=None, help="JSON dataset key")
@@ -588,6 +606,10 @@ if __name__ == "__main__":
 
     if args.eval_dataset:
         assert args.remote_rm_url, "`--eval_dataset` is only supported with `--remote_rm_url`."
+
+    # Default eval_two_stage to match training mode if not explicitly set
+    if args.eval_two_stage is None:
+        args.eval_two_stage = args.use_two_stage
 
     if args.use_kl_loss:
         if args.kl_estimator not in ["k2", "k3"]:

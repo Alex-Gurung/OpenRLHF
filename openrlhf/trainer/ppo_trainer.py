@@ -217,6 +217,208 @@ class BasePPOTrainer(ABC):
                 ref.extend(self.critic_model_group.async_run_method(method_name="save_checkpoint", tag=tag))
             ray.get(ref)
 
+    def _compute_generator_metrics(
+        self, samples_list: list, prompt_to_datasource: dict, n_samples_per_prompt: int
+    ) -> dict:
+        """Compute evaluation metrics for individual generator samples.
+
+        Args:
+            samples_list: List of Experience objects with generator samples
+            prompt_to_datasource: Mapping from prompts to their data sources
+            n_samples_per_prompt: Number of samples generated per prompt
+
+        Returns:
+            Dictionary of generator metrics per datasource
+        """
+        # Duplicate prompts and labels for each sample
+        all_prompts = sum([s.prompts for s in samples_list], [])
+
+        # Get rewards from samples (agent rewards or remote reward models)
+        rewards_list = []
+        for samples in samples_list:
+            rewards_list.append(samples.rewards)
+        # Reshape rewards to (num_prompts, n_samples_per_prompt)
+        rewards = torch.tensor(rewards_list).reshape(-1, n_samples_per_prompt)
+
+        # Collect statistics for each data source
+        global_metrics = {}  # {datasource: {"pass@k": 0, "pass@1": 0, "rewards": [], "count": 0}}
+
+        # Process rewards in chunks of n_samples_per_prompt
+        num_prompts = len(all_prompts) // n_samples_per_prompt
+        for i in range(num_prompts):
+            # Get the original prompt (first one in the chunk)
+            original_prompt = all_prompts[i * n_samples_per_prompt]
+            datasource = prompt_to_datasource[original_prompt]
+
+            if datasource not in global_metrics:
+                global_metrics[datasource] = {
+                    f"pass{n_samples_per_prompt}": 0,
+                    "pass1": 0,
+                    "rewards": [],
+                    "count": 0,
+                }
+
+            # Get rewards for this chunk
+            chunk_rewards = rewards[i]
+
+            # Calculate pass@k (best of k) and pass@1 (average)
+            if n_samples_per_prompt > 1:
+                global_metrics[datasource][f"pass{n_samples_per_prompt}"] += chunk_rewards.max().float().item()
+            global_metrics[datasource]["pass1"] += chunk_rewards.mean().float().item()
+            global_metrics[datasource]["rewards"].extend(chunk_rewards.tolist())
+            global_metrics[datasource]["count"] += 1
+
+        # Calculate final metrics
+        logs = {}
+        for datasource, metrics in global_metrics.items():
+            # Basic metrics
+            logs[f"eval_{datasource}_gen_pass{n_samples_per_prompt}"] = (
+                metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
+            )
+            logs[f"eval_{datasource}_gen_pass1"] = metrics["pass1"] / metrics["count"]
+
+            # Additional statistics
+            all_rewards = torch.tensor(metrics["rewards"])
+            logs[f"eval_{datasource}_gen_mean"] = all_rewards.mean().item()
+            logs[f"eval_{datasource}_gen_std"] = all_rewards.std().item() if len(all_rewards) > 1 else 0.0
+
+        return logs
+
+    def _evaluate_aggregator(
+        self, samples_list: list, prompt_to_datasource: dict, n_samples_per_prompt: int
+    ) -> dict:
+        """Evaluate aggregator performance by combining generator samples.
+
+        Args:
+            samples_list: List of Experience objects with generator samples
+            prompt_to_datasource: Mapping from prompts to their data sources
+            n_samples_per_prompt: Number of samples generated per prompt
+
+        Returns:
+            Dictionary of aggregator metrics per datasource
+        """
+        # Build groups from generator samples
+        groups = build_groups_from_rollouts(samples_list, tokenizer=self.tokenizer)
+        if len(groups) == 0:
+            logger.warning("No groups found for aggregator evaluation")
+            return {}
+
+        # Prepare aggregator prompts and track metadata
+        agg_prompts = []
+        agg_labels = []
+        group_to_datasource = {}
+
+        for group in groups:
+            responses = [t.response_text for t in group.traces]
+            agg_prompt = default_aggregation_template(group.prompt, responses)
+            agg_prompts.append(agg_prompt)
+            agg_labels.append(group.label)
+
+            # Map group to datasource using first trace's prompt
+            original_prompt = group.prompt
+            datasource = prompt_to_datasource.get(original_prompt, "unknown")
+            group_to_datasource[group.group_id] = datasource
+
+        # Generate aggregator answers
+        eval_agg_temp = getattr(self.args, "eval_aggregator_temperature", 0.1)
+        eval_agg_samples = getattr(self.args, "eval_aggregator_samples", 1)
+
+        agg_samples_list = self.aggregator_generator.generate_samples(
+            agg_prompts,
+            agg_labels,
+            remote_reward_model=self.remote_reward_model,
+            n_samples_per_prompt=eval_agg_samples,
+            max_new_tokens=self.aggregator_max_new_tokens,
+            temperature=eval_agg_temp,
+            top_p=self.aggregator_top_p,
+        )
+
+        # Collect aggregator rewards
+        agg_rewards_list = []
+        for agg_sample in agg_samples_list:
+            agg_rewards_list.append(agg_sample.rewards)
+        agg_rewards = torch.tensor(agg_rewards_list).reshape(-1, eval_agg_samples)
+
+        # Compute aggregator metrics per datasource
+        agg_metrics = {}  # {datasource: {"pass@1": 0, "pass@k": 0, "rewards": [], "count": 0}}
+
+        for group_idx, group in enumerate(groups):
+            datasource = group_to_datasource[group.group_id]
+
+            if datasource not in agg_metrics:
+                agg_metrics[datasource] = {
+                    "pass1": 0,
+                    f"pass{eval_agg_samples}": 0,
+                    "rewards": [],
+                    "count": 0,
+                }
+
+            # Get rewards for this group
+            group_rewards = agg_rewards[group_idx]
+
+            # Calculate pass@1 (average) and pass@k (best)
+            agg_metrics[datasource]["pass1"] += group_rewards.mean().float().item()
+            if eval_agg_samples > 1:
+                agg_metrics[datasource][f"pass{eval_agg_samples}"] += group_rewards.max().float().item()
+            agg_metrics[datasource]["rewards"].extend(group_rewards.tolist())
+            agg_metrics[datasource]["count"] += 1
+
+        # Calculate final aggregator metrics
+        logs = {}
+        for datasource, metrics in agg_metrics.items():
+            logs[f"eval_{datasource}_agg_pass1"] = metrics["pass1"] / metrics["count"]
+            if eval_agg_samples > 1:
+                logs[f"eval_{datasource}_agg_pass{eval_agg_samples}"] = (
+                    metrics[f"pass{eval_agg_samples}"] / metrics["count"]
+                )
+
+            # Additional statistics
+            all_rewards = torch.tensor(metrics["rewards"])
+            logs[f"eval_{datasource}_agg_mean"] = all_rewards.mean().item()
+            logs[f"eval_{datasource}_agg_std"] = all_rewards.std().item() if len(all_rewards) > 1 else 0.0
+
+        return logs
+
+    def _compute_comparison_metrics(
+        self, gen_metrics: dict, agg_metrics: dict, n_samples_per_prompt: int
+    ) -> dict:
+        """Compute comparison metrics between generator and aggregator.
+
+        Args:
+            gen_metrics: Generator evaluation metrics
+            agg_metrics: Aggregator evaluation metrics
+            n_samples_per_prompt: Number of samples per prompt
+
+        Returns:
+            Dictionary of comparison metrics
+        """
+        logs = {}
+
+        # Extract unique datasources
+        datasources = set()
+        for key in gen_metrics.keys():
+            if key.startswith("eval_") and "_gen_" in key:
+                datasource = key.split("_gen_")[0].replace("eval_", "")
+                datasources.add(datasource)
+
+        for datasource in datasources:
+            gen_pass_k_key = f"eval_{datasource}_gen_pass{n_samples_per_prompt}"
+            gen_pass1_key = f"eval_{datasource}_gen_pass1"
+            agg_pass1_key = f"eval_{datasource}_agg_pass1"
+
+            # Check if keys exist
+            if gen_pass_k_key in gen_metrics and agg_pass1_key in agg_metrics:
+                # Improvement over best-of-k
+                improvement = agg_metrics[agg_pass1_key] - gen_metrics[gen_pass_k_key]
+                logs[f"eval_{datasource}_improvement"] = improvement
+
+            if gen_pass1_key in gen_metrics and agg_pass1_key in agg_metrics:
+                # Improvement over single-shot (pass@1)
+                improvement_vs_mean = agg_metrics[agg_pass1_key] - gen_metrics[gen_pass1_key]
+                logs[f"eval_{datasource}_agg_vs_gen_mean"] = improvement_vs_mean
+
+        return logs
+
     def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
         """Evaluate model performance on eval dataset.
 
@@ -295,6 +497,24 @@ class BasePPOTrainer(ABC):
                     metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
                 )
                 logs[f"eval_{datasource}_pass1"] = metrics["pass1"] / metrics["count"]
+
+            # Two-stage evaluation: evaluate aggregator if enabled
+            eval_two_stage = getattr(self.args, "eval_two_stage", False)
+            if eval_two_stage and self.use_two_stage and n_samples_per_prompt > 1:
+                logger.info(
+                    f"Running two-stage evaluation: {n_samples_per_prompt} generator samples → aggregator "
+                    f"(temp={getattr(self.args, 'eval_aggregator_temperature', 0.1)})"
+                )
+                # Compute generator metrics using helper
+                gen_metrics = self._compute_generator_metrics(samples_list, prompt_to_datasource, n_samples_per_prompt)
+                # Evaluate aggregator
+                agg_metrics = self._evaluate_aggregator(samples_list, prompt_to_datasource, n_samples_per_prompt)
+                # Compute comparison metrics
+                comparison_metrics = self._compute_comparison_metrics(gen_metrics, agg_metrics, n_samples_per_prompt)
+                # Add two-stage metrics to logs
+                logs.update(gen_metrics)
+                logs.update(agg_metrics)
+                logs.update(comparison_metrics)
 
             # Log to wandb/tensorboard
             if self._wandb is not None:
