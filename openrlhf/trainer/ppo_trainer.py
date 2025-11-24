@@ -730,7 +730,7 @@ class PPOTrainer(BasePPOTrainer):
             requested_prompt_len = self.args.aggregator_prompt_max_len or default_agg_prompt_len
 
             # Clamp aggregator lengths to avoid oversized sequences that can break collectives
-            max_len_cap = self.args.max_len
+            max_len_cap = self.args.max_len or (requested_prompt_len + requested_max_new)
             self.aggregator_max_new_tokens = min(requested_max_new, gen_max_new, max_len_cap)
             if self.aggregator_max_new_tokens < requested_max_new:
                 logger.warning(

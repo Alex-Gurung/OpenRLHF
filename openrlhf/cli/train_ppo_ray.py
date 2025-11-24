@@ -429,7 +429,7 @@ if __name__ == "__main__":
         default=None,
         help="Prompt truncation length for aggregator serialization (defaults to  (n_samples_per_prompt+1)*prompt_max_len, capped by max_len)",
     )
-    parser.add_argument("--aggregator_temperature", type=float, default=0.7, help="Aggregator sampling temperature")
+    parser.add_argument("--aggregator_temperature", type=float, default=1.0, help="Aggregator sampling temperature")
     parser.add_argument("--aggregator_top_p", type=float, default=1.0, help="Aggregator top_p")
     parser.add_argument(
         "--two_stage_mode",
@@ -446,10 +446,11 @@ if __name__ == "__main__":
         help="Generator reward mode in two-stage: ll_delta (likelihood delta) or loo_generate",
     )
     parser.add_argument(
-        "--reuse_aggregator_answers_for_ll",
-        action="store_true",
+        "--no_reuse_aggregator_answers_for_ll",
+        action="store_false",
+        dest="reuse_aggregator_answers_for_ll",
         default=True,
-        help="Reuse aggregator PPO answers as targets for ll_delta generator rewards (avoids extra generation)",
+        help="Disable reusing aggregator PPO answers as targets for ll_delta generator rewards",
     )
 
     # Custom dataset
@@ -533,9 +534,6 @@ if __name__ == "__main__":
             "[Warning] input_template contains \\n characters instead of newline. "
             "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
         )
-
-    if args.aggregator_prompt_max_len is None:
-        args.aggregator_prompt_max_len = args.prompt_max_len
 
 
     if args.ring_attn_size > 1:
