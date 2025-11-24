@@ -678,8 +678,8 @@ class BasePPOTrainer(ABC):
                                         and cached_samples[sample_idx].info.get("reward") is not None
                                     ):
                                         reward_val = cached_samples[sample_idx].info["reward"][0].item()
-                            contrib = contrib * reward_val
-                        per_trace_rewards[drop_idx] += contrib.detach().clone()
+                                contrib = contrib * reward_val
+                            per_trace_rewards[drop_idx] += contrib.detach().clone()
 
                     # free chunk tensors
                     del seq_batch, attn_batch, act_batch, log_probs
