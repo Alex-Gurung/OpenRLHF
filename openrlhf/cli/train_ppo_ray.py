@@ -458,6 +458,19 @@ if __name__ == "__main__":
         default=2,
         help="Microbatch size (number of sequences) when scoring LL deltas to reduce memory",
     )
+    parser.add_argument(
+        "--ll_delta_weight_by_answer_reward",
+        action="store_false",
+        dest="ll_delta_weight_by_answer_reward",
+        default=True,
+        help="Disable weighting per-answer LL deltas by that answer's reward",
+    )
+    parser.add_argument(
+        "--ll_delta_normalize",
+        action="store_true",
+        default=False,
+        help="Normalize LL deltas by |ll_full| to reduce scale sensitivity",
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")

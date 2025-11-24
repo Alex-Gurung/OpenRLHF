@@ -543,8 +543,18 @@ class BasePPOTrainer(ABC):
         )
 
     @torch.no_grad()
-    def _apply_ll_delta_rewards(self, groups, rollout_samples, cached_answers=None):
-        """Compute generator rewards as LL(full prompt) - LL(drop-one prompt) on a fixed answer."""
+    def _apply_ll_delta_rewards(self, groups, rollout_samples, cached_answers=None, cached_samples=None):
+        """
+        Generator reward (LL-delta) per group (sign convention: positive means trace helps the answer):
+          For each aggregator answer A_k:
+            ll_full    = log p(A_k | full prompt with all traces)
+            ll_drop_i  = log p(A_k | prompt with trace i removed)
+            diff       = ll_full - ll_drop_i    # log-likelihood ratio; >0 means trace makes the answer more likely
+            contrib_i  = diff
+            if weight_by_reward: contrib_i *= reward(A_k)
+          Reward for trace i = average contrib_i over all answers k available.
+        This averages across all available aggregator answers (no extra generation).
+        """
 
         # 1) Build full-group prompts and trace index mapping
         agg_prompts = []
@@ -554,11 +564,21 @@ class BasePPOTrainer(ABC):
             agg_prompts.append(default_aggregation_template(group.prompt, responses))
             trace_indices.append([t.sample_index for t in group.traces])
 
-        # 2) Get one answer per group (reuse cached when available)
-        agg_answers = []
-        if cached_answers is not None:
+        # 2) Collect answers per group
+        agg_answers_per_group = [[] for _ in groups]
+        if cached_samples:
+            per_group = self.args.n_samples_per_prompt
+            for g_idx in range(len(groups)):
+                for s_idx in range(per_group):
+                    sample = cached_samples[g_idx * per_group + s_idx]
+                    if sample.info and "response_text" in sample.info:
+                        agg_answers_per_group[g_idx].append(sample.info["response_text"][0])
+                    else:
+                        ans_tokens = sample.sequences[0][sample.action_mask[0].bool()]
+                        agg_answers_per_group[g_idx].append(self.tokenizer.decode(ans_tokens, skip_special_tokens=True))
+        elif cached_answers is not None:
             for i in range(len(groups)):
-                agg_answers.append(cached_answers[i])
+                agg_answers_per_group[i].append(cached_answers[i])
         else:
             agg_samples = self.aggregator_generator.generate_samples(
                 agg_prompts,
@@ -568,84 +588,113 @@ class BasePPOTrainer(ABC):
                 temperature=self.aggregator_temperature,
                 top_p=self.aggregator_top_p,
             )
-            for sample in agg_samples:
+            for i, sample in enumerate(agg_samples):
                 if sample.info and "response_text" in sample.info:
-                    agg_answers.append(sample.info["response_text"][0])
+                    agg_answers_per_group[i].append(sample.info["response_text"][0])
                 else:
                     answer_tokens = sample.sequences[0][sample.action_mask[0].bool()]
-                    agg_answers.append(self.tokenizer.decode(answer_tokens, skip_special_tokens=True))
+                    agg_answers_per_group[i].append(self.tokenizer.decode(answer_tokens, skip_special_tokens=True))
 
         # 3) Process each group independently to keep padding small
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
         for g_idx, group in enumerate(groups):
             responses = [t.response_text for t in group.traces]
-            # full prompt
-            full_seq, full_attn, full_act = self._tokenize_prompt_answer(agg_prompts[g_idx], agg_answers[g_idx])
-            seqs = [full_seq]
-            attns = [full_attn]
-            acts = [full_act]
-            seq_map = [(g_idx, None)]
+            answers = agg_answers_per_group[g_idx] if agg_answers_per_group[g_idx] else []
+            if not answers:
+                continue
 
-            # drop-one variants
-            for drop_idx in range(len(responses)):
-                kept = [resp for j, resp in enumerate(responses) if j != drop_idx]
-                drop_prompt = default_aggregation_template(group.prompt, kept)
-                seq, attn, act = self._tokenize_prompt_answer(drop_prompt, agg_answers[g_idx])
-                seqs.append(seq)
-                attns.append(attn)
-                acts.append(act)
-                seq_map.append((g_idx, drop_idx))
+            per_trace_rewards = torch.zeros(
+                len(responses),
+                device=rollout_samples[0].rewards.device if rollout_samples[0].rewards is not None else "cpu",
+            )
 
-            # pad per-group batch
-            max_len = max(seq.size(0) for seq in seqs)
-            num_seqs = len(seqs)
-            mb = max(1, self.ll_delta_seq_microbatch)
-            ll_full = None
-            for start in range(0, num_seqs, mb):
-                end = min(start + mb, num_seqs)
-                seq_chunk = seqs[start:end]
-                attn_chunk = attns[start:end]
-                act_chunk = acts[start:end]
-                chunk_map = seq_map[start:end]
+            for ans_idx, ans_text in enumerate(answers):
+                # full prompt
+                full_seq, full_attn, full_act = self._tokenize_prompt_answer(agg_prompts[g_idx], ans_text)
+                seqs = [full_seq]
+                attns = [full_attn]
+                acts = [full_act]
+                seq_map = [(g_idx, None)]
 
-                chunk_max_len = max(seq.size(0) for seq in seq_chunk)
-                seq_batch = torch.full((len(seq_chunk), chunk_max_len), pad_id, dtype=torch.long)
-                attn_batch = torch.zeros((len(seq_chunk), chunk_max_len), dtype=torch.long)
-                act_batch = torch.zeros((len(seq_chunk), chunk_max_len - 1), dtype=torch.long)
-                for i, (seq, attn, act) in enumerate(zip(seq_chunk, attn_chunk, act_chunk)):
-                    L = seq.size(0)
-                    seq_batch[i, :L] = seq
-                    attn_batch[i, :L] = attn
-                    act_batch[i, : L - 1] = act[1:]  # shift for logits[:, :-1]
+                # drop-one variants
+                for drop_idx in range(len(responses)):
+                    kept = [resp for j, resp in enumerate(responses) if j != drop_idx]
+                    drop_prompt = default_aggregation_template(group.prompt, kept)
+                    seq, attn, act = self._tokenize_prompt_answer(drop_prompt, ans_text)
+                    seqs.append(seq)
+                    attns.append(attn)
+                    acts.append(act)
+                    seq_map.append((g_idx, drop_idx))
 
-                refs = self.actor_model_group.async_run_method(
-                    method_name="forward",
-                    sequences=seq_batch,
-                    attention_mask=attn_batch,
-                    action_mask=act_batch,
-                )
-                log_probs = ray.get(refs)[0]
+                # pad per-group batch with microbatching
+                max_len = max(seq.size(0) for seq in seqs)
+                num_seqs = len(seqs)
+                mb = max(1, self.ll_delta_seq_microbatch)
+                ll_full = None
+                for start in range(0, num_seqs, mb):
+                    end = min(start + mb, num_seqs)
+                    seq_chunk = seqs[start:end]
+                    attn_chunk = attns[start:end]
+                    act_chunk = acts[start:end]
+                    chunk_map = seq_map[start:end]  # maps chunk rows back to (group_idx, drop_idx)
 
-                for i, (_, drop_idx) in enumerate(chunk_map):
-                    mask = act_batch[i].bool()
-                    ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
-                        log_probs[i].unsqueeze(0), mask.unsqueeze(0)
+                    chunk_max_len = max(seq.size(0) for seq in seq_chunk)
+                    seq_batch = torch.full((len(seq_chunk), chunk_max_len), pad_id, dtype=torch.long)
+                    attn_batch = torch.zeros((len(seq_chunk), chunk_max_len), dtype=torch.long)
+                    act_batch = torch.zeros((len(seq_chunk), chunk_max_len - 1), dtype=torch.long)
+                    for i, (seq, attn, act) in enumerate(zip(seq_chunk, attn_chunk, act_chunk)):
+                        L = seq.size(0)
+                        seq_batch[i, :L] = seq
+                        attn_batch[i, :L] = attn
+                        act_batch[i, : L - 1] = act[1:]  # shift for logits[:, :-1]
+
+                    refs = self.actor_model_group.async_run_method(
+                        method_name="forward",
+                        sequences=seq_batch,
+                        attention_mask=attn_batch,
+                        action_mask=act_batch,
                     )
-                    if drop_idx is None:
-                        ll_full = ll
-                    else:
-                        reward = (ll_full - ll).detach().clone()
-                        sample_idx = trace_indices[g_idx][drop_idx]
-                        sample = rollout_samples[sample_idx]
-                        if sample.info is None or not isinstance(sample.info, dict):
-                            sample.info = {}
-                        sample.rewards = reward.unsqueeze(0)
-                        sample.info["reward"] = reward.unsqueeze(0)
-                        sample.info["loo_reward"] = reward.unsqueeze(0)
+                    log_probs = ray.get(refs)[0]
 
-                # free chunk tensors
-                del seq_batch, attn_batch, act_batch, log_probs
-                torch.cuda.empty_cache()
+                    for i, (_, drop_idx) in enumerate(chunk_map):
+                        mask = act_batch[i].bool()
+                                ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
+                                    log_probs[i].unsqueeze(0), mask.unsqueeze(0)
+                                )
+                                if drop_idx is None:
+                                    ll_full = ll  # loglikelihood on full prompt
+                                else:
+                                    # log-likelihood ratio; >0 means trace helps this answer
+                                    contrib = ll_full - ll
+                                    if self.ll_delta_normalize:
+                                        contrib = contrib / (ll_full.abs() + 1e-6)
+                                    if self.ll_delta_weight_by_answer_reward:
+                                        # if answer reward is cached on the sample, use it; else weight=1
+                                        reward_val = 1.0
+                                        if cached_samples:
+                                            sample_idx = g_idx * self.args.n_samples_per_prompt + ans_idx
+                                            if (
+                                                cached_samples[sample_idx].info is not None
+                                                and cached_samples[sample_idx].info.get("reward") is not None
+                                            ):
+                                                reward_val = cached_samples[sample_idx].info["reward"][0].item()
+                                    contrib = contrib * reward_val
+                                per_trace_rewards[drop_idx] += contrib.detach().clone()
+
+                    # free chunk tensors
+                    del seq_batch, attn_batch, act_batch, log_probs
+                    torch.cuda.empty_cache()
+
+            # average across all answers seen
+            per_trace_rewards = per_trace_rewards / max(1, len(answers))
+            for local_idx, sample_idx in enumerate(trace_indices[g_idx]):
+                reward = per_trace_rewards[local_idx]
+                sample = rollout_samples[sample_idx]
+                if sample.info is None or not isinstance(sample.info, dict):
+                    sample.info = {}
+                sample.rewards = reward.unsqueeze(0)
+                sample.info["reward"] = reward.unsqueeze(0)
+                sample.info["loo_reward"] = reward.unsqueeze(0)
 
 
 @ray.remote
@@ -713,6 +762,8 @@ class PPOTrainer(BasePPOTrainer):
         self.generator_reward_mode = getattr(self.args, "generator_reward_mode", "ll_delta")
         self.reuse_agg_answers_for_ll = getattr(self.args, "reuse_aggregator_answers_for_ll", True)
         self.ll_delta_seq_microbatch = getattr(self.args, "ll_delta_seq_microbatch", 2)
+        self.ll_delta_weight_by_answer_reward = getattr(self.args, "ll_delta_weight_by_answer_reward", True)
+        self.ll_delta_normalize = getattr(self.args, "ll_delta_normalize", False)
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
