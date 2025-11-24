@@ -168,6 +168,8 @@ class Actor(nn.Module):
 
         output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids)
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
+        print(f"output['logits'].dtype: {output['logits'].dtype}")
+        print(f"output['logits'].shape: {output['logits'].shape}")
         output["logits"] = output["logits"].to(torch.float32)
 
         if return_entropy:

@@ -452,6 +452,12 @@ if __name__ == "__main__":
         default=True,
         help="Disable reusing aggregator PPO answers as targets for ll_delta generator rewards",
     )
+    parser.add_argument(
+        "--ll_delta_seq_microbatch",
+        type=int,
+        default=2,
+        help="Microbatch size (number of sequences) when scoring LL deltas to reduce memory",
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")

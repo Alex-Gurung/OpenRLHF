@@ -598,41 +598,54 @@ class BasePPOTrainer(ABC):
 
             # pad per-group batch
             max_len = max(seq.size(0) for seq in seqs)
-            seq_batch = torch.full((len(seqs), max_len), pad_id, dtype=torch.long)
-            attn_batch = torch.zeros((len(seqs), max_len), dtype=torch.long)
-            act_batch = torch.zeros((len(seqs), max_len - 1), dtype=torch.long)
-            for i, (seq, attn, act) in enumerate(zip(seqs, attns, acts)):
-                L = seq.size(0)
-                seq_batch[i, :L] = seq
-                attn_batch[i, :L] = attn
-                act_batch[i, : L - 1] = act[1:]  # shift for logits[:, :-1]
-
-            # forward and aggregate LL
-            refs = self.actor_model_group.async_run_method(
-                method_name="forward",
-                sequences=seq_batch,
-                attention_mask=attn_batch,
-                action_mask=act_batch,
-            )
-            log_probs = ray.get(refs)[0]
-
+            num_seqs = len(seqs)
+            mb = max(1, self.ll_delta_seq_microbatch)
             ll_full = None
-            for i, (_, drop_idx) in enumerate(seq_map):
-                mask = act_batch[i].bool()
-                ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
-                    log_probs[i].unsqueeze(0), mask.unsqueeze(0)
+            for start in range(0, num_seqs, mb):
+                end = min(start + mb, num_seqs)
+                seq_chunk = seqs[start:end]
+                attn_chunk = attns[start:end]
+                act_chunk = acts[start:end]
+                chunk_map = seq_map[start:end]
+
+                chunk_max_len = max(seq.size(0) for seq in seq_chunk)
+                seq_batch = torch.full((len(seq_chunk), chunk_max_len), pad_id, dtype=torch.long)
+                attn_batch = torch.zeros((len(seq_chunk), chunk_max_len), dtype=torch.long)
+                act_batch = torch.zeros((len(seq_chunk), chunk_max_len - 1), dtype=torch.long)
+                for i, (seq, attn, act) in enumerate(zip(seq_chunk, attn_chunk, act_chunk)):
+                    L = seq.size(0)
+                    seq_batch[i, :L] = seq
+                    attn_batch[i, :L] = attn
+                    act_batch[i, : L - 1] = act[1:]  # shift for logits[:, :-1]
+
+                refs = self.actor_model_group.async_run_method(
+                    method_name="forward",
+                    sequences=seq_batch,
+                    attention_mask=attn_batch,
+                    action_mask=act_batch,
                 )
-                if drop_idx is None:
-                    ll_full = ll
-                else:
-                    reward = (ll_full - ll).detach().clone()
-                    sample_idx = trace_indices[g_idx][drop_idx]
-                    sample = rollout_samples[sample_idx]
-                    if sample.info is None or not isinstance(sample.info, dict):
-                        sample.info = {}
-                    sample.rewards = reward.unsqueeze(0)
-                    sample.info["reward"] = reward.unsqueeze(0)
-                    sample.info["loo_reward"] = reward.unsqueeze(0)
+                log_probs = ray.get(refs)[0]
+
+                for i, (_, drop_idx) in enumerate(chunk_map):
+                    mask = act_batch[i].bool()
+                    ll = torch.tensor(0.0, device=log_probs.device) if mask.sum() == 0 else masked_mean(
+                        log_probs[i].unsqueeze(0), mask.unsqueeze(0)
+                    )
+                    if drop_idx is None:
+                        ll_full = ll
+                    else:
+                        reward = (ll_full - ll).detach().clone()
+                        sample_idx = trace_indices[g_idx][drop_idx]
+                        sample = rollout_samples[sample_idx]
+                        if sample.info is None or not isinstance(sample.info, dict):
+                            sample.info = {}
+                        sample.rewards = reward.unsqueeze(0)
+                        sample.info["reward"] = reward.unsqueeze(0)
+                        sample.info["loo_reward"] = reward.unsqueeze(0)
+
+                # free chunk tensors
+                del seq_batch, attn_batch, act_batch, log_probs
+                torch.cuda.empty_cache()
 
 
 @ray.remote
@@ -699,6 +712,7 @@ class PPOTrainer(BasePPOTrainer):
         ]
         self.generator_reward_mode = getattr(self.args, "generator_reward_mode", "ll_delta")
         self.reuse_agg_answers_for_ll = getattr(self.args, "reuse_aggregator_answers_for_ll", True)
+        self.ll_delta_seq_microbatch = getattr(self.args, "ll_delta_seq_microbatch", 2)
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
