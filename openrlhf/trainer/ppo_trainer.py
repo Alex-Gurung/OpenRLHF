@@ -333,7 +333,11 @@ class BasePPOTrainer(ABC):
         for group in groups:
             responses = [t.response_text for t in group.traces]
             agg_prompt = default_aggregation_template(
-                group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                group.prompt,
+                responses,
+                self.aggregator_extract_tags,
+                self.aggregator_tag_name,
+                group.original_prompt,
             )
             agg_prompts.append(agg_prompt)
             agg_labels.append(group.label)
@@ -466,9 +470,11 @@ class BasePPOTrainer(ABC):
             all_labels = []
             prompt_to_datasource = {}  # Dictionary to store mapping between prompts and their data sources
 
-            for datasources, prompts, labels in eval_dataloader:
+            all_original_prompts = []
+            for datasources, prompts, labels, original_prompts in eval_dataloader:
                 all_prompts.extend(prompts)
                 all_labels.extend(labels)
+                all_original_prompts.extend(original_prompts)
                 # Create mapping for each prompt to its corresponding data source
                 for prompt, datasource in zip(prompts, datasources):
                     prompt_to_datasource[prompt] = datasource
@@ -480,6 +486,12 @@ class BasePPOTrainer(ABC):
             samples_list = self.samples_generator.generate_samples(
                 all_prompts, all_labels, remote_reward_model=self.remote_reward_model, **generate_kwargs
             )
+
+            # Store original prompts in sample info for aggregation
+            for i, sample in enumerate(samples_list):
+                if sample.info is None:
+                    sample.info = {}
+                sample.info["original_prompt"] = all_original_prompts[i % len(all_original_prompts)]
 
             # duplicate prompts and labels for each sample
             all_prompts = sum([s.prompts for s in samples_list], [])
@@ -723,7 +735,11 @@ class BasePPOTrainer(ABC):
                 responses = [t.response_text for t in group.traces]
                 agg_prompts.append(
                     default_aggregation_template(
-                        group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                        group.prompt,
+                        responses,
+                        self.aggregator_extract_tags,
+                        self.aggregator_tag_name,
+                        group.original_prompt,
                     )
                 )
                 agg_labels.append(group.label)
@@ -811,7 +827,11 @@ class BasePPOTrainer(ABC):
             responses = [t.response_text for t in group.traces]
             agg_prompts.append(
                 default_aggregation_template(
-                    group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                    group.prompt,
+                    responses,
+                    self.aggregator_extract_tags,
+                    self.aggregator_tag_name,
+                    group.original_prompt,
                 )
             )
             trace_indices.append([t.sample_index for t in group.traces])
@@ -872,7 +892,7 @@ class BasePPOTrainer(ABC):
                 for drop_idx in range(len(responses)):
                     kept = [resp for j, resp in enumerate(responses) if j != drop_idx]
                     drop_prompt = default_aggregation_template(
-                        group.prompt, kept, self.aggregator_extract_tags, self.aggregator_tag_name
+                        group.prompt, kept, self.aggregator_extract_tags, self.aggregator_tag_name, group.original_prompt
                     )
                     seq, attn, act = self._tokenize_prompt_answer(drop_prompt, ans_text)
                     seqs.append(seq)
@@ -1120,11 +1140,16 @@ class PPOTrainer(BasePPOTrainer):
 
             filtered_samples = []
             number_of_samples = 0
-            for _, rand_prompts, labels in self.prompts_dataloader:
+            for _, rand_prompts, labels, original_prompts in self.prompts_dataloader:
                 remote_reward_model = self.remote_reward_model if self.args.dynamic_filtering else None
                 rollout_samples = self.samples_generator.generate_samples(
                     rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
                 )
+                # Store original prompts in sample info for aggregation
+                for i, sample in enumerate(rollout_samples):
+                    if sample.info is None:
+                        sample.info = {}
+                    sample.info["original_prompt"] = original_prompts[i % len(original_prompts)]
                 pbar.update()
 
                 # dynamic filtering
@@ -1172,7 +1197,11 @@ class PPOTrainer(BasePPOTrainer):
                         for group in groups:
                             responses = [t.response_text for t in group.traces]
                             prompt_text = default_aggregation_template(
-                                group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                                group.prompt,
+                                responses,
+                                self.aggregator_extract_tags,
+                                self.aggregator_tag_name,
+                                group.original_prompt,
                             )
                             # Build a single Experience for the aggregator prompt
                             agg_samples = self.aggregator_generator.generate_samples(

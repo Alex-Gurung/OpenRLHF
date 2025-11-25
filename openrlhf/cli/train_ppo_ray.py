@@ -508,7 +508,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval_aggregator_temperature",
         type=float,
-        default=0.1,
+        default=0.7,
         help="Temperature for aggregator generation during evaluation (lower = more deterministic)",
     )
     parser.add_argument(

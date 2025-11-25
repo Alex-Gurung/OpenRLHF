@@ -86,7 +86,7 @@ class GenerateSamplesActor(BasePPOTrainer):
             filtered_samples = []
             number_of_samples = 0
             queue_log_counter = 0  # Counter for log interval
-            for _, rand_prompts, labels in self.prompts_dataloader:
+            for _, rand_prompts, labels, original_prompts in self.prompts_dataloader:
                 # Wait until queue is not full
                 # To support 1-step off-policy training
                 while queue.full():

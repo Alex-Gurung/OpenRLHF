@@ -29,7 +29,8 @@ class AggregationGroup:
     """All traces for a single prompt."""
 
     group_id: int
-    prompt: str
+    prompt: str  # Formatted prompt (with chat template)
+    original_prompt: Optional[str]  # Original user question (without chat template)
     label: Any
     traces: List[Trace] = field(default_factory=list)
 
@@ -87,7 +88,11 @@ def process_responses_for_aggregation(
 
 
 def default_aggregation_template(
-    prompt: str, responses: List[str], extract_tags: bool = False, tag_name: str = "final_reasoning_trace"
+    prompt: str,
+    responses: List[str],
+    extract_tags: bool = False,
+    tag_name: str = "final_reasoning_trace",
+    original_prompt: Optional[str] = None,
 ) -> str:
     """Default aggregator prompt template: enumerate traces under the original question.
 
@@ -95,10 +100,11 @@ def default_aggregation_template(
     providing clear separation and instructions for the aggregator.
 
     Args:
-        prompt: The original question/problem
+        prompt: The formatted prompt (may include chat template)
         responses: List of candidate solution texts
         extract_tags: If True, extract only content within <tag_name> tags from responses
         tag_name: Name of XML-style tag to extract from (default: "final_reasoning_trace")
+        original_prompt: The original user question without chat template formatting (preferred)
 
     Returns:
         Formatted aggregator prompt
@@ -106,10 +112,13 @@ def default_aggregation_template(
     # Process responses to extract tagged content if requested
     processed_responses = process_responses_for_aggregation(responses, extract_tags, tag_name)
 
+    # Use original_prompt if available, otherwise fall back to formatted prompt
+    question_text = original_prompt if original_prompt is not None else prompt
+
     header = (
         f"You are given a question and {len(processed_responses)} candidate solution(s). "
         f"Your task is to analyze these solutions and synthesize the best final answer.\n\n"
-        f"Question:\n{prompt}\n\n"
+        f"Question:\n{question_text}\n\n"
         f"Candidate Solutions:\n"
     )
 
@@ -150,6 +159,8 @@ def build_groups_from_rollouts(
         info = sample.info or {}
         group_id = int(info.get("group_id", sample_index))
         prompt = sample.prompts[0] if sample.prompts else ""
+        # Try to get original prompt without chat template
+        original_prompt = info.get("original_prompt", None)
         label = sample.labels[0] if sample.labels else None
 
         # Prefer vLLM-provided response text; fall back to decoding the response tokens.
@@ -177,7 +188,9 @@ def build_groups_from_rollouts(
         )
 
         if group_id not in groups:
-            groups[group_id] = AggregationGroup(group_id=group_id, prompt=prompt, label=label, traces=[])
+            groups[group_id] = AggregationGroup(
+                group_id=group_id, prompt=prompt, original_prompt=original_prompt, label=label, traces=[]
+            )
         groups[group_id].traces.append(trace)
 
     # Keep deterministic ordering by group_id for readability/debugging
