@@ -332,7 +332,9 @@ class BasePPOTrainer(ABC):
 
         for group in groups:
             responses = [t.response_text for t in group.traces]
-            agg_prompt = default_aggregation_template(group.prompt, responses)
+            agg_prompt = default_aggregation_template(
+                group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+            )
             agg_prompts.append(agg_prompt)
             agg_labels.append(group.label)
 
@@ -719,7 +721,11 @@ class BasePPOTrainer(ABC):
             agg_labels = []
             for group in groups:
                 responses = [t.response_text for t in group.traces]
-                agg_prompts.append(default_aggregation_template(group.prompt, responses))
+                agg_prompts.append(
+                    default_aggregation_template(
+                        group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                    )
+                )
                 agg_labels.append(group.label)
 
             agg_samples = self.aggregator_generator.generate_samples(
@@ -803,7 +809,11 @@ class BasePPOTrainer(ABC):
         trace_indices = []  # per group, maps local trace idx -> sample_index in rollout_samples
         for group in groups:
             responses = [t.response_text for t in group.traces]
-            agg_prompts.append(default_aggregation_template(group.prompt, responses))
+            agg_prompts.append(
+                default_aggregation_template(
+                    group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                )
+            )
             trace_indices.append([t.sample_index for t in group.traces])
 
         # 2) Collect answers per group
@@ -861,7 +871,9 @@ class BasePPOTrainer(ABC):
                 # drop-one variants
                 for drop_idx in range(len(responses)):
                     kept = [resp for j, resp in enumerate(responses) if j != drop_idx]
-                    drop_prompt = default_aggregation_template(group.prompt, kept)
+                    drop_prompt = default_aggregation_template(
+                        group.prompt, kept, self.aggregator_extract_tags, self.aggregator_tag_name
+                    )
                     seq, attn, act = self._tokenize_prompt_answer(drop_prompt, ans_text)
                     seqs.append(seq)
                     attns.append(attn)
@@ -1009,6 +1021,8 @@ class PPOTrainer(BasePPOTrainer):
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
+        self.aggregator_extract_tags = getattr(self.args, "aggregator_extract_tags", False)
+        self.aggregator_tag_name = getattr(self.args, "aggregator_tag_name", "final_reasoning_trace")
         if self.use_two_stage:
             # Defaults: match generator lengths, but allow aggregator prompt to include all traces
             gen_max_new = self.generate_kwargs.get("max_new_tokens", self.args.generate_max_len)
@@ -1157,7 +1171,9 @@ class PPOTrainer(BasePPOTrainer):
                         aggregator_rollouts = []
                         for group in groups:
                             responses = [t.response_text for t in group.traces]
-                            prompt_text = default_aggregation_template(group.prompt, responses)
+                            prompt_text = default_aggregation_template(
+                                group.prompt, responses, self.aggregator_extract_tags, self.aggregator_tag_name
+                            )
                             # Build a single Experience for the aggregator prompt
                             agg_samples = self.aggregator_generator.generate_samples(
                                 [prompt_text],

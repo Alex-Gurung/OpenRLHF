@@ -421,6 +421,18 @@ if __name__ == "__main__":
     # Two-stage aggregation
     parser.add_argument("--use_two_stage", action="store_true", default=False, help="Enable generator LOO aggregation")
     parser.add_argument(
+        "--aggregator_extract_tags",
+        action="store_true",
+        default=False,
+        help="Extract content from XML-style tags in generator responses before aggregation",
+    )
+    parser.add_argument(
+        "--aggregator_tag_name",
+        type=str,
+        default="final_reasoning_trace",
+        help="Name of XML tag to extract from generator responses (e.g., 'final_reasoning_trace')",
+    )
+    parser.add_argument(
         "--aggregator_max_new_tokens", type=int, default=1024, help="Max new tokens for aggregator generation"
     )
     parser.add_argument(

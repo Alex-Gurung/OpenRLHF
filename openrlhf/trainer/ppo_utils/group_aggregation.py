@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -33,12 +34,103 @@ class AggregationGroup:
     traces: List[Trace] = field(default_factory=list)
 
 
-def default_aggregation_template(prompt: str, responses: List[str]) -> str:
-    """Default aggregator prompt template: enumerate traces under the original question."""
+def extract_content_from_tags(text: str, tag_name: str = "final_reasoning_trace") -> str:
+    """Extract content from XML-style tags in the response, using the LAST occurrence.
 
-    header = f"You will be given a question and a set of candidate solutions. Your task is to reason and derive the answer, based on candidate solutions.\nQuestion:\n{prompt}\n\nCandidate solutions:\n"
-    body = "\n".join([f"{idx + 1}. {resp}" for idx, resp in enumerate(responses)])
-    return f"{header}{body}\n\nProvide the final answer:"
+    Args:
+        text: The full response text
+        tag_name: Name of the tag to extract from (default: "final_reasoning_trace")
+
+    Returns:
+        Extracted content if tags are found (last occurrence), otherwise returns the original text
+
+    Examples:
+        >>> extract_content_from_tags("Some text <final_reasoning_trace>first</final_reasoning_trace> more <final_reasoning_trace>second</final_reasoning_trace>")
+        'second'
+        >>> extract_content_from_tags("No tags here")
+        'No tags here'
+    """
+    # Find all matches and use the last one
+    pattern = rf"<{tag_name}>(.*?)</{tag_name}>"
+    matches = list(re.finditer(pattern, text, re.DOTALL))
+
+    if matches:
+        # Return the last match
+        return matches[-1].group(1).strip()
+
+    # If no tags found, return original text
+    return text
+
+
+def process_responses_for_aggregation(
+    responses: List[str], extract_tags: bool = False, tag_name: str = "final_reasoning_trace"
+) -> List[str]:
+    """Process responses before aggregation, optionally extracting tagged content.
+
+    Args:
+        responses: List of response texts
+        extract_tags: Whether to extract content from tags
+        tag_name: Name of the tag to extract from
+
+    Returns:
+        Processed list of responses
+    """
+    if not extract_tags:
+        return responses
+
+    processed = []
+    for resp in responses:
+        extracted = extract_content_from_tags(resp, tag_name)
+        processed.append(extracted)
+
+    return processed
+
+
+def default_aggregation_template(
+    prompt: str, responses: List[str], extract_tags: bool = False, tag_name: str = "final_reasoning_trace"
+) -> str:
+    """Default aggregator prompt template: enumerate traces under the original question.
+
+    Now optimized to work with responses that contain <final_reasoning_trace> sections,
+    providing clear separation and instructions for the aggregator.
+
+    Args:
+        prompt: The original question/problem
+        responses: List of candidate solution texts
+        extract_tags: If True, extract only content within <tag_name> tags from responses
+        tag_name: Name of XML-style tag to extract from (default: "final_reasoning_trace")
+
+    Returns:
+        Formatted aggregator prompt
+    """
+    # Process responses to extract tagged content if requested
+    processed_responses = process_responses_for_aggregation(responses, extract_tags, tag_name)
+
+    header = (
+        f"You are given a question and {len(processed_responses)} candidate solution(s). "
+        f"Your task is to analyze these solutions and synthesize the best final answer.\n\n"
+        f"Question:\n{prompt}\n\n"
+        f"Candidate Solutions:\n"
+    )
+
+    # Create clearly separated candidate solutions with visual delimiters
+    solution_blocks = []
+    for idx, resp in enumerate(processed_responses, 1):
+        solution_blocks.append(
+            f"--- Candidate {idx} ---\n{resp}\n--- End Candidate {idx} ---"
+        )
+    body = "\n\n".join(solution_blocks)
+
+    footer = (
+        f"\n\nInstructions:\n"
+        f"1. Review each candidate solution carefully\n"
+        f"2. Identify correct reasoning and flag any errors\n"
+        f"3. Synthesize the best elements from all candidates\n"
+        f"4. Provide your final reasoning and answer\n\n"
+        f"Your response:"
+    )
+
+    return f"{header}{body}{footer}"
 
 
 def build_groups_from_rollouts(
