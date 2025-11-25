@@ -91,6 +91,7 @@ class BasePPOTrainer(ABC):
         self._wandb = None
         self._tensorboard = None
         self.generated_samples_table = None
+        self.aggregator_samples_table = None
         if self.strategy.args.use_wandb:
             import wandb
 
@@ -111,6 +112,7 @@ class BasePPOTrainer(ABC):
             wandb.define_metric("eval/epoch")
             wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
             self.generated_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
+            self.aggregator_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None:
@@ -184,6 +186,14 @@ class BasePPOTrainer(ABC):
                     new_table.add_data(global_step, *logs_dict.pop("generated_samples"))
                     self.generated_samples_table = new_table
                     self._wandb.log({"train/generated_samples": new_table})
+                # Add aggregator samples to wandb using Table
+                if "aggregator_samples" in logs_dict:
+                    new_table = self._wandb.Table(
+                        columns=self.aggregator_samples_table.columns, data=self.aggregator_samples_table.data
+                    )
+                    new_table.add_data(global_step, *logs_dict.pop("aggregator_samples"))
+                    self.aggregator_samples_table = new_table
+                    self._wandb.log({"train/aggregator_samples": new_table})
                 logs = {
                     "train/%s" % k: v
                     for k, v in {
@@ -200,6 +210,11 @@ class BasePPOTrainer(ABC):
                         text, reward = v
                         formatted_text = f"Sample:\n{text}\n\nReward: {reward:.4f}"
                         self._tensorboard.add_text("train/generated_samples", formatted_text, global_step)
+                    elif k == "aggregator_samples":
+                        # Record aggregator samples in TensorBoard using simple text format
+                        text, reward = v
+                        formatted_text = f"Aggregator Sample:\n{text}\n\nReward: {reward:.4f}"
+                        self._tensorboard.add_text("train/aggregator_samples", formatted_text, global_step)
                     else:
                         self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
@@ -281,6 +296,13 @@ class BasePPOTrainer(ABC):
             all_rewards = torch.tensor(metrics["rewards"])
             logs[f"eval_{datasource}_gen_mean"] = all_rewards.mean().item()
             logs[f"eval_{datasource}_gen_std"] = all_rewards.std().item() if len(all_rewards) > 1 else 0.0
+
+        # Add example generator sample (first sample from first datasource for visualization)
+        if len(samples_list) > 0:
+            logs["_generator_sample_example"] = {
+                "text": samples_list[0].prompts[0] if samples_list[0].prompts else "",
+                "reward": samples_list[0].rewards.item() if samples_list[0].rewards is not None else 0.0,
+            }
 
         return logs
 
