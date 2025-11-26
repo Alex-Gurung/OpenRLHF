@@ -23,6 +23,27 @@ Goal: jointly train (1) a generator that emits diverse, useful traces and (2) an
 - `trainer/ppo_utils/group_aggregation.py`: grouping, prompt templating, LOO reward computation, and reward attachment.
 - `trainer/ppo_utils/experience_maker.py`: emits `group_id`/`response_text` from vLLM rollouts to support grouping.
 
+### Important implementation details
+
+#### Group ID management with dynamic filtering
+When `--enable_dynamic_filtering` is used, multiple sampling iterations may occur to fill the batch quota. To prevent group_id collisions:
+- A persistent `next_group_id` counter tracks the next available group_id across dataloader iterations
+- Each batch gets unique group_ids: iteration 1 → [0-35], iteration 2 → [36-71], etc.
+- This ensures samples from different prompts never merge into the same aggregation group, even when filtering causes resampling
+
+#### Chat template application
+Aggregator prompts are automatically wrapped with the tokenizer's chat template (if available) via `default_aggregation_template`:
+- Generator prompts receive chat templates during dataset preprocessing
+- Aggregator prompts (question + candidate solutions + instructions) are wrapped as a user message
+- Falls back to raw prompt if `tokenizer.chat_template` is not set (for base models)
+- All parameters (`extract_tags`, `tag_name`, `original_prompt`) are passed through consistently to `LeaveOneOutAggregator` and template functions
+
+#### Sample ordering and metadata assignment
+Samples are generated in prompt-major order: `[p0_s0, p0_s1, p1_s0, p1_s1, ...]` where `p0_s0` means prompt 0, sample 0.
+- `original_prompt` assignment uses `i // n_samples_per_prompt` to map sample index to prompt index
+- Ensures all samples within a `group_id` have consistent metadata (same prompt, original_prompt, and label)
+- Critical for correct aggregation: each group represents responses to a single question
+
 ### Notes and limitations
 - Reward sources: local reward model (`--reward_pretrain`) or remote reward model (`--remote_rm_url`). Custom Python reward functions are supported only if you instantiate `LeaveOneOutAggregator` yourself and pass your own `reward_fn` callable.
 - `n_samples_per_prompt` should be >1 to get meaningful LOO terms.

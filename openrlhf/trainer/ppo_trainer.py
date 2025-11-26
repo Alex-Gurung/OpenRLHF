@@ -335,6 +335,7 @@ class BasePPOTrainer(ABC):
             agg_prompt = default_aggregation_template(
                 group.prompt,
                 responses,
+                self.tokenizer,
                 self.aggregator_extract_tags,
                 self.aggregator_tag_name,
                 group.original_prompt,
@@ -737,6 +738,7 @@ class BasePPOTrainer(ABC):
                     default_aggregation_template(
                         group.prompt,
                         responses,
+                        self.tokenizer,
                         self.aggregator_extract_tags,
                         self.aggregator_tag_name,
                         group.original_prompt,
@@ -829,6 +831,7 @@ class BasePPOTrainer(ABC):
                 default_aggregation_template(
                     group.prompt,
                     responses,
+                    self.tokenizer,
                     self.aggregator_extract_tags,
                     self.aggregator_tag_name,
                     group.original_prompt,
@@ -892,7 +895,7 @@ class BasePPOTrainer(ABC):
                 for drop_idx in range(len(responses)):
                     kept = [resp for j, resp in enumerate(responses) if j != drop_idx]
                     drop_prompt = default_aggregation_template(
-                        group.prompt, kept, self.aggregator_extract_tags, self.aggregator_tag_name, group.original_prompt
+                        group.prompt, kept, self.tokenizer, self.aggregator_extract_tags, self.aggregator_tag_name, group.original_prompt
                     )
                     seq, attn, act = self._tokenize_prompt_answer(drop_prompt, ans_text)
                     seqs.append(seq)
@@ -1081,8 +1084,11 @@ class PPOTrainer(BasePPOTrainer):
             self.leave_one_out = LeaveOneOutAggregator(
                 generate_fn=self._aggregate_generate_fn,
                 reward_fn=self._aggregate_reward_fn,
+                tokenizer=self.tokenizer,
                 template_fn=default_aggregation_template,
                 include_full_group=True,
+                extract_tags=self.aggregator_extract_tags,
+                tag_name=self.aggregator_tag_name,
             )
             # Per-call context for aggregator full-group caching
             self._agg_context = None
@@ -1140,16 +1146,24 @@ class PPOTrainer(BasePPOTrainer):
 
             filtered_samples = []
             number_of_samples = 0
+            next_group_id = 0  # Track next available group_id to prevent collisions across sampling iterations
             for _, rand_prompts, labels, original_prompts in self.prompts_dataloader:
                 remote_reward_model = self.remote_reward_model if self.args.dynamic_filtering else None
+
+                # Assign unique group_ids to prevent collisions during dynamic filtering resampling
+                group_ids = list(range(next_group_id, next_group_id + len(rand_prompts)))
+                next_group_id += len(rand_prompts)
+
                 rollout_samples = self.samples_generator.generate_samples(
-                    rand_prompts, labels, remote_reward_model=remote_reward_model, **self.generate_kwargs
+                    rand_prompts, labels, remote_reward_model=remote_reward_model,
+                    group_ids=group_ids, **self.generate_kwargs
                 )
                 # Store original prompts in sample info for aggregation
                 for i, sample in enumerate(rollout_samples):
                     if sample.info is None:
                         sample.info = {}
-                    sample.info["original_prompt"] = original_prompts[i % len(original_prompts)]
+                    # rollout_samples are ordered: [p0_s0, p0_s1, ..., p1_s0, p1_s1, ...]
+                    sample.info["original_prompt"] = original_prompts[i // self.args.n_samples_per_prompt]
                 pbar.update()
 
                 # dynamic filtering
@@ -1199,6 +1213,7 @@ class PPOTrainer(BasePPOTrainer):
                             prompt_text = default_aggregation_template(
                                 group.prompt,
                                 responses,
+                                self.tokenizer,
                                 self.aggregator_extract_tags,
                                 self.aggregator_tag_name,
                                 group.original_prompt,

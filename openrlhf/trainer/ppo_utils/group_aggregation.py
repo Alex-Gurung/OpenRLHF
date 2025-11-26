@@ -90,14 +90,15 @@ def process_responses_for_aggregation(
 def default_aggregation_template(
     prompt: str,
     responses: List[str],
+    tokenizer,
     extract_tags: bool = False,
     tag_name: str = "final_reasoning_trace",
     original_prompt: Optional[str] = None,
 ) -> str:
-    """Default aggregator prompt template: enumerate traces under the original question.
+    """Default aggregator prompt template with chat template applied.
 
-    Now optimized to work with responses that contain <final_reasoning_trace> sections,
-    providing clear separation and instructions for the aggregator.
+    Builds an aggregation task (question + candidate solutions + instructions) and
+    wraps it as a user message with the chat template.
 
     Args:
         prompt: The formatted prompt (may include chat template)
@@ -105,14 +106,12 @@ def default_aggregation_template(
         extract_tags: If True, extract only content within <tag_name> tags from responses
         tag_name: Name of XML-style tag to extract from (default: "final_reasoning_trace")
         original_prompt: The original user question without chat template formatting (preferred)
+        tokenizer: Tokenizer for applying chat template
 
     Returns:
-        Formatted aggregator prompt
+        Formatted aggregator prompt with chat template applied
     """
-    # Process responses to extract tagged content if requested
     processed_responses = process_responses_for_aggregation(responses, extract_tags, tag_name)
-
-    # Use original_prompt if available, otherwise fall back to formatted prompt
     question_text = original_prompt if original_prompt is not None else prompt
 
     header = (
@@ -122,7 +121,6 @@ def default_aggregation_template(
         f"Candidate Solutions:\n"
     )
 
-    # Create clearly separated candidate solutions with visual delimiters
     solution_blocks = []
     for idx, resp in enumerate(processed_responses, 1):
         solution_blocks.append(
@@ -132,14 +130,19 @@ def default_aggregation_template(
 
     footer = (
         f"\n\nInstructions:\n"
-        f"1. Review each candidate solution carefully\n"
-        f"2. Identify correct reasoning and flag any errors\n"
-        f"3. Synthesize the best elements from all candidates\n"
-        f"4. Provide your final reasoning and answer\n\n"
+        f"1. Synthesize the best elements from all candidates\n"
+        f"2. Provide your final reasoning and answer, in the requested format.\n\n"
         f"Your response:"
     )
 
-    return f"{header}{body}{footer}"
+    aggregation_content = f"{header}{body}{footer}"
+
+    # Apply chat template if available: treat aggregation task as a user message
+    if tokenizer.chat_template is not None:
+        chat = [{"role": "user", "content": aggregation_content}]
+        return tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+
+    return aggregation_content
 
 
 def build_groups_from_rollouts(
@@ -219,20 +222,29 @@ class LeaveOneOutAggregator:
         self,
         generate_fn: Callable[[List[str], List[Any]], List[str]],
         reward_fn: Callable[[List[str], List[str], List[Any]], torch.Tensor],
+        tokenizer,
         template_fn: Callable[[str, List[str]], str] = default_aggregation_template,
         include_full_group: bool = True,
+        extract_tags: bool = False,
+        tag_name: str = "final_reasoning_trace",
     ) -> None:
         """
         Args:
             generate_fn: Callable that maps a list of aggregator prompts -> list of aggregator answers.
             reward_fn: Callable that maps (prompts, answers, label) -> tensor of rewards (len == len(prompts)).
+            tokenizer: Tokenizer for applying chat template to aggregation prompts.
             template_fn: How to serialize (prompt, traces) into an aggregator prompt.
             include_full_group: Whether to include a full-group prompt for aggregator PPO reward/logging.
+            extract_tags: Whether to extract content from XML tags in responses.
+            tag_name: Name of the XML tag to extract from.
         """
         self.generate_fn = generate_fn
         self.reward_fn = reward_fn
+        self.tokenizer = tokenizer
         self.template_fn = template_fn
         self.include_full_group = include_full_group
+        self.extract_tags = extract_tags
+        self.tag_name = tag_name
 
     def _build_prompts(
         self, group: AggregationGroup
@@ -244,13 +256,23 @@ class LeaveOneOutAggregator:
 
         responses = [t.response_text for t in group.traces]
         if self.include_full_group:
-            prompts.append(self.template_fn(group.prompt, responses))
+            prompts.append(
+                self.template_fn(
+                    group.prompt, responses, self.tokenizer,
+                    self.extract_tags, self.tag_name, group.original_prompt
+                )
+            )
             dropped_trace.append(None)
             labels.append(group.label)
 
         for idx in range(len(responses)):
             kept = [resp for j, resp in enumerate(responses) if j != idx]
-            prompts.append(self.template_fn(group.prompt, kept))
+            prompts.append(
+                self.template_fn(
+                    group.prompt, kept, self.tokenizer,
+                    self.extract_tags, self.tag_name, group.original_prompt
+                )
+            )
             dropped_trace.append(idx)
             labels.append(group.label)
         return prompts, dropped_trace, labels
