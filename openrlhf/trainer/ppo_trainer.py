@@ -726,10 +726,14 @@ class BasePPOTrainer(ABC):
             self._agg_context = None
             return rollout_samples, []
 
-        # Aggregator rollouts: always build if aggregator is being trained
+        # Aggregator rollouts: build when training the aggregator OR when we need answers/rewards for LL-delta
         aggregator_rollouts = []
         agg_answers = None
-        if self.train_aggregator:
+        need_ll_delta = self.train_generator and self.generator_reward_mode == "ll_delta"
+        need_agg_samples = self.train_aggregator or (
+            need_ll_delta and (self.reuse_agg_answers_for_ll or self.ll_delta_weight_by_answer_reward)
+        )
+        if need_agg_samples:
             agg_prompts = []
             agg_labels = []
             for group in groups:
@@ -746,10 +750,12 @@ class BasePPOTrainer(ABC):
                 )
                 agg_labels.append(group.label)
 
+            # If we're only using aggregator answers for ll_delta weighting/reuse, take 1 sample per prompt to save work.
+            agg_samples_per_prompt = self.args.n_samples_per_prompt if self.train_aggregator else 1
             agg_samples = self.aggregator_generator.generate_samples(
                 agg_prompts,
                 agg_labels,
-                n_samples_per_prompt=self.args.n_samples_per_prompt,
+                n_samples_per_prompt=agg_samples_per_prompt,
                 max_new_tokens=self.aggregator_max_new_tokens,
                 temperature=self.aggregator_temperature,
                 top_p=self.aggregator_top_p,
@@ -759,7 +765,7 @@ class BasePPOTrainer(ABC):
             # Cache first sample per group as target answer (for LL-delta reuse)
             if self.reuse_agg_answers_for_ll:
                 agg_answers = {}
-                per_group = self.args.n_samples_per_prompt
+                per_group = agg_samples_per_prompt
                 for i, prompt in enumerate(agg_prompts):
                     sample = agg_samples[i * per_group]
                     if sample.info and "response_text" in sample.info:
@@ -768,6 +774,25 @@ class BasePPOTrainer(ABC):
                         ans_tokens = sample.sequences[0][sample.action_mask[0].bool()]
                         agg_answers[i] = self.tokenizer.decode(ans_tokens, skip_special_tokens=True)
 
+        # Score aggregator samples if needed for ll_delta weighting
+        if need_ll_delta and self.ll_delta_weight_by_answer_reward and aggregator_rollouts:
+            # Compute task rewards for aggregator samples before using them to weight generator rewards
+            agg_experiences = self.experience_maker.make_experience(
+                self.experience_maker.split_rollout_samples(aggregator_rollouts)
+            )
+            # Attach rewards back to the original aggregator rollouts so ll_delta weighting can read them
+            for exp in agg_experiences:
+                if exp.index is None:
+                    continue
+                for local_idx, sample_idx in enumerate(exp.index):
+                    reward_tensor = exp.rewards[local_idx].detach().clone()
+                    reward_tensor = reward_tensor.reshape(1)  # ensure shape (1,)
+                    sample = aggregator_rollouts[sample_idx]
+                    if sample.info is None or not isinstance(sample.info, dict):
+                        sample.info = {}
+                    sample.rewards = reward_tensor
+                    sample.info["reward"] = reward_tensor
+
         # Generator rewards
         if self.train_generator:
             if self.generator_reward_mode == "loo_generate":
@@ -775,7 +800,7 @@ class BasePPOTrainer(ABC):
                 agg_results = loo(groups)
                 apply_aggregation_results_to_rollouts(rollout_samples, agg_results)
             elif self.generator_reward_mode == "ll_delta":
-                self._apply_ll_delta_rewards(groups, rollout_samples, agg_answers)
+                self._apply_ll_delta_rewards(groups, rollout_samples, agg_answers, aggregator_rollouts)
             else:
                 raise ValueError(f"Unknown generator_reward_mode {self.generator_reward_mode}")
 
@@ -841,11 +866,16 @@ class BasePPOTrainer(ABC):
 
         # 2) Collect answers per group
         agg_answers_per_group = [[] for _ in groups]
+        # Derive how many aggregator samples we actually have per group (may differ when aggregator isn't trained)
+        agg_samples_per_group = None
         if cached_samples:
-            per_group = self.args.n_samples_per_prompt
+            agg_samples_per_group = max(1, len(cached_samples) // max(1, len(groups)))
             for g_idx in range(len(groups)):
-                for s_idx in range(per_group):
-                    sample = cached_samples[g_idx * per_group + s_idx]
+                for s_idx in range(agg_samples_per_group):
+                    idx = g_idx * agg_samples_per_group + s_idx
+                    if idx >= len(cached_samples):
+                        break
+                    sample = cached_samples[idx]
                     if sample.info and "response_text" in sample.info:
                         agg_answers_per_group[g_idx].append(sample.info["response_text"][0])
                     else:
@@ -948,10 +978,11 @@ class BasePPOTrainer(ABC):
                             if self.ll_delta_weight_by_answer_reward:
                                 # if answer reward is cached on the sample, use it; else weight=1
                                 reward_val = 1.0
-                                if cached_samples:
-                                    sample_idx = g_idx * self.args.n_samples_per_prompt + ans_idx
+                                if cached_samples and agg_samples_per_group is not None:
+                                    sample_idx = g_idx * agg_samples_per_group + ans_idx
                                     if (
-                                        cached_samples[sample_idx].info is not None
+                                        sample_idx < len(cached_samples)
+                                        and cached_samples[sample_idx].info is not None
                                         and cached_samples[sample_idx].info.get("reward") is not None
                                     ):
                                         reward_val = cached_samples[sample_idx].info["reward"][0].item()

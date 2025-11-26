@@ -23,6 +23,31 @@ Goal: jointly train (1) a generator that emits diverse, useful traces and (2) an
 - `trainer/ppo_utils/group_aggregation.py`: grouping, prompt templating, LOO reward computation, and reward attachment.
 - `trainer/ppo_utils/experience_maker.py`: emits `group_id`/`response_text` from vLLM rollouts to support grouping.
 
+### LL-delta weighting (aggregator reward)
+- LL-delta generator rewards can be weighted by the aggregator answer’s task reward (`contribution * aggregator_reward`).
+- Even in generator-only mode, one aggregator answer per prompt is generated/scored when weighting is enabled so the weighting term has real rewards.
+
+### How LOO rewards scale candidate contributions
+
+The Leave-One-Out (LOO) mechanism automatically scales each candidate solution's contribution based on how it affects the aggregator's performance. For each candidate i in a group of K candidates:
+
+1. **Measure performance without candidate i**: Run aggregator on the K-1 other candidates → reward `r_-i`
+2. **Estimate performance with candidate i**: Average the rewards when other candidates are dropped → `reward_with_i = mean(r_-j for j≠i)`
+3. **Compute marginal contribution**: `generator_reward[i] = reward_with_i - r_-i`
+
+**Interpretation:**
+- **Positive reward**: Candidate helps the aggregator (when included, aggregator does better than when excluded)
+- **Negative reward**: Candidate hurts the aggregator (misleading/incorrect solution that reduces aggregator performance)
+- **Magnitude**: Larger absolute value means stronger positive or negative contribution
+
+**Example:** With K=4 candidates and aggregator rewards r_-0=0.6, r_-1=0.7, r_-2=0.5, r_-3=0.8:
+- Candidate 0: reward = mean(0.7, 0.5, 0.8) - 0.6 = 0.067 (slightly helpful)
+- Candidate 2: reward = mean(0.6, 0.7, 0.8) - 0.5 = 0.200 (very helpful)
+- Candidate 1: reward = mean(0.6, 0.5, 0.8) - 0.7 = -0.067 (slightly harmful)
+- Candidate 3: reward = mean(0.6, 0.7, 0.5) - 0.8 = -0.200 (very harmful)
+
+This reward signal trains the generator to produce candidates that improve aggregation quality while avoiding misleading or redundant solutions.
+
 ### Important implementation details
 
 #### Group ID management with dynamic filtering
