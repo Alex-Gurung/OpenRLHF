@@ -975,6 +975,8 @@ class BasePPOTrainer(ABC):
                             contrib = ll_full - ll
                             if self.ll_delta_normalize:
                                 contrib = contrib / (ll_full.abs() + 1e-6)
+                            # Scale up rewards to make them comparable to aggregator rewards (0/1)
+                            contrib = contrib * self.ll_delta_reward_scale
                             if self.ll_delta_weight_by_answer_reward:
                                 # if answer reward is cached on the sample, use it; else weight=1
                                 reward_val = 1.0
@@ -1072,6 +1074,7 @@ class PPOTrainer(BasePPOTrainer):
         self.ll_delta_seq_microbatch = getattr(self.args, "ll_delta_seq_microbatch", 2)
         self.ll_delta_weight_by_answer_reward = getattr(self.args, "ll_delta_weight_by_answer_reward", True)
         self.ll_delta_normalize = getattr(self.args, "ll_delta_normalize", False)
+        self.ll_delta_reward_scale = getattr(self.args, "ll_delta_reward_scale", 10.0)
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
@@ -1234,6 +1237,11 @@ class PPOTrainer(BasePPOTrainer):
                 aggregator_rollouts = []
                 if self.use_two_stage:
                     if self.train_generator:
+                        # Save original task correctness before ll_delta overwrites it
+                        gen_task_correctness = None
+                        if self.generator_reward_mode == "ll_delta" and rollout_samples:
+                            gen_task_correctness = torch.tensor([s.scores[0].item() for s in rollout_samples if s.scores is not None])
+
                         rollout_samples, aggregator_rollouts = self._run_two_stage_rewards(rollout_samples)
                     else:
                         # Aggregator-only: skip LOO, build aggregator prompts directly from rollouts.
@@ -1324,6 +1332,12 @@ class PPOTrainer(BasePPOTrainer):
                     status["gen_reward/mean"] = gen_rewards.mean().item()
                     status["gen_reward/std"] = gen_rewards.std(unbiased=False).item()
                     status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+
+                    # Log original task correctness before ll_delta overwrote it
+                    if self.use_two_stage and self.train_generator and self.generator_reward_mode == "ll_delta":
+                        if 'gen_task_correctness' in locals() and gen_task_correctness is not None:
+                            status["gen_task_correctness/mean"] = gen_task_correctness.mean().item()
+                            status["gen_task_correctness/std"] = gen_task_correctness.std(unbiased=False).item() if len(gen_task_correctness) > 1 else 0.0
 
                 if self.train_aggregator and aggregator_experiences:
                     agg_text = self.tokenizer.batch_decode(
