@@ -483,6 +483,12 @@ if __name__ == "__main__":
         default=False,
         help="Normalize LL deltas by |ll_full| to reduce scale sensitivity",
     )
+    parser.add_argument(
+        "--ll_delta_reward_scale",
+        type=float,
+        default=10.0,
+        help="Scale factor for LL delta rewards to make them comparable to aggregator rewards (default: 10.0)",
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
