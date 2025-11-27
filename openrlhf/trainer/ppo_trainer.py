@@ -1334,6 +1334,8 @@ class PPOTrainer(BasePPOTrainer):
                     status["agg_reward/std"] = agg_rewards.std(unbiased=False).item()
                     status["aggregator_samples"] = [agg_text, aggregator_experiences[0].info["reward"][0]]
 
+                # Add episode to status for logging
+                status["episode"] = episode
                 logger.info(f"✨ Global step {steps}: {status}")
 
                 # logs/checkpoints
