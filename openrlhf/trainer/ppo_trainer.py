@@ -1182,7 +1182,9 @@ class PPOTrainer(BasePPOTrainer):
             number_of_samples = 0
             next_group_id = 0  # Track next available group_id to prevent collisions across sampling iterations
             for _, rand_prompts, labels, original_prompts in self.prompts_dataloader:
-                remote_reward_model = self.remote_reward_model if self.args.dynamic_filtering else None
+                # Score generator samples for dynamic filtering or for logging/evaluation
+                score_generator_samples = getattr(self.args, "score_generator_samples", False)
+                remote_reward_model = self.remote_reward_model if (self.args.dynamic_filtering or score_generator_samples) else None
 
                 # Assign unique group_ids to prevent collisions during dynamic filtering resampling
                 group_ids = list(range(next_group_id, next_group_id + len(rand_prompts)))
@@ -1235,11 +1237,11 @@ class PPOTrainer(BasePPOTrainer):
 
                 # Two-stage aggregation: compute LOO generator rewards unless aggregator-only
                 aggregator_rollouts = []
+                gen_task_correctness = None  # Initialize outside to be accessible later
                 if self.use_two_stage:
                     if self.train_generator:
-                        # Save original task correctness before ll_delta overwrites it
-                        gen_task_correctness = None
-                        if self.generator_reward_mode == "ll_delta" and rollout_samples:
+                        # Save original task correctness before ll_delta overwrites it (requires scoring)
+                        if self.generator_reward_mode == "ll_delta" and rollout_samples and score_generator_samples:
                             gen_task_correctness = torch.tensor([s.scores[0].item() for s in rollout_samples if s.scores is not None])
 
                         rollout_samples, aggregator_rollouts = self._run_two_stage_rewards(rollout_samples)
@@ -1334,10 +1336,9 @@ class PPOTrainer(BasePPOTrainer):
                     status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
 
                     # Log original task correctness before ll_delta overwrote it
-                    if self.use_two_stage and self.train_generator and self.generator_reward_mode == "ll_delta":
-                        if 'gen_task_correctness' in locals() and gen_task_correctness is not None:
-                            status["gen_task_correctness/mean"] = gen_task_correctness.mean().item()
-                            status["gen_task_correctness/std"] = gen_task_correctness.std(unbiased=False).item() if len(gen_task_correctness) > 1 else 0.0
+                    if gen_task_correctness is not None and len(gen_task_correctness) > 0:
+                        status["gen_task_correctness/mean"] = gen_task_correctness.mean().item()
+                        status["gen_task_correctness/std"] = gen_task_correctness.std(unbiased=False).item() if len(gen_task_correctness) > 1 else 0.0
 
                 if self.train_aggregator and aggregator_experiences:
                     agg_text = self.tokenizer.batch_decode(

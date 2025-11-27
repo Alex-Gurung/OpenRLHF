@@ -489,6 +489,12 @@ if __name__ == "__main__":
         default=10.0,
         help="Scale factor for LL delta rewards to make them comparable to aggregator rewards (default: 10.0)",
     )
+    parser.add_argument(
+        "--score_generator_samples",
+        action="store_true",
+        default=False,
+        help="Score generator samples with reward model for logging task correctness (default: False)",
+    )
 
     # Custom dataset
     parser.add_argument("--prompt_data", type=str, default=None, help="HF dataset name or path")
