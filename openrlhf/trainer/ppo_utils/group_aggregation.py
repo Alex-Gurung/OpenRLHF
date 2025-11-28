@@ -114,25 +114,25 @@ def default_aggregation_template(
     processed_responses = process_responses_for_aggregation(responses, extract_tags, tag_name)
     question_text = original_prompt if original_prompt is not None else prompt
 
+
     header = (
-        f"You are given a question and {len(processed_responses)} candidate solution(s). "
-        f"Your task is to analyze these solutions and synthesize the best final answer.\n\n"
+        f"You are a teacher evaluating student answers on a question you didn't write. You are given a question and {len(processed_responses)} answer(s) given from students. "
+        f"Your task is to analyze these answers and figure out true correct answer based on the quality of their reasoning. The students may or may not be correct, but their reasoning may be useful in determining the correct answer.\n\n"
         f"Question:\n{question_text}\n\n"
-        f"Candidate Solutions:\n"
+        f"Student Solutions:\n"
     )
 
     solution_blocks = []
     for idx, resp in enumerate(processed_responses, 1):
         solution_blocks.append(
-            f"--- Candidate {idx} ---\n{resp}\n--- End Candidate {idx} ---"
+            f"--- Student {idx} ---\n{resp}\n--- End Student {idx} ---"
         )
     body = "\n\n".join(solution_blocks)
 
     footer = (
         f"\n\nInstructions:\n"
-        f"1. Synthesize the best elements from all candidates\n"
-        f"2. Provide your final reasoning and answer, in the requested format.\n\n"
-        f"Your response:"
+        f"1. Analyse the students' answers (each one may be incorrect), compare them against each other, and reason about the correct answer.\n"
+        f"2. Provide your answer in the requested format."
     )
 
     aggregation_content = f"{header}{body}{footer}"
