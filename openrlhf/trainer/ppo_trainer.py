@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import time
 from abc import ABC
 from datetime import timedelta
@@ -73,11 +72,10 @@ class BasePPOTrainer(ABC):
 
         self.freezing_actor_steps = getattr(self.args, "freezing_actor_steps", -1)
         default_sample_cap = max(2, min(20, self.args.rollout_batch_size * self.args.n_samples_per_prompt))
-        self.sample_log_limit = getattr(self.args, "log_samples_per_step", default_sample_cap)
+        sample_cap_arg = getattr(self.args, "log_samples_per_step", default_sample_cap)
+        self.sample_log_limit = default_sample_cap if sample_cap_arg is None else sample_cap_arg
         self.sample_log_char_limit = getattr(self.args, "log_sample_char_limit", 512)
         self.diversity_extract_tags = getattr(self.args, "diversity_extract_tags", False)
-        self.diversity_max_traces = getattr(self.args, "diversity_max_traces", 200)
-        self.diversity_max_pairwise = getattr(self.args, "diversity_max_pairwise", 200)
         self.sample_artifact_dir = getattr(
             self.args, "sample_artifact_dir", os.path.join(self.args.ckpt_path, "sample_logs")
         )
@@ -670,8 +668,6 @@ class BasePPOTrainer(ABC):
         if not groups:
             return {}
 
-        max_traces = max(0, self.diversity_max_traces)
-        max_pairwise = max(0, self.diversity_max_pairwise)
         group_stats = []
 
         for group in groups:
@@ -683,9 +679,6 @@ class BasePPOTrainer(ABC):
             tokenized = [resp.split() for resp in processed if resp]
             if not tokenized:
                 continue
-
-            if max_traces and len(tokenized) > max_traces:
-                tokenized = tokenized[:max_traces]
 
             all_tokens = []
             all_bigrams = []
@@ -700,20 +693,7 @@ class BasePPOTrainer(ABC):
             n = len(tokenized)
             pair_count = n * (n - 1) // 2
             if n > 1:
-                if max_pairwise and pair_count > max_pairwise:
-                    indices = []
-                    # sample pairs without replacement
-                    while len(indices) < max_pairwise:
-                        i = random.randrange(0, n)
-                        j = random.randrange(0, n)
-                        if i == j:
-                            continue
-                        a, b = (i, j) if i < j else (j, i)
-                        if (a, b) in indices:
-                            continue
-                        indices.append((a, b))
-                else:
-                    indices = [(i, j) for i in range(n) for j in range(i + 1, n)]
+                indices = [(i, j) for i in range(n) for j in range(i + 1, n)]
 
                 for i, j in indices:
                     set_i = set(tokenized[i])
@@ -747,49 +727,6 @@ class BasePPOTrainer(ABC):
                 metrics[f"{prefix}/{key}"] = sum(vals) / len(vals)
 
         return metrics
-        max_traces = max(0, self.diversity_max_traces)
-        max_pairwise = max(0, self.diversity_max_pairwise)
-        collected_traces = []
-
-        for group in groups:
-            responses = [t.response_text for t in group.traces if t.response_text is not None]
-            if not responses:
-                continue
-
-            processed = process_responses_for_aggregation(responses, extract_tags, tag_name)
-            tokenized = [resp.split() for resp in processed if resp]
-            if not tokenized:
-                continue
-
-            for toks in tokenized:
-                if max_traces and sample_count >= max_traces:
-                    break
-                collected_traces.append(toks)
-                sample_count += 1
-                token_lengths.append(len(toks))
-
-                all_tokens.extend(toks)
-                all_bigrams.extend(list(zip(toks, toks[1:])))
-
-            if max_traces and sample_count >= max_traces:
-                break
-
-        if collected_traces:
-            pairwise_candidates = collected_traces
-            if max_pairwise and len(collected_traces) > max_pairwise:
-                pairwise_candidates = random.sample(collected_traces, max_pairwise)
-
-            if len(pairwise_candidates) > 1:
-                for i in range(len(pairwise_candidates)):
-                    set_i = set(pairwise_candidates[i])
-                    for j in range(i + 1, len(pairwise_candidates)):
-                        set_j = set(pairwise_candidates[j])
-                        union = set_i | set_j
-                        if not union:
-                            continue
-                        pairwise_jaccard.append(len(set_i & set_j) / len(union))
-
-        metrics = {}
         if sample_count:
             metrics[f"{prefix}/count"] = sample_count
         if token_lengths:

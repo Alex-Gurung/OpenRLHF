@@ -258,6 +258,24 @@ if __name__ == "__main__":
     parser.add_argument("--save_steps", type=int, default=-1)
     parser.add_argument("--logging_steps", type=int, default=1)
     parser.add_argument("--ckpt_path", type=str, default="./ckpt/checkpoints_ppo_ray")
+    parser.add_argument(
+        "--log_samples_per_step",
+        type=int,
+        default=None,
+        help="Number of samples to show in preview logs (wandb/tensorboard). Full batches still go to artifacts; defaults to min(20, rollout_batch_size*n_samples_per_prompt).",
+    )
+    parser.add_argument(
+        "--log_sample_char_limit",
+        type=int,
+        default=1024,
+        help="Max characters per sample in preview logs. Full artifacts are untruncated.",
+    )
+    parser.add_argument(
+        "--sample_artifact_dir",
+        type=str,
+        default=None,
+        help="Directory to write sample JSONL files before uploading to wandb artifacts (default: <ckpt_path>/sample_logs).",
+    )
     parser.add_argument("--save_hf_ckpt", action="store_true", default=False)
     parser.add_argument("--disable_ds_ckpt", action="store_true", default=False)
     parser.add_argument("--max_ckpt_num", type=int, default=3)
@@ -431,6 +449,12 @@ if __name__ == "__main__":
         type=str,
         default="final_reasoning_trace",
         help="Name of XML tag to extract from generator responses (e.g., 'final_reasoning_trace')",
+    )
+    parser.add_argument(
+        "--diversity_extract_tags",
+        action="store_true",
+        default=False,
+        help="Extract tagged content before computing within-group diversity metrics.",
     )
     parser.add_argument(
         "--aggregator_max_new_tokens", type=int, default=1024, help="Max new tokens for aggregator generation"
