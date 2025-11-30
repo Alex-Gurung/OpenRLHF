@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from abc import ABC
 from datetime import timedelta
@@ -761,8 +762,11 @@ class BasePPOTrainer(ABC):
             for rec in records:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-        run_name = getattr(self.strategy.args, "wandb_run_name", "run")
-        artifact = self._wandb.Artifact(f"{run_name}-{name}-samples", type="samples")
+        run_name = getattr(self.strategy.args, "wandb_run_name", "run") or "run"
+        # wandb artifact names must match [A-Za-z0-9._-]; sanitize to be safe
+        safe_run_name = re.sub(r"[^A-Za-z0-9._-]", "-", run_name)
+        artifact_name = f"{safe_run_name}-{name}-samples"
+        artifact = self._wandb.Artifact(artifact_name, type="samples")
         artifact.add_file(filepath, name=filename)
         self._wandb.log_artifact(artifact)
 
