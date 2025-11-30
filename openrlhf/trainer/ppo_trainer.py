@@ -76,9 +76,9 @@ class BasePPOTrainer(ABC):
         self.sample_log_limit = default_sample_cap if sample_cap_arg is None else sample_cap_arg
         self.sample_log_char_limit = getattr(self.args, "log_sample_char_limit", 512)
         self.diversity_extract_tags = getattr(self.args, "diversity_extract_tags", False)
-        self.sample_artifact_dir = getattr(
-            self.args, "sample_artifact_dir", os.path.join(self.args.ckpt_path, "sample_logs")
-        )
+        default_artifact_dir = os.path.join(self.args.ckpt_path, "sample_logs")
+        sample_artifact_arg = getattr(self.args, "sample_artifact_dir", None)
+        self.sample_artifact_dir = sample_artifact_arg or default_artifact_dir
 
         # Init dummy variables
         self.prompts_dataloader = None
