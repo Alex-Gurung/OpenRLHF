@@ -1,4 +1,6 @@
+import json
 import os
+import random
 import time
 from abc import ABC
 from datetime import timedelta
@@ -16,6 +18,7 @@ from openrlhf.trainer.ppo_utils.group_aggregation import (
     apply_aggregation_results_to_rollouts,
     build_groups_from_rollouts,
     default_aggregation_template,
+    process_responses_for_aggregation,
 )
 from openrlhf.trainer.ppo_utils.replay_buffer import balance_experiences
 from openrlhf.trainer.ray.launcher import RayActorGroup
@@ -69,6 +72,15 @@ class BasePPOTrainer(ABC):
         self.kl_horizon = self.args.kl_horizon
 
         self.freezing_actor_steps = getattr(self.args, "freezing_actor_steps", -1)
+        default_sample_cap = max(2, min(20, self.args.rollout_batch_size * self.args.n_samples_per_prompt))
+        self.sample_log_limit = getattr(self.args, "log_samples_per_step", default_sample_cap)
+        self.sample_log_char_limit = getattr(self.args, "log_sample_char_limit", 512)
+        self.diversity_extract_tags = getattr(self.args, "diversity_extract_tags", False)
+        self.diversity_max_traces = getattr(self.args, "diversity_max_traces", 200)
+        self.diversity_max_pairwise = getattr(self.args, "diversity_max_pairwise", 200)
+        self.sample_artifact_dir = getattr(
+            self.args, "sample_artifact_dir", os.path.join(self.args.ckpt_path, "sample_logs")
+        )
 
         # Init dummy variables
         self.prompts_dataloader = None
@@ -174,24 +186,41 @@ class BasePPOTrainer(ABC):
             batch_vllm_engine_call(self.vllm_engines, "sleep")
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
+        def _normalize_sample_entries(sample_val):
+            if sample_val is None:
+                return []
+            if isinstance(sample_val, list):
+                if sample_val and isinstance(sample_val[0], (list, tuple)):
+                    return [list(e) for e in sample_val]
+                if len(sample_val) == 2 and not isinstance(sample_val[0], (list, tuple)):
+                    return [sample_val]
+            return []
+
+        gen_artifact_records = logs_dict.pop("generator_samples_artifact", None)
+        agg_artifact_records = logs_dict.pop("aggregator_samples_artifact", None)
+
         if global_step % args.logging_steps == 0:
             # wandb
             if self._wandb is not None:
                 # Add generated samples to wandb using Table
-                if "generated_samples" in logs_dict:
+                gen_entries = _normalize_sample_entries(logs_dict.pop("generated_samples", None))
+                if gen_entries:
                     # https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
                     new_table = self._wandb.Table(
                         columns=self.generated_samples_table.columns, data=self.generated_samples_table.data
                     )
-                    new_table.add_data(global_step, *logs_dict.pop("generated_samples"))
+                    for entry in gen_entries:
+                        new_table.add_data(global_step, *entry)
                     self.generated_samples_table = new_table
                     self._wandb.log({"train/generated_samples": new_table})
                 # Add aggregator samples to wandb using Table
-                if "aggregator_samples" in logs_dict:
+                agg_entries = _normalize_sample_entries(logs_dict.pop("aggregator_samples", None))
+                if agg_entries:
                     new_table = self._wandb.Table(
                         columns=self.aggregator_samples_table.columns, data=self.aggregator_samples_table.data
                     )
-                    new_table.add_data(global_step, *logs_dict.pop("aggregator_samples"))
+                    for entry in agg_entries:
+                        new_table.add_data(global_step, *entry)
                     self.aggregator_samples_table = new_table
                     self._wandb.log({"train/aggregator_samples": new_table})
                 logs = {
@@ -202,21 +231,34 @@ class BasePPOTrainer(ABC):
                     }.items()
                 }
                 self._wandb.log(logs)
+
+                # Log full-batch samples as artifacts
+                if gen_artifact_records:
+                    self._log_samples_artifact("generator", gen_artifact_records, global_step)
+                if agg_artifact_records:
+                    self._log_samples_artifact("aggregator", agg_artifact_records, global_step)
             # TensorBoard
             elif self._tensorboard is not None:
+                gen_entries = _normalize_sample_entries(logs_dict.pop("generated_samples", None))
+                agg_entries = _normalize_sample_entries(logs_dict.pop("aggregator_samples", None))
                 for k, v in logs_dict.items():
-                    if k == "generated_samples":
-                        # Record generated samples in TensorBoard using simple text format
-                        text, reward = v
-                        formatted_text = f"Sample:\n{text}\n\nReward: {reward:.4f}"
-                        self._tensorboard.add_text("train/generated_samples", formatted_text, global_step)
-                    elif k == "aggregator_samples":
-                        # Record aggregator samples in TensorBoard using simple text format
-                        text, reward = v
-                        formatted_text = f"Aggregator Sample:\n{text}\n\nReward: {reward:.4f}"
-                        self._tensorboard.add_text("train/aggregator_samples", formatted_text, global_step)
-                    else:
-                        self._tensorboard.add_scalar(f"train/{k}", v, global_step)
+                    self._tensorboard.add_scalar(f"train/{k}", v, global_step)
+
+                for idx, entry in enumerate(gen_entries):
+                    text, reward = entry
+                    formatted_text = f"Sample {idx}:\n{text}\n\nReward: {reward:.4f}"
+                    self._tensorboard.add_text("train/generated_samples", formatted_text, global_step)
+
+                for idx, entry in enumerate(agg_entries):
+                    text, reward = entry
+                    formatted_text = f"Aggregator Sample {idx}:\n{text}\n\nReward: {reward:.4f}"
+                    self._tensorboard.add_text("train/aggregator_samples", formatted_text, global_step)
+
+        # If not using wandb, still persist artifact payloads locally for debugging
+        if gen_artifact_records and self._wandb is None:
+            self._dump_samples_to_disk("generator", gen_artifact_records, global_step)
+        if agg_artifact_records and self._wandb is None:
+            self._dump_samples_to_disk("aggregator", agg_artifact_records, global_step)
 
         # TODO: Add evaluation mechanism for PPO
         if global_step % args.eval_steps == 0 and self.eval_dataloader and len(self.eval_dataloader) > 0:
@@ -447,6 +489,345 @@ class BasePPOTrainer(ABC):
                 logs[f"eval_{datasource}_agg_vs_gen_mean"] = improvement_vs_mean
 
         return logs
+
+    def _collect_sample_records(self, experiences):
+        """Collect full completion records for artifact logging (no truncation, whole batch)."""
+        if not experiences:
+            return []
+
+        records = []
+
+        def _get_info_value(info, key, idx):
+            val = info.get(key)
+            if val is None:
+                return None
+            if isinstance(val, list):
+                if idx < len(val):
+                    return val[idx]
+                if len(val) == 1:
+                    return val[0]
+            if torch.is_tensor(val):
+                flat = val.reshape(-1)
+                if idx < flat.numel():
+                    return flat[idx].item()
+            return val
+
+        for exp in experiences:
+            info = exp.info or {}
+            texts = info.get("response_text", [])
+            if torch.is_tensor(texts):
+                texts = self.tokenizer.batch_decode(texts, skip_special_tokens=True)
+            elif not isinstance(texts, list):
+                texts = [texts] if texts else []
+
+            rewards = info.get("reward", exp.rewards)
+            reward_list = []
+            if rewards is not None:
+                if torch.is_tensor(rewards):
+                    reward_list = rewards.reshape(-1).detach().cpu().tolist()
+                elif isinstance(rewards, list):
+                    for r in rewards:
+                        if torch.is_tensor(r):
+                            reward_list.extend(r.reshape(-1).detach().cpu().tolist())
+                        elif r is not None:
+                            reward_list.append(float(r))
+                elif isinstance(rewards, (float, int)):
+                    reward_list = [float(rewards)]
+
+            num_rows = max(len(texts), len(reward_list))
+            if num_rows == 0 and exp.sequences is not None:
+                num_rows = exp.sequences.shape[0] if exp.sequences.dim() > 1 else 1
+
+            for row in range(num_rows or 0):
+                text = ""
+                if row < len(texts) and texts[row] is not None:
+                    text = texts[row]
+                elif exp.sequences is not None:
+                    seq = (
+                        exp.sequences[row]
+                        if exp.sequences.dim() > 1 and row < exp.sequences.shape[0]
+                        else exp.sequences
+                    )
+                    act_mask = None
+                    if exp.action_mask is not None:
+                        act_mask = (
+                            exp.action_mask[row]
+                            if exp.action_mask.dim() > 1 and row < exp.action_mask.shape[0]
+                            else exp.action_mask
+                        )
+                    resp_tokens = seq[act_mask.bool()] if act_mask is not None else seq
+                    text = self.tokenizer.decode(resp_tokens, skip_special_tokens=True)
+
+                reward_val = None
+                if row < len(reward_list):
+                    reward_val = reward_list[row]
+
+                prompt_val = None
+                if exp.prompts:
+                    if row < len(exp.prompts):
+                        prompt_val = exp.prompts[row]
+                    elif len(exp.prompts) == 1:
+                        prompt_val = exp.prompts[0]
+                original_prompt = _get_info_value(info, "original_prompt", row)
+                group_id = _get_info_value(info, "group_id", row)
+
+                record = {"response": text or ""}
+                if prompt_val is not None:
+                    record["prompt"] = prompt_val
+                if original_prompt is not None:
+                    record["original_prompt"] = original_prompt
+                if reward_val is not None:
+                    record["reward"] = float(reward_val)
+                if group_id is not None:
+                    try:
+                        record["group_id"] = int(group_id)
+                    except Exception:
+                        record["group_id"] = group_id
+
+                records.append(record)
+
+        return records
+
+    def _prepare_sample_logs(self, experiences, limit=None):
+        """Extract a small set of decoded samples + rewards for logging tables."""
+        if not experiences:
+            return []
+
+        max_samples = self.sample_log_limit if limit is None else limit
+        if max_samples <= 0:
+            return []
+        entries = []
+        char_limit = self.sample_log_char_limit
+
+        for exp in experiences:
+            info = exp.info or {}
+            texts = info.get("response_text", [])
+            if torch.is_tensor(texts):
+                texts = self.tokenizer.batch_decode(texts, skip_special_tokens=True)
+            elif not isinstance(texts, list):
+                texts = [texts] if texts else []
+
+            rewards = info.get("reward", exp.rewards)
+            reward_list = []
+            if rewards is not None:
+                if torch.is_tensor(rewards):
+                    reward_list = rewards.reshape(-1).detach().cpu().tolist()
+                elif isinstance(rewards, list):
+                    for r in rewards:
+                        if torch.is_tensor(r):
+                            reward_list.extend(r.reshape(-1).detach().cpu().tolist())
+                        elif r is not None:
+                            reward_list.append(float(r))
+                elif isinstance(rewards, (float, int)):
+                    reward_list = [float(rewards)]
+
+            num_rows = max(len(texts), len(reward_list))
+            if num_rows == 0 and exp.sequences is not None:
+                num_rows = exp.sequences.shape[0] if exp.sequences.dim() > 1 else 1
+
+            for row in range(num_rows or 0):
+                if len(entries) >= max_samples:
+                    return entries
+
+                text = ""
+                if row < len(texts) and texts[row] is not None:
+                    text = texts[row]
+                elif exp.sequences is not None:
+                    seq = (
+                        exp.sequences[row]
+                        if exp.sequences.dim() > 1 and row < exp.sequences.shape[0]
+                        else exp.sequences
+                    )
+                    act_mask = None
+                    if exp.action_mask is not None:
+                        act_mask = (
+                            exp.action_mask[row]
+                            if exp.action_mask.dim() > 1 and row < exp.action_mask.shape[0]
+                            else exp.action_mask
+                        )
+                    resp_tokens = seq[act_mask.bool()] if act_mask is not None else seq
+                    text = self.tokenizer.decode(resp_tokens, skip_special_tokens=True)
+
+                if char_limit and text and len(text) > char_limit:
+                    text = text[:char_limit] + "..."
+
+                reward_val = None
+                if row < len(reward_list):
+                    reward_val = reward_list[row]
+
+                entries.append([text or "", 0.0 if reward_val is None else float(reward_val)])
+
+        return entries
+
+    def _compute_trace_diversity(
+        self,
+        groups,
+        prefix: str,
+        extract_tags: bool = False,
+        tag_name: str = "final_reasoning_trace",
+    ):
+        """Compute within-group diversity (per prompt) and average across groups."""
+        if not groups:
+            return {}
+
+        max_traces = max(0, self.diversity_max_traces)
+        max_pairwise = max(0, self.diversity_max_pairwise)
+        group_stats = []
+
+        for group in groups:
+            responses = [t.response_text for t in group.traces if t.response_text is not None]
+            if not responses:
+                continue
+
+            processed = process_responses_for_aggregation(responses, extract_tags, tag_name)
+            tokenized = [resp.split() for resp in processed if resp]
+            if not tokenized:
+                continue
+
+            if max_traces and len(tokenized) > max_traces:
+                tokenized = tokenized[:max_traces]
+
+            all_tokens = []
+            all_bigrams = []
+            lengths = []
+            pairwise_vals = []
+
+            for toks in tokenized:
+                lengths.append(len(toks))
+                all_tokens.extend(toks)
+                all_bigrams.extend(list(zip(toks, toks[1:])))
+
+            n = len(tokenized)
+            pair_count = n * (n - 1) // 2
+            if n > 1:
+                if max_pairwise and pair_count > max_pairwise:
+                    indices = []
+                    # sample pairs without replacement
+                    while len(indices) < max_pairwise:
+                        i = random.randrange(0, n)
+                        j = random.randrange(0, n)
+                        if i == j:
+                            continue
+                        a, b = (i, j) if i < j else (j, i)
+                        if (a, b) in indices:
+                            continue
+                        indices.append((a, b))
+                else:
+                    indices = [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+                for i, j in indices:
+                    set_i = set(tokenized[i])
+                    set_j = set(tokenized[j])
+                    union = set_i | set_j
+                    if not union:
+                        continue
+                    pairwise_vals.append(len(set_i & set_j) / len(union))
+
+            stats = {}
+            stats["count"] = n
+            if lengths:
+                stats["avg_len"] = sum(lengths) / len(lengths)
+            if all_tokens:
+                stats["distinct1"] = len(set(all_tokens)) / len(all_tokens)
+            if all_bigrams:
+                stats["distinct2"] = len(set(all_bigrams)) / len(all_bigrams)
+            if pairwise_vals:
+                stats["avg_pairwise_jaccard"] = sum(pairwise_vals) / len(pairwise_vals)
+
+            if stats:
+                group_stats.append(stats)
+
+        if not group_stats:
+            return {}
+
+        metrics = {f"{prefix}/group_count": len(group_stats)}
+        for key in ["count", "avg_len", "distinct1", "distinct2", "avg_pairwise_jaccard"]:
+            vals = [g[key] for g in group_stats if key in g]
+            if vals:
+                metrics[f"{prefix}/{key}"] = sum(vals) / len(vals)
+
+        return metrics
+        max_traces = max(0, self.diversity_max_traces)
+        max_pairwise = max(0, self.diversity_max_pairwise)
+        collected_traces = []
+
+        for group in groups:
+            responses = [t.response_text for t in group.traces if t.response_text is not None]
+            if not responses:
+                continue
+
+            processed = process_responses_for_aggregation(responses, extract_tags, tag_name)
+            tokenized = [resp.split() for resp in processed if resp]
+            if not tokenized:
+                continue
+
+            for toks in tokenized:
+                if max_traces and sample_count >= max_traces:
+                    break
+                collected_traces.append(toks)
+                sample_count += 1
+                token_lengths.append(len(toks))
+
+                all_tokens.extend(toks)
+                all_bigrams.extend(list(zip(toks, toks[1:])))
+
+            if max_traces and sample_count >= max_traces:
+                break
+
+        if collected_traces:
+            pairwise_candidates = collected_traces
+            if max_pairwise and len(collected_traces) > max_pairwise:
+                pairwise_candidates = random.sample(collected_traces, max_pairwise)
+
+            if len(pairwise_candidates) > 1:
+                for i in range(len(pairwise_candidates)):
+                    set_i = set(pairwise_candidates[i])
+                    for j in range(i + 1, len(pairwise_candidates)):
+                        set_j = set(pairwise_candidates[j])
+                        union = set_i | set_j
+                        if not union:
+                            continue
+                        pairwise_jaccard.append(len(set_i & set_j) / len(union))
+
+        metrics = {}
+        if sample_count:
+            metrics[f"{prefix}/count"] = sample_count
+        if token_lengths:
+            metrics[f"{prefix}/avg_len"] = sum(token_lengths) / len(token_lengths)
+        if all_tokens:
+            metrics[f"{prefix}/distinct1"] = len(set(all_tokens)) / len(all_tokens)
+        if all_bigrams:
+            metrics[f"{prefix}/distinct2"] = len(set(all_bigrams)) / len(all_bigrams)
+        if pairwise_jaccard:
+            metrics[f"{prefix}/avg_pairwise_jaccard"] = sum(pairwise_jaccard) / len(pairwise_jaccard)
+
+        return metrics
+
+    def _dump_samples_to_disk(self, name: str, records: list, global_step: int):
+        """Fallback when wandb is unavailable: write JSONL for inspection."""
+        if not records:
+            return
+        os.makedirs(self.sample_artifact_dir, exist_ok=True)
+        filename = os.path.join(self.sample_artifact_dir, f"{name}_step{global_step}.jsonl")
+        with open(filename, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def _log_samples_artifact(self, name: str, records: list, global_step: int):
+        """Log full-batch samples as a wandb Artifact (JSONL)."""
+        if self._wandb is None or not records:
+            return
+        os.makedirs(self.sample_artifact_dir, exist_ok=True)
+        filename = f"{name}_step{global_step}.jsonl"
+        filepath = os.path.join(self.sample_artifact_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        run_name = getattr(self.strategy.args, "wandb_run_name", "run")
+        artifact = self._wandb.Artifact(f"{run_name}-{name}-samples", type="samples")
+        artifact.add_file(filepath, name=filename)
+        self._wandb.log_artifact(artifact)
 
     def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
         """Evaluate model performance on eval dataset.
@@ -1080,6 +1461,7 @@ class PPOTrainer(BasePPOTrainer):
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
         self.aggregator_extract_tags = getattr(self.args, "aggregator_extract_tags", False)
         self.aggregator_tag_name = getattr(self.args, "aggregator_tag_name", "final_reasoning_trace")
+        self.diversity_extract_tags = getattr(self.args, "diversity_extract_tags", self.aggregator_extract_tags)
         if self.use_two_stage:
             # Defaults: match generator lengths, but allow aggregator prompt to include all traces
             gen_max_new = self.generate_kwargs.get("max_new_tokens", self.args.generate_max_len)
@@ -1270,6 +1652,28 @@ class PPOTrainer(BasePPOTrainer):
                             )
                             aggregator_rollouts.extend(agg_samples)
 
+                diversity_logs = {}
+                if rollout_samples:
+                    generator_groups = build_groups_from_rollouts(rollout_samples, tokenizer=self.tokenizer)
+                    diversity_logs.update(
+                        self._compute_trace_diversity(
+                            generator_groups,
+                            prefix="div/gen",
+                            extract_tags=self.diversity_extract_tags,
+                            tag_name=self.aggregator_tag_name,
+                        )
+                    )
+                if aggregator_rollouts:
+                    aggregator_groups = build_groups_from_rollouts(aggregator_rollouts, tokenizer=self.tokenizer)
+                    diversity_logs.update(
+                        self._compute_trace_diversity(
+                            aggregator_groups,
+                            prefix="div/agg",
+                            extract_tags=self.diversity_extract_tags,
+                            tag_name=self.aggregator_tag_name,
+                        )
+                    )
+
                 experiences = (
                     self.experience_maker.make_experience_batch(rollout_samples) if self.train_generator else []
                 )
@@ -1285,6 +1689,17 @@ class PPOTrainer(BasePPOTrainer):
                     self.experience_maker.make_experience_batch(aggregator_rollouts)
                     if self.train_aggregator and aggregator_rollouts
                     else []
+                )
+
+                gen_sample_logs = self._prepare_sample_logs(experiences, self.sample_log_limit) if experiences else []
+                agg_sample_logs = (
+                    self._prepare_sample_logs(aggregator_experiences, self.sample_log_limit)
+                    if aggregator_experiences
+                    else []
+                )
+                gen_sample_records = self._collect_sample_records(experiences) if experiences else []
+                agg_sample_records = (
+                    self._collect_sample_records(aggregator_experiences) if aggregator_experiences else []
                 )
 
                 # balance experiences across dp
@@ -1329,11 +1744,17 @@ class PPOTrainer(BasePPOTrainer):
                 if self.args.dynamic_filtering:
                     status["dynamic_filtering_pass_rate"] = pass_rate
 
+                if diversity_logs:
+                    status.update(diversity_logs)
+
                 if experiences:
                     gen_rewards = torch.cat([exp.info["reward"] for exp in experiences], dim=0)
                     status["gen_reward/mean"] = gen_rewards.mean().item()
                     status["gen_reward/std"] = gen_rewards.std(unbiased=False).item()
-                    status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+                    if gen_sample_logs:
+                        status["generated_samples"] = gen_sample_logs
+                    else:
+                        status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
 
                     # Log original task correctness before ll_delta overwrote it
                     if gen_task_correctness is not None and len(gen_task_correctness) > 0:
@@ -1347,7 +1768,15 @@ class PPOTrainer(BasePPOTrainer):
                     agg_rewards = torch.cat([exp.info["reward"] for exp in aggregator_experiences], dim=0)
                     status["agg_reward/mean"] = agg_rewards.mean().item()
                     status["agg_reward/std"] = agg_rewards.std(unbiased=False).item()
-                    status["aggregator_samples"] = [agg_text, aggregator_experiences[0].info["reward"][0]]
+                    if agg_sample_logs:
+                        status["aggregator_samples"] = agg_sample_logs
+                    else:
+                        status["aggregator_samples"] = [agg_text, aggregator_experiences[0].info["reward"][0]]
+
+                if gen_sample_records:
+                    status["generator_samples_artifact"] = gen_sample_records
+                if agg_sample_records:
+                    status["aggregator_samples_artifact"] = agg_sample_records
 
                 # Add episode to status for logging
                 status["episode"] = episode
