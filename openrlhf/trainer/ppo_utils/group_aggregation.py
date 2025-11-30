@@ -119,7 +119,7 @@ def default_aggregation_template(
         f"You are a teacher evaluating student answers on a question you didn't write. You are given a question and {len(processed_responses)} answer(s) given from students. "
         f"Your task is to analyze these answers and figure out true correct answer based on the quality of their reasoning. The students may or may not be correct, but their reasoning may be useful in determining the correct answer.\n\n"
         # f"Question:\n{question_text}\n\n"
-        "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n",
+        "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
         f"Student Solutions:\n"
     )
 
