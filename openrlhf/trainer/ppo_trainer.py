@@ -1582,11 +1582,11 @@ class PPOTrainer(BasePPOTrainer):
                                 self.aggregator_tag_name,
                                 group.original_prompt,
                             )
-                            # Build a single Experience for the aggregator prompt
+                            # Generate full aggregator batches so advantage reshaping matches n_samples_per_prompt.
                             agg_samples = self.aggregator_generator.generate_samples(
                                 [prompt_text],
                                 [group.label],
-                                n_samples_per_prompt=1,
+                                n_samples_per_prompt=self.args.n_samples_per_prompt,
                                 max_new_tokens=self.aggregator_max_new_tokens,
                                 temperature=self.aggregator_temperature,
                                 top_p=self.aggregator_top_p,
