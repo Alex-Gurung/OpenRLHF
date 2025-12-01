@@ -582,6 +582,11 @@ class BasePPOTrainer(ABC):
                 record = {"response": text or ""}
                 if prompt_val is not None:
                     record["prompt"] = prompt_val
+                # Always expose an aggregator_response field so downstream analysis can rely on it.
+                if agg_answer is not None:
+                    record["aggregator_response"] = agg_answer
+                elif text is not None:
+                    record["aggregator_response"] = text
                 if label_val is not None:
                     record["label"] = label_val
                 if original_prompt is not None:
@@ -589,14 +594,11 @@ class BasePPOTrainer(ABC):
                 if reward_val is not None:
                     record["reward"] = float(reward_val)
                 if agg_full_reward is not None:
-                    try:
-                        record["aggregator_reward"] = float(agg_full_reward)
-                    except Exception:
-                        record["aggregator_reward"] = agg_full_reward
+                    record["aggregator_reward"] = float(agg_full_reward)
+                elif reward_val is not None:
+                    record["aggregator_reward"] = float(reward_val)
                 if group_responses is not None:
                     record["group_responses"] = group_responses
-                if agg_answer is not None:
-                    record["aggregator_response"] = agg_answer
                 if group_id is not None:
                     try:
                         record["group_id"] = int(group_id)

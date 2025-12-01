@@ -18,6 +18,8 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+
 
 def load_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -25,10 +27,7 @@ def load_jsonl(path: Path):
             line = line.strip()
             if not line:
                 continue
-            try:
-                yield json.loads(line)
-            except Exception:
-                continue
+            yield json.loads(line)
 
 
 def extract_step(path: Path) -> int:
@@ -37,49 +36,45 @@ def extract_step(path: Path) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _normalize_group_responses(responses):
+    if isinstance(responses, list) and responses and isinstance(responses[0], list):
+        return responses[0]
+    if responses is None:
+        return []
+    if isinstance(responses, list):
+        return responses
+    return [responses]
+
+
 def analyze_file(path: Path):
     stats = defaultdict(int)
     rewards = []
     positions = []
 
     for rec in load_jsonl(path):
-        agg_resp = rec.get("aggregator_response") or rec.get("response")
-        responses = rec.get("group_responses")
-        if isinstance(responses, list) and responses and isinstance(responses[0], list):
-            # unwrap if nested
-            responses = responses[0]
+        agg_resp = rec["aggregator_response"]
+        responses = _normalize_group_responses(rec["group_responses"])
 
-        if not agg_resp or not responses:
-            continue
+        stats["total_rows"] += 1
 
-        stats["total"] += 1
+        stats["usable"] += 1
         if agg_resp == responses[0]:
             stats["match_first"] += 1
-        # position of first match (if any)
-        try:
-            pos = responses.index(agg_resp)
-            positions.append(pos)
-            stats["match_any"] += 1
-        except ValueError:
-            pos = None
+        pos = responses.index(agg_resp)
+        positions.append(pos)
+        stats["match_any"] += 1
 
-        if responses:
-            mode_resp, _ = Counter(responses).most_common(1)[0]
-            if agg_resp == mode_resp:
-                stats["match_mode"] += 1
+        mode_resp, _ = Counter(responses).most_common(1)[0]
+        if agg_resp == mode_resp:
+            stats["match_mode"] += 1
 
-        rew = rec.get("aggregator_reward")
-        if rew is None:
-            rew = rec.get("reward")
-        if rew is not None:
-            try:
-                rewards.append(float(rew))
-            except Exception:
-                pass
+        rew = rec.get("aggregator_reward", rec.get("reward"))
+        rewards.append(float(rew))
 
-    total = stats["total"] or 1
+    total = stats["usable"] or 1
     return {
-        "count": stats["total"],
+        "count": stats["usable"],
+        "rows": stats["total_rows"],
         "match_first_pct": stats["match_first"] / total,
         "match_any_pct": stats["match_any"] / total,
         "match_mode_pct": stats["match_mode"] / total,
@@ -89,12 +84,6 @@ def analyze_file(path: Path):
 
 
 def maybe_plot(metrics_by_step, out_dir: Path):
-    try:
-        import matplotlib.pyplot as plt
-    except Exception:
-        print("matplotlib not available; skipping plots")
-        return
-
     steps = sorted(metrics_by_step.keys())
     if not steps:
         return
@@ -132,9 +121,7 @@ def main():
     args = parser.parse_args()
 
     paths = sorted(args.log_dir.glob("aggregator_step*.jsonl"), key=extract_step)
-    if not paths:
-        print(f"No aggregator_step*.jsonl found in {args.log_dir}")
-        return
+    assert paths, f"No aggregator_step*.jsonl found in {args.log_dir}"
 
     metrics_by_step = {}
     for path in paths:
@@ -142,10 +129,13 @@ def main():
         metrics = analyze_file(path)
         metrics_by_step[step] = metrics
 
-    print("Per-step metrics (step: count, match_first, match_mode, reward_mean):")
+    print("Per-step metrics (step: usable rows / total rows, match_first, match_mode, reward_mean):")
     for step in sorted(metrics_by_step.keys()):
         m = metrics_by_step[step]
-        base = f"{step:>6}: n={m['count']:>4}, first={m['match_first_pct']*100:5.1f}%, mode={m['match_mode_pct']*100:5.1f}%"
+        base = (
+            f"{step:>6}: n={m['count']:>4}/{m['rows']:>4}, "
+            f"first={m['match_first_pct']*100:5.1f}%, mode={m['match_mode_pct']*100:5.1f}%"
+        )
         if m.get("reward_mean") is not None:
             base += f", reward={m['reward_mean']:.3f}"
         print(base)
