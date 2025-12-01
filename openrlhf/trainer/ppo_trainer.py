@@ -567,16 +567,36 @@ class BasePPOTrainer(ABC):
                         prompt_val = exp.prompts[row]
                     elif len(exp.prompts) == 1:
                         prompt_val = exp.prompts[0]
+                label_val = None
+                if exp.labels:
+                    if row < len(exp.labels):
+                        label_val = exp.labels[row]
+                    elif len(exp.labels) == 1:
+                        label_val = exp.labels[0]
                 original_prompt = _get_info_value(info, "original_prompt", row)
                 group_id = _get_info_value(info, "group_id", row)
+                group_responses = _get_info_value(info, "group_responses", row)
+                agg_answer = _get_info_value(info, "aggregator_full_answer", row)
+                agg_full_reward = _get_info_value(info, "aggregator_full_reward", row)
 
                 record = {"response": text or ""}
                 if prompt_val is not None:
                     record["prompt"] = prompt_val
+                if label_val is not None:
+                    record["label"] = label_val
                 if original_prompt is not None:
                     record["original_prompt"] = original_prompt
                 if reward_val is not None:
                     record["reward"] = float(reward_val)
+                if agg_full_reward is not None:
+                    try:
+                        record["aggregator_reward"] = float(agg_full_reward)
+                    except Exception:
+                        record["aggregator_reward"] = agg_full_reward
+                if group_responses is not None:
+                    record["group_responses"] = group_responses
+                if agg_answer is not None:
+                    record["aggregator_response"] = agg_answer
                 if group_id is not None:
                     try:
                         record["group_id"] = int(group_id)
@@ -1048,6 +1068,17 @@ class BasePPOTrainer(ABC):
             self._agg_context = None
             return rollout_samples, []
 
+        # Attach group context for downstream logging
+        for group in groups:
+            responses = [t.response_text for t in group.traces]
+            for trace in group.traces:
+                sample = rollout_samples[trace.sample_index]
+                if sample.info is None or not isinstance(sample.info, dict):
+                    sample.info = {}
+                sample.info.setdefault("group_responses", [responses])
+                if group.original_prompt is not None and sample.info.get("original_prompt") is None:
+                    sample.info["original_prompt"] = [group.original_prompt]
+
         # Aggregator rollouts: build when training the aggregator OR when we need answers/rewards for LL-delta
         aggregator_rollouts = []
         agg_answers = None
@@ -1058,6 +1089,7 @@ class BasePPOTrainer(ABC):
         if need_agg_samples:
             agg_prompts = []
             agg_labels = []
+            agg_metadata = []
             for group in groups:
                 responses = [t.response_text for t in group.traces]
                 agg_prompts.append(
@@ -1071,6 +1103,13 @@ class BasePPOTrainer(ABC):
                     )
                 )
                 agg_labels.append(group.label)
+                agg_metadata.append(
+                    {
+                        "group_id": group.group_id,
+                        "original_prompt": group.original_prompt,
+                        "responses": responses,
+                    }
+                )
 
             # If we're only using aggregator answers for ll_delta weighting/reuse, take 1 sample per prompt to save work.
             agg_samples_per_prompt = self.args.n_samples_per_prompt if self.train_aggregator else 1
@@ -1083,6 +1122,14 @@ class BasePPOTrainer(ABC):
                 top_p=self.aggregator_top_p,
             )
             aggregator_rollouts.extend(agg_samples)
+            # Keep aggregator inputs for logging
+            for i, sample in enumerate(agg_samples):
+                meta = agg_metadata[i // agg_samples_per_prompt]
+                if sample.info is None or not isinstance(sample.info, dict):
+                    sample.info = {}
+                sample.info.setdefault("group_responses", [meta["responses"]])
+                if meta["original_prompt"] is not None and sample.info.get("original_prompt") is None:
+                    sample.info["original_prompt"] = [meta["original_prompt"]]
 
             # Cache first sample per group as target answer (for LL-delta reuse)
             if self.reuse_agg_answers_for_ll:
