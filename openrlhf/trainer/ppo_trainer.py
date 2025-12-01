@@ -1132,6 +1132,14 @@ class BasePPOTrainer(ABC):
                 sample.info.setdefault("group_responses", [meta["responses"]])
                 if meta["original_prompt"] is not None and sample.info.get("original_prompt") is None:
                     sample.info["original_prompt"] = [meta["original_prompt"]]
+                if "aggregator_full_answer" not in sample.info:
+                    if sample.info.get("response_text"):
+                        sample.info["aggregator_full_answer"] = sample.info["response_text"]
+                    else:
+                        ans_tokens = sample.sequences[0][sample.action_mask[0].bool()]
+                        sample.info["aggregator_full_answer"] = [
+                            self.tokenizer.decode(ans_tokens, skip_special_tokens=True)
+                        ]
 
             # Cache first sample per group as target answer (for LL-delta reuse)
             if self.reuse_agg_answers_for_ll:
@@ -1641,6 +1649,17 @@ class PPOTrainer(BasePPOTrainer):
                                 top_p=self.aggregator_top_p,
                             )
                             aggregator_rollouts.extend(agg_samples)
+                        for sample in aggregator_rollouts:
+                            if sample.info is None or not isinstance(sample.info, dict):
+                                sample.info = {}
+                            if "aggregator_full_answer" not in sample.info:
+                                if sample.info.get("response_text"):
+                                    sample.info["aggregator_full_answer"] = sample.info["response_text"]
+                                else:
+                                    ans_tokens = sample.sequences[0][sample.action_mask[0].bool()]
+                                    sample.info["aggregator_full_answer"] = [
+                                        self.tokenizer.decode(ans_tokens, skip_special_tokens=True)
+                                    ]
 
                 diversity_logs = {}
                 if rollout_samples:
