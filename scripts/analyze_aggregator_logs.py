@@ -89,55 +89,60 @@ def analyze_file(path: Path):
 
     for rec in load_jsonl(path):
         agg_resp = rec["aggregator_response"]
-        responses = _normalize_group_responses(rec["group_responses"])
+        responses = _normalize_group_responses(rec.get("group_responses"))
         label = rec.get("label")
         agg_reward = rec.get("aggregator_reward", rec.get("reward"))
 
         agg_pred = parse_prediction(agg_resp)
-        elem_preds = [parse_prediction(r) for r in responses]
+        elem_preds = [parse_prediction(r) for r in responses] if responses else []
 
         stats["total_rows"] += 1
 
-        stats["usable"] += 1
-        if agg_resp == responses[0]:
-            stats["match_first"] += 1
-        pos = next((i for i, r in enumerate(responses) if r == agg_resp), -1)
-        if pos >= 0:
-            positions.append(pos)
-            stats["match_any"] += 1
+        has_group = bool(responses)
+        if has_group:
+            stats["usable"] += 1
+            if agg_resp == responses[0]:
+                stats["match_first"] += 1
+            pos = next((i for i, r in enumerate(responses) if r == agg_resp), -1)
+            if pos >= 0:
+                positions.append(pos)
+                stats["match_any"] += 1
 
-        mode_resp, _ = Counter(responses).most_common(1)[0]
-        if agg_resp == mode_resp:
-            stats["match_mode"] += 1
+            mode_resp, _ = Counter(responses).most_common(1)[0]
+            if agg_resp == mode_resp:
+                stats["match_mode"] += 1
 
         rewards.append(float(agg_reward))
         agg_preds.append(agg_pred)
-        mean_elem_preds.append(sum(elem_preds) / len(elem_preds) if elem_preds else 0.0)
-        agree_fraction.append(sum(1 for p in elem_preds if p == agg_pred) / len(elem_preds))
-        agree_first_pred.append(1.0 if agg_pred == elem_preds[0] else 0.0)
-        majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
-        agree_majority_pred.append(1.0 if agg_pred == majority_pred else 0.0)
+        if elem_preds:
+            mean_elem_preds.append(sum(elem_preds) / len(elem_preds))
+            agree_fraction.append(sum(1 for p in elem_preds if p == agg_pred) / len(elem_preds))
+            agree_first_pred.append(1.0 if agg_pred == elem_preds[0] else 0.0)
+            majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
+            agree_majority_pred.append(1.0 if agg_pred == majority_pred else 0.0)
         if label is not None:
             stats["label_rows"] += 1
             stats["agg_hits_label"] += 1 if agg_pred == float(label) else 0
-            first_correct.append(1.0 if elem_preds and elem_preds[0] == float(label) else 0.0)
-            majority_correct.append(1.0 if majority_pred == float(label) else 0.0)
+            if elem_preds:
+                first_correct.append(1.0 if elem_preds[0] == float(label) else 0.0)
+                majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
+                majority_correct.append(1.0 if majority_pred == float(label) else 0.0)
             agg_correct.append(1.0 if agg_pred == float(label) else 0.0)
 
     total = stats["usable"] or 1
-    mean_elem = sum(mean_elem_preds) / len(mean_elem_preds) if mean_elem_preds else 0.0
-    mean_agg = sum(agg_preds) / len(agg_preds) if agg_preds else 0.0
-    # simple Pearson correlation between agg_pred and mean elem pred
-    if agg_preds:
-        n = len(agg_preds)
+    mean_elem = sum(mean_elem_preds) / len(mean_elem_preds) if mean_elem_preds else None
+    mean_agg = sum(agg_preds) / len(agg_preds) if agg_preds else None
+    # simple Pearson correlation between agg_pred and mean elem pred when both exist
+    if agg_preds and mean_elem_preds:
+        n = len(mean_elem_preds)
         mean_x = mean_agg
         mean_y = mean_elem
-        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(agg_preds, mean_elem_preds)) / n
-        var_x = sum((x - mean_x) ** 2 for x in agg_preds) / n
+        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(agg_preds[:n], mean_elem_preds)) / n
+        var_x = sum((x - mean_x) ** 2 for x in agg_preds[:n]) / n
         var_y = sum((y - mean_y) ** 2 for y in mean_elem_preds) / n
         corr = cov / ((var_x ** 0.5) * (var_y ** 0.5) + 1e-12)
     else:
-        corr = 0.0
+        corr = None
 
     return {
         "count": stats["usable"],
@@ -150,9 +155,9 @@ def analyze_file(path: Path):
         "agg_pred_mean": mean_agg,
         "elem_pred_mean": mean_elem,
         "agg_elem_pred_corr": corr,
-        "agree_fraction_mean": sum(agree_fraction) / len(agree_fraction) if agree_fraction else 0.0,
-        "agree_first_pred_pct": sum(agree_first_pred) / len(agree_first_pred) if agree_first_pred else 0.0,
-        "agree_majority_pred_pct": sum(agree_majority_pred) / len(agree_majority_pred) if agree_majority_pred else 0.0,
+        "agree_fraction_mean": sum(agree_fraction) / len(agree_fraction) if agree_fraction else None,
+        "agree_first_pred_pct": sum(agree_first_pred) / len(agree_first_pred) if agree_first_pred else None,
+        "agree_majority_pred_pct": sum(agree_majority_pred) / len(agree_majority_pred) if agree_majority_pred else None,
         "agg_hits_label_pct": stats["agg_hits_label"] / stats["label_rows"] if stats["label_rows"] else None,
         "first_hits_label_pct": sum(first_correct) / len(first_correct) if first_correct else None,
         "majority_hits_label_pct": sum(majority_correct) / len(majority_correct) if majority_correct else None,
@@ -196,10 +201,16 @@ def main():
         action="store_true",
         help="Save matplotlib plots in the log dir",
     )
+    parser.add_argument(
+        "--pattern",
+        type=str,
+        default="aggregator_step*.jsonl",
+        help="Filename glob to read (e.g., aggregator_step*.jsonl or generator_step*.jsonl)",
+    )
     args = parser.parse_args()
 
-    paths = sorted(args.log_dir.glob("aggregator_step*.jsonl"), key=extract_step)
-    assert paths, f"No aggregator_step*.jsonl found in {args.log_dir}"
+    paths = sorted(args.log_dir.glob(args.pattern), key=extract_step)
+    assert paths, f"No files matching {args.pattern} found in {args.log_dir}"
 
     metrics_by_step = {}
     for path in paths:
@@ -226,15 +237,15 @@ def main():
         table.add_row(
             str(step),
             f"{m['count']}/{m['rows']}",
-            f"{m['reward_mean']:.3f}",
-            f"{(m['agg_hits_label_pct'] or 0.0)*100:5.1f}%" if m.get("agg_hits_label_pct") is not None else "NA",
-            f"{(m['majority_hits_label_pct'] or 0.0)*100:5.1f}%" if m.get("majority_hits_label_pct") is not None else "NA",
-            f"{(m['first_hits_label_pct'] or 0.0)*100:5.1f}%" if m.get("first_hits_label_pct") is not None else "NA",
-            f"{m['agg_pred_mean']:.3f}",
-            f"{m['elem_pred_mean']:.3f}",
-            f"{m['agree_first_pred_pct']*100:5.1f}%",
-            f"{m['agree_majority_pred_pct']*100:5.1f}%",
-            f"{m['agg_elem_pred_corr']:.3f}",
+            f"{m['reward_mean']:.3f}" if m.get("reward_mean") is not None else "NA",
+            f"{m['agg_hits_label_pct']*100:5.1f}%" if m.get("agg_hits_label_pct") is not None else "NA",
+            f"{m['majority_hits_label_pct']*100:5.1f}%" if m.get("majority_hits_label_pct") is not None else "NA",
+            f"{m['first_hits_label_pct']*100:5.1f}%" if m.get("first_hits_label_pct") is not None else "NA",
+            f"{m['agg_pred_mean']:.3f}" if m.get("agg_pred_mean") is not None else "NA",
+            f"{m['elem_pred_mean']:.3f}" if m.get("elem_pred_mean") is not None else "NA",
+            f"{m['agree_first_pred_pct']*100:5.1f}%" if m.get("agree_first_pred_pct") is not None else "NA",
+            f"{m['agree_majority_pred_pct']*100:5.1f}%" if m.get("agree_majority_pred_pct") is not None else "NA",
+            f"{m['agg_elem_pred_corr']:.3f}" if m.get("agg_elem_pred_corr") is not None else "NA",
         )
 
     console.print(table)
