@@ -9,7 +9,16 @@ Reads JSONL sample artifacts written by `ppo_trainer` (e.g.,
 - Distribution over which position it selected
 - Average aggregator reward
 
-Optionally writes simple Matplotlib visualizations over training steps.
+Metrics reported per step:
+- Reward: mean aggregator reward.
+- Agg Acc: percent of examples where aggregator prediction matches label.
+- Maj Acc: percent where majority vote of group predictions matches label.
+- First Acc: percent where first response prediction matches label.
+- Agg Pred / Elem Pred: average yes/no predictions (1=yes) for aggregator and group elements.
+- Agree First / Agree Maj: how often aggregator prediction matches first / majority prediction.
+- Corr: Pearson correlation between aggregator prediction and mean group prediction.
+
+Plots are saved if --plot is provided.
 """
 
 import argparse
@@ -199,7 +208,7 @@ def main():
         metrics_by_step[step] = metrics
 
     console = Console()
-    table = Table(title="Aggregator metrics per step", show_lines=False)
+    table = Table(title="Aggregator metrics per step", show_lines=False, caption="Yes/no predictions parsed via boxed{...}")
     table.add_column("Step", justify="right")
     table.add_column("n (usable/total)", justify="right")
     table.add_column("Reward", justify="right")
