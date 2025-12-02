@@ -19,6 +19,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from rich.console import Console
+from rich.table import Table
 
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}", re.IGNORECASE)
 
@@ -72,6 +74,9 @@ def analyze_file(path: Path):
     agree_fraction = []
     agree_first_pred = []
     agree_majority_pred = []
+    agg_correct = []
+    first_correct = []
+    majority_correct = []
 
     for rec in load_jsonl(path):
         agg_resp = rec["aggregator_response"]
@@ -106,6 +111,9 @@ def analyze_file(path: Path):
         if label is not None:
             stats["label_rows"] += 1
             stats["agg_hits_label"] += 1 if agg_pred == float(label) else 0
+            first_correct.append(1.0 if elem_preds and elem_preds[0] == float(label) else 0.0)
+            majority_correct.append(1.0 if majority_pred == float(label) else 0.0)
+            agg_correct.append(1.0 if agg_pred == float(label) else 0.0)
 
     total = stats["usable"] or 1
     mean_elem = sum(mean_elem_preds) / len(mean_elem_preds) if mean_elem_preds else 0.0
@@ -137,6 +145,8 @@ def analyze_file(path: Path):
         "agree_first_pred_pct": sum(agree_first_pred) / len(agree_first_pred) if agree_first_pred else 0.0,
         "agree_majority_pred_pct": sum(agree_majority_pred) / len(agree_majority_pred) if agree_majority_pred else 0.0,
         "agg_hits_label_pct": stats["agg_hits_label"] / stats["label_rows"] if stats["label_rows"] else None,
+        "first_hits_label_pct": sum(first_correct) / len(first_correct) if first_correct else None,
+        "majority_hits_label_pct": sum(majority_correct) / len(majority_correct) if majority_correct else None,
     }
 
 
@@ -157,9 +167,11 @@ def maybe_plot(metrics_by_step, out_dir: Path):
         plt.savefig(out_dir / filename)
         plt.close()
 
-    plot_series("match_first_pct", "P(agg==first)", "match_first_pct.png")
-    plot_series("match_mode_pct", "P(agg==mode)", "match_mode_pct.png")
     plot_series("reward_mean", "Aggregator reward", "aggregator_reward_mean.png")
+    plot_series("agg_hits_label_pct", "Aggregator accuracy", "agg_accuracy.png")
+    plot_series("majority_hits_label_pct", "Majority accuracy", "majority_accuracy.png")
+    plot_series("agree_first_pred_pct", "Agree with first pred", "agree_first_pred.png")
+    plot_series("agree_majority_pred_pct", "Agree with majority pred", "agree_majority_pred.png")
 
 
 def main():
@@ -186,21 +198,37 @@ def main():
         metrics = analyze_file(path)
         metrics_by_step[step] = metrics
 
-    print(
-        "Per-step metrics (n usable/total, reward_mean, agg_pred_mean, elem_pred_mean, "
-        "agree_first_pred, agree_majority_pred, agg_elem_pred_corr):"
-    )
+    console = Console()
+    table = Table(title="Aggregator metrics per step", show_lines=False)
+    table.add_column("Step", justify="right")
+    table.add_column("n (usable/total)", justify="right")
+    table.add_column("Reward", justify="right")
+    table.add_column("Agg Acc", justify="right")
+    table.add_column("Maj Acc", justify="right")
+    table.add_column("First Acc", justify="right")
+    table.add_column("Agg Pred", justify="right")
+    table.add_column("Elem Pred", justify="right")
+    table.add_column("Agree First", justify="right")
+    table.add_column("Agree Maj", justify="right")
+    table.add_column("Corr", justify="right")
+
     for step in sorted(metrics_by_step.keys()):
         m = metrics_by_step[step]
-        base = (
-            f"{step:>6}: n={m['count']:>4}/{m['rows']:>4}, "
-            f"reward={m['reward_mean']:.3f}, "
-            f"agg_pred={m['agg_pred_mean']:.3f}, elems_pred={m['elem_pred_mean']:.3f}, "
-            f"agree_first_pred={m['agree_first_pred_pct']*100:5.1f}%, "
-            f"agree_majority_pred={m['agree_majority_pred_pct']*100:5.1f}%, "
-            f"corr={m['agg_elem_pred_corr']:.3f}"
+        table.add_row(
+            str(step),
+            f"{m['count']}/{m['rows']}",
+            f"{m['reward_mean']:.3f}",
+            f"{(m['agg_hits_label_pct'] or 0.0)*100:5.1f}%" if m.get("agg_hits_label_pct") is not None else "NA",
+            f"{(m['majority_hits_label_pct'] or 0.0)*100:5.1f}%" if m.get("majority_hits_label_pct") is not None else "NA",
+            f"{(m['first_hits_label_pct'] or 0.0)*100:5.1f}%" if m.get("first_hits_label_pct") is not None else "NA",
+            f"{m['agg_pred_mean']:.3f}",
+            f"{m['elem_pred_mean']:.3f}",
+            f"{m['agree_first_pred_pct']*100:5.1f}%",
+            f"{m['agree_majority_pred_pct']*100:5.1f}%",
+            f"{m['agg_elem_pred_corr']:.3f}",
         )
-        print(base)
+
+    console.print(table)
 
     if args.plot:
         args.log_dir.mkdir(parents=True, exist_ok=True)
