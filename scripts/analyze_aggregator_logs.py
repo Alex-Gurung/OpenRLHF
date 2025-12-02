@@ -60,9 +60,10 @@ def analyze_file(path: Path):
         stats["usable"] += 1
         if agg_resp == responses[0]:
             stats["match_first"] += 1
-        pos = responses.index(agg_resp)
-        positions.append(pos)
-        stats["match_any"] += 1
+        pos = next((i for i, r in enumerate(responses) if r == agg_resp), -1)
+        if pos >= 0:
+            positions.append(pos)
+            stats["match_any"] += 1
 
         mode_resp, _ = Counter(responses).most_common(1)[0]
         if agg_resp == mode_resp:
