@@ -1624,7 +1624,10 @@ class PPOTrainer(BasePPOTrainer):
                     if self.train_generator:
                         # Save original task correctness before ll_delta overwrites it (requires scoring)
                         if self.generator_reward_mode == "ll_delta" and rollout_samples and score_generator_samples:
-                            gen_task_correctness = torch.tensor([s.scores[0].item() for s in rollout_samples if s.scores is not None])
+                            # Treat correctness as 1.0 only when the scored reward == 1 (binary accuracy)
+                            gen_task_correctness = torch.tensor(
+                                [1.0 if s.scores is not None and s.scores[0].item() == 1 else 0.0 for s in rollout_samples]
+                            )
 
                         rollout_samples, aggregator_rollouts = self._run_two_stage_rewards(rollout_samples)
                     else:
@@ -1779,6 +1782,10 @@ class PPOTrainer(BasePPOTrainer):
                     agg_rewards = torch.cat([exp.info["reward"] for exp in aggregator_experiences], dim=0)
                     status["agg_reward/mean"] = agg_rewards.mean().item()
                     status["agg_reward/std"] = agg_rewards.std(unbiased=False).item()
+                    # Treat correctness as reward == 1.0
+                    agg_correct = (agg_rewards == 1.0).float()
+                    status["agg_task_correctness/mean"] = agg_correct.mean().item()
+                    status["agg_task_correctness/std"] = agg_correct.std(unbiased=False).item() if agg_correct.numel() > 1 else 0.0
                     if agg_sample_logs:
                         status["aggregator_samples"] = agg_sample_logs
                     else:
