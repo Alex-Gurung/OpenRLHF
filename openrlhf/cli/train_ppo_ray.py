@@ -482,6 +482,12 @@ if __name__ == "__main__":
         help="Generator reward mode in two-stage: ll_delta (likelihood delta) or loo_generate",
     )
     parser.add_argument(
+        "--loo_reward_correctness_diff",
+        action="store_true",
+        default=False,
+        help="For loo_generate: use correctness flip reward (+1 if trace makes aggregator correct, -1 if it makes it wrong, else 0)",
+    )
+    parser.add_argument(
         "--no_reuse_aggregator_answers_for_ll",
         action="store_false",
         dest="reuse_aggregator_answers_for_ll",

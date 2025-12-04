@@ -1454,6 +1454,7 @@ class PPOTrainer(BasePPOTrainer):
         self.ll_delta_weight_by_answer_reward = getattr(self.args, "ll_delta_weight_by_answer_reward", True)
         self.ll_delta_normalize = getattr(self.args, "ll_delta_normalize", False)
         self.ll_delta_reward_scale = getattr(self.args, "ll_delta_reward_scale", 10.0)
+        self.loo_reward_correctness_diff = getattr(self.args, "loo_reward_correctness_diff", False)
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
@@ -1503,6 +1504,7 @@ class PPOTrainer(BasePPOTrainer):
                 include_full_group=True,
                 extract_tags=self.aggregator_extract_tags,
                 tag_name=self.aggregator_tag_name,
+                correctness_diff_reward=self.loo_reward_correctness_diff,
             )
             # Per-call context for aggregator full-group caching
             self._agg_context = None

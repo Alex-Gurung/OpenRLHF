@@ -253,6 +253,7 @@ class LeaveOneOutAggregator:
         include_full_group: bool = True,
         extract_tags: bool = False,
         tag_name: str = "final_reasoning_trace",
+        correctness_diff_reward: bool = False,
     ) -> None:
         """
         Args:
@@ -263,6 +264,8 @@ class LeaveOneOutAggregator:
             include_full_group: Whether to include a full-group prompt for aggregator PPO reward/logging.
             extract_tags: Whether to extract content from XML tags in responses.
             tag_name: Name of the XML tag to extract from.
+            correctness_diff_reward: If True, generator reward is +1 when the trace makes the aggregator correct,
+                -1 when it flips a correct aggregator to wrong, and 0 otherwise (ignores reward magnitude).
         """
         self.generate_fn = generate_fn
         self.reward_fn = reward_fn
@@ -271,6 +274,7 @@ class LeaveOneOutAggregator:
         self.include_full_group = include_full_group
         self.extract_tags = extract_tags
         self.tag_name = tag_name
+        self.correctness_diff_reward = correctness_diff_reward
 
     def _build_prompts(
         self, group: AggregationGroup
@@ -303,11 +307,17 @@ class LeaveOneOutAggregator:
             labels.append(group.label)
         return prompts, dropped_trace, labels
 
-    def _compute_generator_rewards(self, loo_rewards: torch.Tensor) -> Dict[int, torch.Tensor]:
+    def _compute_generator_rewards(self, loo_rewards: torch.Tensor, full_reward: Optional[torch.Tensor]) -> Dict[int, torch.Tensor]:
         """Vectorized LOO reward computation for a single group."""
         gen_rewards: Dict[int, torch.Tensor] = {}
         k = loo_rewards.numel()
         if k == 0:
+            return gen_rewards
+        if self.correctness_diff_reward and full_reward is not None:
+            full_correct = (full_reward > 0).float()
+            for idx in range(k):
+                without_correct = (loo_rewards[idx] > 0).float()
+                gen_rewards[idx] = full_correct - without_correct  # +1, 0, or -1
             return gen_rewards
         rewards_sum = loo_rewards.sum()
         for idx in range(k):
@@ -333,7 +343,7 @@ class LeaveOneOutAggregator:
             full_reward = rewards[0] if self.include_full_group else None
             loo_rewards = rewards[offset:]
 
-            gen_rewards_by_local_idx = self._compute_generator_rewards(loo_rewards)
+            gen_rewards_by_local_idx = self._compute_generator_rewards(loo_rewards, full_reward)
             trace_rewards: Dict[int, torch.Tensor] = {}
             for local_idx, reward in gen_rewards_by_local_idx.items():
                 sample_index = group.traces[local_idx].sample_index
