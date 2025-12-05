@@ -115,20 +115,21 @@ def default_aggregation_template(
     question_text = original_prompt if original_prompt is not None else prompt
 
 
-    # header = (
-    #     f"You are a teacher evaluating student answers on a question you didn't write. You are given a question and {len(processed_responses)} answer(s) given from students. "
-    #     f"Your task is to analyze these answers and figure out true correct answer based on the quality of their reasoning. The students may or may not be correct, but their reasoning may be useful in determining the correct answer.\n\n"
-    #     # f"Question:\n{question_text}\n\n"
-    #     "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
-    #     f"Student Solutions:\n"
-    # )
     header = (
-        "Students were asked: Does the story contain a continuity error? "
-        f"There are {len(processed_responses)} summarized student answers below. "
-        "Use only these summaries (you do not have the story) to pick the final decision. "
-        "End with \\boxed{Yes} if there is a continuity error and \\boxed{No} if there is not.\n\n"
-        "Student Solutions:\n"
+        f"You are a teacher evaluating student answers on a question you didn't write. You are given a question and {len(processed_responses)} answer(s) given from students. "
+        f"Your task is to analyze these answers and figure out true correct answer based on the quality of their reasoning. The students may or may not be correct, but their reasoning may be useful in determining the correct answer.\n\n"
+        f"Question:\n{question_text}\n\n"
+        # "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
+        # "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
+        f"Student Solutions:\n"
     )
+    # header = (
+    #     "Students were asked: Does the story contain a continuity error? "
+    #     f"There are {len(processed_responses)} summarized student answers below. "
+    #     "Use only these summaries (you do not have the story) to pick the final decision. "
+    #     "End with \\boxed{Yes} if there is a continuity error and \\boxed{No} if there is not.\n\n"
+    #     "Student Solutions:\n"
+    # )
 
     solution_blocks = []
     for idx, resp in enumerate(processed_responses, 1):
@@ -137,32 +138,32 @@ def default_aggregation_template(
         )
     body = "\n\n".join(solution_blocks)
 
-    footer = (
-        f"\n\nInstructions:\n"
-        f"1. Analyse the students' answers (each one may be incorrect), compare them against each other, and reason about the correct answer.\n"
-        f"2. Provide your answer in the requested format.\n"
-        """Detailed Task Description:
-1. Read through the provided `prompt` containing multiple student answers summarizing a story.
-2. Identify any points where the details in the student answers might contradict each other.
-3. Focus on identifying continuity errors, which are inconsistencies or contradictions in the story's details.
-4. Compare the students' arguments and resolve any conflicts to determine the most supported answer.
-5. Conclude with \\boxed{Yes} if a continuity error is found, or \\boxed{No} if there is no continuity error.
-6. Ensure that the final answer is based on the best-supported argument among the students' responses.
+#     footer = (
+#         f"\n\nInstructions:\n"
+#         f"1. Analyse the students' answers (each one may be incorrect), compare them against each other, and reason about the correct answer.\n"
+#         f"2. Provide your answer in the requested format.\n"
+#         """Detailed Task Description:
+# 1. Read through the provided `prompt` containing multiple student answers summarizing a story.
+# 2. Identify any points where the details in the student answers might contradict each other.
+# 3. Focus on identifying continuity errors, which are inconsistencies or contradictions in the story's details.
+# 4. Compare the students' arguments and resolve any conflicts to determine the most supported answer.
+# 5. Conclude with \\boxed{Yes} if a continuity error is found, or \\boxed{No} if there is no continuity error.
+# 6. Ensure that the final answer is based on the best-supported argument among the students' responses.
 
-Niche and Domain Specific Factual Information:
-- A continuity error occurs when there is a contradiction or inconsistency in the story's details.
-- Students' answers may contain less-organized thoughts and backtracking, which need to be analyzed for consistency.
-- The story's context and details should be carefully examined to identify any discrepancies.
-- The final decision should be based on the most coherent and logically consistent argument among the students' responses.
+# Niche and Domain Specific Factual Information:
+# - A continuity error occurs when there is a contradiction or inconsistency in the story's details.
+# - Students' answers may contain less-organized thoughts and backtracking, which need to be analyzed for consistency.
+# - The story's context and details should be carefully examined to identify any discrepancies.
+# - The final decision should be based on the most coherent and logically consistent argument among the students' responses.
 
-Generalizable Strategy:
-- Carefully read and compare each student's summary to identify contradictions.
-- Resolve conflicts by selecting the most supported argument.
-- Conclude with \\boxed{Yes} or \\boxed{No} based on the identified continuity error."""
-    )
+# Generalizable Strategy:
+# - Carefully read and compare each student's summary to identify contradictions.
+# - Resolve conflicts by selecting the most supported argument.
+# - Conclude with \\boxed{Yes} or \\boxed{No} based on the identified continuity error."""
+#     )
 
-    aggregation_content = f"{header}{body}{footer}"
-
+    # aggregation_content = f"{header}{body}{footer}"
+    aggregation_content = f"{header}{body}"
     # Apply chat template if available: treat aggregation task as a user message
     # if tokenizer.chat_template is not None:
     chat = [{"role": "user", "content": aggregation_content}]
