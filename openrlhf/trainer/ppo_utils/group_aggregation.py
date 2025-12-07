@@ -162,8 +162,12 @@ def default_aggregation_template(
 # - Conclude with \\boxed{Yes} or \\boxed{No} based on the identified continuity error."""
 #     )
 
-    # aggregation_content = f"{header}{body}{footer}"
-    aggregation_content = f"{header}{body}"
+    footer = "\n\nInstructions:\n"
+    footer += "1. Step by step, analyse the students' answers (each one may be incorrect), compare them against each other, and reason about the correct answer.\n"
+    footer += "2. Provide your final answer inside \\boxed{}.\n"
+
+    aggregation_content = f"{header}{body}{footer}"
+    # aggregation_content = f"{header}{body}"
     # Apply chat template if available: treat aggregation task as a user message
     # if tokenizer.chat_template is not None:
     chat = [{"role": "user", "content": aggregation_content}]

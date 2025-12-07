@@ -122,8 +122,8 @@ class BasePPOTrainer(ABC):
             wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
             wandb.define_metric("eval/epoch")
             wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
-            self.generated_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
-            self.aggregator_samples_table = wandb.Table(columns=["global_step", "text", "reward"])
+            self.generated_samples_table = wandb.Table(columns=["global_step", "prompt", "response", "reward"])
+            self.aggregator_samples_table = wandb.Table(columns=["global_step", "prompt", "response", "reward"])
 
         # Initialize TensorBoard writer if wandb is not available
         if self.strategy.args.use_tensorboard and self._wandb is None:
@@ -190,8 +190,16 @@ class BasePPOTrainer(ABC):
                 return []
             if isinstance(sample_val, list):
                 if sample_val and isinstance(sample_val[0], (list, tuple)):
-                    return [list(e) for e in sample_val]
-                if len(sample_val) == 2 and not isinstance(sample_val[0], (list, tuple)):
+                    normalized = []
+                    for e in sample_val:
+                        if len(e) == 2:
+                            normalized.append(["", e[0], e[1]])
+                        else:
+                            normalized.append(list(e))
+                    return normalized
+                if len(sample_val) in (2, 3) and not isinstance(sample_val[0], (list, tuple)):
+                    if len(sample_val) == 2:
+                        return [["", sample_val[0], sample_val[1]]]
                     return [sample_val]
             return []
 
@@ -244,13 +252,13 @@ class BasePPOTrainer(ABC):
                     self._tensorboard.add_scalar(f"train/{k}", v, global_step)
 
                 for idx, entry in enumerate(gen_entries):
-                    text, reward = entry
-                    formatted_text = f"Sample {idx}:\n{text}\n\nReward: {reward:.4f}"
+                    prompt, text, reward = entry
+                    formatted_text = f"Sample {idx}:\nPrompt:\n{prompt}\n\nResponse:\n{text}\n\nReward: {reward:.4f}"
                     self._tensorboard.add_text("train/generated_samples", formatted_text, global_step)
 
                 for idx, entry in enumerate(agg_entries):
-                    text, reward = entry
-                    formatted_text = f"Aggregator Sample {idx}:\n{text}\n\nReward: {reward:.4f}"
+                    prompt, text, reward = entry
+                    formatted_text = f"Aggregator Sample {idx}:\nPrompt:\n{prompt}\n\nResponse:\n{text}\n\nReward: {reward:.4f}"
                     self._tensorboard.add_text("train/aggregator_samples", formatted_text, global_step)
 
         # If not using wandb, still persist artifact payloads locally for debugging
@@ -672,11 +680,24 @@ class BasePPOTrainer(ABC):
                 if char_limit and text and len(text) > char_limit:
                     text = text[:char_limit] + "..."
 
+                prompt_val = None
+                if exp.prompts:
+                    if row < len(exp.prompts):
+                        prompt_val = exp.prompts[row]
+                    elif len(exp.prompts) == 1:
+                        prompt_val = exp.prompts[0]
+
                 reward_val = None
                 if row < len(reward_list):
                     reward_val = reward_list[row]
 
-                entries.append([text or "", 0.0 if reward_val is None else float(reward_val)])
+                entries.append(
+                    [
+                        prompt_val or "",
+                        text or "",
+                        0.0 if reward_val is None else float(reward_val),
+                    ]
+                )
 
         return entries
 
@@ -1691,11 +1712,15 @@ class PPOTrainer(BasePPOTrainer):
                 experiences = (
                     self.experience_maker.make_experience_batch(rollout_samples) if self.train_generator else []
                 )
-                sample0 = (
-                    self.tokenizer.batch_decode(experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True)
-                    if experiences
-                    else ["", 0]
-                )
+                sample0 = None
+                if experiences:
+                    sample0 = {
+                        "prompt": experiences[0].prompts[0] if experiences[0].prompts else "",
+                        "text": self.tokenizer.batch_decode(
+                            experiences[0].sequences[0].unsqueeze(0), skip_special_tokens=True
+                        )[0],
+                        "reward": experiences[0].info["reward"][0] if "reward" in experiences[0].info else 0,
+                    }
                 print(sample0)
 
                 # Aggregator experiences (full-group prompts/answers)
@@ -1768,7 +1793,11 @@ class PPOTrainer(BasePPOTrainer):
                     if gen_sample_logs:
                         status["generated_samples"] = gen_sample_logs
                     else:
-                        status["generated_samples"] = [sample0[0], experiences[0].info["reward"][0]]
+                        status["generated_samples"] = [
+                            sample0["prompt"] if sample0 else "",
+                            sample0["text"] if sample0 else "",
+                            sample0["reward"] if sample0 else 0,
+                        ]
 
                     # Log original task correctness before ll_delta overwrote it
                     if gen_task_correctness is not None and len(gen_task_correctness) > 0:
@@ -1789,7 +1818,12 @@ class PPOTrainer(BasePPOTrainer):
                     if agg_sample_logs:
                         status["aggregator_samples"] = agg_sample_logs
                     else:
-                        status["aggregator_samples"] = [agg_text, aggregator_experiences[0].info["reward"][0]]
+                        agg_prompt = aggregator_experiences[0].prompts[0] if aggregator_experiences[0].prompts else ""
+                        status["aggregator_samples"] = [
+                            agg_prompt,
+                            agg_text,
+                            aggregator_experiences[0].info["reward"][0],
+                        ]
 
                 if gen_sample_records:
                     status["generator_samples_artifact"] = gen_sample_records
