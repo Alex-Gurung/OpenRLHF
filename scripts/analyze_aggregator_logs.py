@@ -32,6 +32,7 @@ from rich.console import Console
 from rich.table import Table
 
 BOXED_RE = re.compile(r"\\boxed\{([^}]*)\}", re.IGNORECASE)
+HASH_ANSWER_RE = re.compile(r"####\s*([^\n]+)")
 
 
 def extract_last_boxed(text: str) -> str:
@@ -41,12 +42,56 @@ def extract_last_boxed(text: str) -> str:
     return text or ""
 
 
-def parse_prediction(raw_text: str) -> float:
+def parse_yes_no_prediction(raw_text: str) -> float:
     candidate = extract_last_boxed(raw_text)
     candidate = (candidate or raw_text or "").strip().lower()
     if "yes" in candidate and "no" not in candidate:
         return 1.0
     return 0.0
+
+
+def extract_answer_text(text: str) -> str:
+    """Extract a final numeric/string answer from boxed/#### formats."""
+    text = text or ""
+    text = text.replace("\\boxed{<final_integer>}", "fake")
+    boxed_matches = list(BOXED_RE.finditer(text))
+    if boxed_matches:
+        return boxed_matches[-1].group(1).strip()
+    hash_matches = HASH_ANSWER_RE.findall(text)
+    if hash_matches:
+        return hash_matches[-1].strip()
+    return text.strip()
+
+
+def parse_math_answer(raw_text: str) -> str:
+    return extract_answer_text(raw_text)
+
+
+def _normalize_math_for_compare(ans: str) -> str:
+    # Lightweight normalization to smooth over whitespace/punctuation.
+    return re.sub(r"\s+", "", str(ans or "").strip().strip(".,"))
+
+
+def math_is_correct(pred_answer: str, gold_answer: str, math_verifier=None) -> bool:
+    """Check correctness using math_verify if available, else fallback to string match."""
+    if math_verifier is not None:
+        try:
+            return bool(math_verifier(str(gold_answer), str(pred_answer)))
+        except Exception:
+            # fall back to string comparison if verifier fails
+            pass
+    return _normalize_math_for_compare(pred_answer) == _normalize_math_for_compare(gold_answer)
+
+
+def resolve_math_verifier(enabled: bool):
+    if not enabled:
+        return None
+    try:
+        from math_verify import verify as math_verify  # type: ignore
+    except Exception as exc:
+        print(f"math_verify unavailable ({exc}); falling back to string comparison")
+        return None
+    return math_verify
 
 
 def load_jsonl(path: Path):
@@ -74,11 +119,11 @@ def _normalize_group_responses(responses):
     return [responses]
 
 
-def analyze_file(path: Path):
+def analyze_file(path: Path, math_mode: bool = False, math_verifier=None):
     stats = defaultdict(int)
     rewards = []
     positions = []
-    agg_preds = []
+    agg_preds_numeric = []
     mean_elem_preds = []
     agree_fraction = []
     agree_first_pred = []
@@ -93,8 +138,13 @@ def analyze_file(path: Path):
         label = rec.get("label")
         agg_reward = rec.get("aggregator_reward", rec.get("reward"))
 
-        agg_pred = parse_prediction(agg_resp)
-        elem_preds = [parse_prediction(r) for r in responses] if responses else []
+        if math_mode:
+            agg_pred = parse_math_answer(agg_resp)
+            elem_preds = [parse_math_answer(r) for r in responses] if responses else []
+        else:
+            agg_pred = parse_yes_no_prediction(agg_resp)
+            elem_preds = [parse_yes_no_prediction(r) for r in responses] if responses else []
+            agg_preds_numeric.append(agg_pred)
 
         stats["total_rows"] += 1
 
@@ -113,36 +163,52 @@ def analyze_file(path: Path):
                 stats["match_mode"] += 1
 
         rewards.append(float(agg_reward))
-        agg_preds.append(agg_pred)
         if elem_preds:
-            mean_elem_preds.append(sum(elem_preds) / len(elem_preds))
+            if not math_mode:
+                mean_elem_preds.append(sum(elem_preds) / len(elem_preds))
+                majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
+            else:
+                majority_pred = Counter(elem_preds).most_common(1)[0][0]
             agree_fraction.append(sum(1 for p in elem_preds if p == agg_pred) / len(elem_preds))
             agree_first_pred.append(1.0 if agg_pred == elem_preds[0] else 0.0)
-            majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
             agree_majority_pred.append(1.0 if agg_pred == majority_pred else 0.0)
         if label is not None:
             stats["label_rows"] += 1
-            stats["agg_hits_label"] += 1 if agg_pred == float(label) else 0
-            if elem_preds:
-                first_correct.append(1.0 if elem_preds[0] == float(label) else 0.0)
-                majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
-                majority_correct.append(1.0 if majority_pred == float(label) else 0.0)
-            agg_correct.append(1.0 if agg_pred == float(label) else 0.0)
+            if math_mode:
+                label_answer = parse_math_answer(str(label))
+                agg_hit = math_is_correct(agg_pred, label_answer, math_verifier)
+                stats["agg_hits_label"] += 1 if agg_hit else 0
+                agg_correct.append(1.0 if agg_hit else 0.0)
+                if elem_preds:
+                    first_hit = math_is_correct(elem_preds[0], label_answer, math_verifier)
+                    first_correct.append(1.0 if first_hit else 0.0)
+                    majority_pred = Counter(elem_preds).most_common(1)[0][0]
+                    maj_hit = math_is_correct(majority_pred, label_answer, math_verifier)
+                    majority_correct.append(1.0 if maj_hit else 0.0)
+            else:
+                stats["agg_hits_label"] += 1 if agg_pred == float(label) else 0
+                if elem_preds:
+                    first_correct.append(1.0 if elem_preds[0] == float(label) else 0.0)
+                    majority_pred = 1.0 if sum(elem_preds) >= (len(elem_preds) / 2) else 0.0
+                    majority_correct.append(1.0 if majority_pred == float(label) else 0.0)
+                agg_correct.append(1.0 if agg_pred == float(label) else 0.0)
 
     total = stats["usable"] or 1
-    mean_elem = sum(mean_elem_preds) / len(mean_elem_preds) if mean_elem_preds else None
-    mean_agg = sum(agg_preds) / len(agg_preds) if agg_preds else None
-    # simple Pearson correlation between agg_pred and mean elem pred when both exist
-    if agg_preds and mean_elem_preds:
-        n = len(mean_elem_preds)
-        mean_x = mean_agg
-        mean_y = mean_elem
-        cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(agg_preds[:n], mean_elem_preds)) / n
-        var_x = sum((x - mean_x) ** 2 for x in agg_preds[:n]) / n
-        var_y = sum((y - mean_y) ** 2 for y in mean_elem_preds) / n
-        corr = cov / ((var_x ** 0.5) * (var_y ** 0.5) + 1e-12)
-    else:
-        corr = None
+    mean_elem = None
+    mean_agg = None
+    corr = None
+    if not math_mode:
+        mean_elem = sum(mean_elem_preds) / len(mean_elem_preds) if mean_elem_preds else None
+        mean_agg = sum(agg_preds_numeric) / len(agg_preds_numeric) if agg_preds_numeric else None
+        # simple Pearson correlation between agg_pred and mean elem pred when both exist
+        if agg_preds_numeric and mean_elem_preds:
+            n = len(mean_elem_preds)
+            mean_x = mean_agg
+            mean_y = mean_elem
+            cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(agg_preds_numeric[:n], mean_elem_preds)) / n
+            var_x = sum((x - mean_x) ** 2 for x in agg_preds_numeric[:n]) / n
+            var_y = sum((y - mean_y) ** 2 for y in mean_elem_preds) / n
+            corr = cov / ((var_x ** 0.5) * (var_y ** 0.5) + 1e-12)
 
     return {
         "count": stats["usable"],
@@ -170,7 +236,12 @@ def maybe_plot(metrics_by_step, out_dir: Path):
         return
 
     def plot_series(metric_key, ylabel, filename):
-        vals = [metrics_by_step[s].get(metric_key) for s in steps]
+        vals = [
+            float(metrics_by_step[s].get(metric_key))
+            if metrics_by_step[s].get(metric_key) is not None
+            else float("nan")
+            for s in steps
+        ]
         plt.figure(figsize=(6, 3))
         plt.plot(steps, vals, marker="o")
         plt.xlabel("step")
@@ -207,19 +278,30 @@ def main():
         default="aggregator_step*.jsonl",
         help="Filename glob to read (e.g., aggregator_step*.jsonl or generator_step*.jsonl)",
     )
+    parser.add_argument(
+        "--math",
+        action="store_true",
+        help="Parse answers as math outputs (boxed/####) and score with math_verify if available.",
+    )
     args = parser.parse_args()
 
     paths = sorted(args.log_dir.glob(args.pattern), key=extract_step)
     assert paths, f"No files matching {args.pattern} found in {args.log_dir}"
 
+    math_verifier = resolve_math_verifier(args.math)
     metrics_by_step = {}
     for path in paths:
         step = extract_step(path)
-        metrics = analyze_file(path)
+        metrics = analyze_file(path, math_mode=args.math, math_verifier=math_verifier)
         metrics_by_step[step] = metrics
 
     console = Console()
-    table = Table(title="Aggregator metrics per step", show_lines=False, caption="Yes/no predictions parsed via boxed{...}")
+    caption = (
+        "Math answers parsed via boxed/####; correctness via math_verify if available"
+        if args.math
+        else "Yes/no predictions parsed via boxed{...}"
+    )
+    table = Table(title="Aggregator metrics per step", show_lines=False, caption=caption)
     table.add_column("Step", justify="right")
     table.add_column("n (usable/total)", justify="right")
     table.add_column("Reward", justify="right")
