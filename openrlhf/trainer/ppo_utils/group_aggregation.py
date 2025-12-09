@@ -115,15 +115,29 @@ def default_aggregation_template(
     processed_responses = process_responses_for_aggregation(responses, extract_tags, tag_name)
     question_text = original_prompt if original_prompt is not None else prompt
 
+    question_text = (
+        "Does the story contain a continuity error? Answer Yes or No and justify briefly.\n\n"
+    )
+
+    # header = (
+    #     f"You are a teacher evaluating student answers on a question you didn't write. You are given a question and {len(processed_responses)} answer(s) given from students. "
+    #     f"Your task is to analyze these answers and figure out true correct answer based on the quality of their reasoning. The students may or may not be correct, but their reasoning may be useful in determining the correct answer.\n\n"
+    #     f"Question:\n{question_text}\n\n"
+    #     # "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
+    #     # "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
+    #     f"Student Solutions:\n"
+    # )
 
     header = (
-        f"You are a teacher evaluating student answers on a question you didn't write. You are given a question and {len(processed_responses)} answer(s) given from students. "
+        f"You are an aggregator, evaluating student answers on a question to construct the correct answer. You are given a question and {len(processed_responses)} answer(s) given from students. "
         f"Your task is to analyze these answers and figure out true correct answer based on the quality of their reasoning. The students may or may not be correct, but their reasoning may be useful in determining the correct answer.\n\n"
         f"Question:\n{question_text}\n\n"
         # "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
         # "Question:\nRead the given story, and focus on a specific plot point or event. Figure out if there was a contradiction or plot hole in the story. Finish your response with your final answer (Yes or No), inside \\boxed{}.\n\n"
         f"Student Solutions:\n"
     )
+
+
     # header = (
     #     "Students were asked: Does the story contain a continuity error? "
     #     f"There are {len(processed_responses)} summarized student answers below. "
@@ -164,7 +178,7 @@ def default_aggregation_template(
 #     )
 
     footer = "\n\nInstructions:\n"
-    footer += "1. Step by step, analyse the students' answers (each one may be incorrect), compare them against each other, and reason about the correct answer.\n"
+    footer += "1. Step by step, analyse the students' answers (each one may be incorrect), compare them against each other, and reason about the correct answer. Majority voting is not sufficient to determine the correct answer, you must carefully consider the students' answers and justifications.\n"
     footer += "2. Provide your final answer inside \\boxed{}.\n"
 
     aggregation_content = f"{header}{body}{footer}"
