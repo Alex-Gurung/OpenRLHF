@@ -75,7 +75,7 @@ class BasePPOTrainer(ABC):
         default_sample_cap = max(2, min(20, self.args.rollout_batch_size * self.args.n_samples_per_prompt))
         sample_cap_arg = getattr(self.args, "log_samples_per_step", default_sample_cap)
         self.sample_log_limit = default_sample_cap if sample_cap_arg is None else sample_cap_arg
-        self.sample_log_char_limit = getattr(self.args, "log_sample_char_limit", 512)
+        self.sample_log_char_limit = getattr(self.args, "log_sample_char_limit", None)
         self.diversity_extract_tags = getattr(self.args, "diversity_extract_tags", False)
         default_artifact_dir = os.path.join(self.args.ckpt_path, "sample_logs")
         sample_artifact_arg = getattr(self.args, "sample_artifact_dir", None)
@@ -677,7 +677,7 @@ class BasePPOTrainer(ABC):
                     resp_tokens = seq[act_mask.bool()] if act_mask is not None else seq
                     text = self.tokenizer.decode(resp_tokens, skip_special_tokens=True)
 
-                if char_limit and text and len(text) > char_limit:
+                if char_limit is not None and char_limit > 0 and text and len(text) > char_limit:
                     text = text[:char_limit] + "..."
 
                 prompt_val = None

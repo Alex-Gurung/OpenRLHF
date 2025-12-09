@@ -267,8 +267,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--log_sample_char_limit",
         type=int,
-        default=1024,
-        help="Max characters per sample in preview logs. Full artifacts are untruncated.",
+        default=None,
+        help="Max characters per sample in preview logs (wandb/tensorboard). Set to <=0 or omit to disable truncation; full artifacts are always untruncated.",
     )
     parser.add_argument(
         "--sample_artifact_dir",
