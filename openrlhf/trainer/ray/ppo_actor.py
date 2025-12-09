@@ -554,6 +554,13 @@ class PolicyModelActor(BaseModelActor):
     def append(self, experience: Experience):
         self.trainer.replay_buffer.append(experience)
 
+    def set_entropy_loss_coef(self, entropy_loss_coef: Optional[float] = None):
+        """Update entropy coefficient used during PPO training."""
+        self.strategy.args.entropy_loss_coef = entropy_loss_coef
+        if self.trainer is not None:
+            self.trainer.args.entropy_loss_coef = entropy_loss_coef
+        return entropy_loss_coef
+
     def reload_states(self):
         reload_deepspeed_states(self.actor.model)
 

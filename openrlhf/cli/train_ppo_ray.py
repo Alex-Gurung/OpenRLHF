@@ -394,6 +394,12 @@ if __name__ == "__main__":
         default=None,
         help="Entropy loss coef, set to 0 means only enable entropy logs",
     )
+    parser.add_argument(
+        "--aggregator_entropy_loss_coef",
+        type=float,
+        default=None,
+        help="Entropy loss coef for aggregator PPO phase; defaults to entropy_loss_coef. Set to 0 to disable aggregator entropy while keeping generator entropy.",
+    )
     parser.add_argument("--adam_betas", type=float, nargs=2, default=(0.9, 0.95), help="Betas for Adam optimizer")
     parser.add_argument("--reward_clip_range", type=float, nargs=2, default=(-10, 10), help="Reward clip range")
 
@@ -478,8 +484,8 @@ if __name__ == "__main__":
         "--generator_reward_mode",
         type=str,
         default="ll_delta",
-        choices=["ll_delta", "loo_generate"],
-        help="Generator reward mode in two-stage: ll_delta (likelihood delta) or loo_generate",
+        choices=["ll_delta", "loo_generate", "direct"],
+        help="Generator reward mode in two-stage: ll_delta (likelihood delta), loo_generate (LOO correctness), or direct (per-sample reward model as in single-stage)",
     )
     parser.add_argument(
         "--loo_reward_correctness_diff",

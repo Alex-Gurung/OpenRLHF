@@ -173,6 +173,15 @@ class BasePPOTrainer(ABC):
 
         return status
 
+    def _set_actor_entropy_coef(self, entropy_coef):
+        """Update actor-side entropy coefficient (generator vs aggregator phases)."""
+        self.args.entropy_loss_coef = entropy_coef
+        refs = self.actor_model_group.async_run_method(
+            method_name="set_entropy_loss_coef",
+            entropy_loss_coef=entropy_coef,
+        )
+        ray.get(refs)
+
     def _broadcast_to_vllm(self):
         if self.strategy.args.vllm_enable_sleep:
             from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
@@ -1201,6 +1210,9 @@ class BasePPOTrainer(ABC):
                 apply_aggregation_results_to_rollouts(rollout_samples, agg_results)
             elif self.generator_reward_mode == "ll_delta":
                 self._apply_ll_delta_rewards(groups, rollout_samples, agg_answers, aggregator_rollouts)
+            elif self.generator_reward_mode == "direct":
+                # Leave rewards untouched; they will be computed per-sample by the reward model in make_experience_batch.
+                pass
             else:
                 raise ValueError(f"Unknown generator_reward_mode {self.generator_reward_mode}")
 
@@ -1469,6 +1481,10 @@ class PPOTrainer(BasePPOTrainer):
             "aggregator_only",
             "aggregator",
         ]
+        self.generator_entropy_loss_coef = getattr(self.args, "entropy_loss_coef", None)
+        self.aggregator_entropy_loss_coef = getattr(
+            self.args, "aggregator_entropy_loss_coef", self.generator_entropy_loss_coef
+        )
         self.generator_reward_mode = getattr(self.args, "generator_reward_mode", "ll_delta")
         self.reuse_agg_answers_for_ll = getattr(self.args, "reuse_aggregator_answers_for_ll", True)
         self.ll_delta_seq_microbatch = getattr(self.args, "ll_delta_seq_microbatch", 2)
@@ -1751,6 +1767,7 @@ class PPOTrainer(BasePPOTrainer):
 
                 # Train generator first (if enabled)
                 if self.train_generator and experiences:
+                    self._set_actor_entropy_coef(self.generator_entropy_loss_coef)
                     refs = self.actor_model_group.async_run_method_batch(method_name="append", experience=experiences)
                     if self.critic_model_group is not None:
                         refs.extend(
@@ -1761,6 +1778,7 @@ class PPOTrainer(BasePPOTrainer):
 
                 # Train aggregator separately to keep batches homogeneous
                 if self.train_aggregator and aggregator_experiences:
+                    self._set_actor_entropy_coef(self.aggregator_entropy_loss_coef)
                     refs = self.actor_model_group.async_run_method_batch(
                         method_name="append", experience=aggregator_experiences
                     )
