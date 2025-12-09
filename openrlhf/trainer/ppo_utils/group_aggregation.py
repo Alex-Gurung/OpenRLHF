@@ -51,7 +51,8 @@ def extract_content_from_tags(text: str, tag_name: str = "final_reasoning_trace"
         >>> extract_content_from_tags("No tags here")
         'No tags here'
     """
-    text = text.split("</think>")[-1].strip()
+    # just in case the response didn't finish, we try to get after the last think tag
+    text = text.split("</think>")[-1].strip().split("<think>")[-1].strip()
     # Find all matches and use the last one
     pattern = rf"<{tag_name}>(.*?)</{tag_name}>"
     matches = list(re.finditer(pattern, text, re.DOTALL))
