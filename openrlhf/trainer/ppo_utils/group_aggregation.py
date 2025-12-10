@@ -52,6 +52,7 @@ def extract_content_from_tags(text: str, tag_name: str = "final_reasoning_trace"
         'No tags here'
     """
     # just in case the response didn't finish, we try to get after the last think tag
+    
     text = text.split("</think>")[-1].strip().split("<think>")[-1].strip()
     # Find all matches and use the last one
     pattern = rf"<{tag_name}>(.*?)</{tag_name}>"
