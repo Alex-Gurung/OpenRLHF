@@ -51,8 +51,6 @@ class SFTDataset(Dataset):
         input_template=None,
         pretrain_mode=False,
         multiturn=False,
-        enable_filtering=True,
-        num_processors=8,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -60,6 +58,7 @@ class SFTDataset(Dataset):
         self.pretrain_mode = pretrain_mode
         self.max_length = max_length
         self.multiturn = multiturn
+        self.dataset = dataset
 
         # chat template
         self.input_template = input_template
@@ -73,157 +72,147 @@ class SFTDataset(Dataset):
             if tokenizer_chat_template:
                 self.tokenizer.chat_template = tokenizer_chat_template
 
-        # Optional lightweight filtering to remove invalid samples upfront
-        if enable_filtering:
-            filtered_dataset = dataset.filter(
-                self._is_valid_sample,
-                num_proc=num_processors,
-            )
-            self.dataset = filtered_dataset
-        else:
-            self.dataset = dataset
-
-    def _is_valid_sample(self, data):
-        """Lightweight validation without full tokenization to filter dataset upfront."""
-        try:
-            # Check basic data structure
-            if self.multiturn:
-                if not data.get(self.input_key):
-                    return False
-                messages = data[self.input_key]
-                if self.output_key and data.get(self.output_key):
-                    # Will be appended in __getitem__
-                    messages = list(messages) + [data[self.output_key]]
-                # Check if there's at least one assistant message
-                has_assistant = any(msg.get("role") == "assistant" for msg in messages if isinstance(msg, dict))
-                if not has_assistant:
-                    return False
-            else:
-                # For non-multiturn, check that required keys exist
-                if not data.get(self.input_key):
-                    return False
-                if not self.pretrain_mode and self.output_key and not data.get(self.output_key):
-                    return False
-            return True
-        except Exception:
-            return False
-
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, idx):
-        data = self.dataset[idx]
-        response_ranges = None
+        # Try to find a valid sample, cycling through the dataset if needed
+        dataset_len = len(self.dataset)
+        for attempt in range(dataset_len):
+            try:
+                current_idx = (idx + attempt) % dataset_len
+                data = self.dataset[current_idx]
+                response_ranges = None
 
-        # Build multi-turn response ranges lazily if needed
-        if self.multiturn:
-            if self.output_key:
-                data = dict(data)
-                data[self.input_key] = list(data[self.input_key])
-                data[self.input_key].append(data[self.output_key])
-                data[self.output_key] = None
+                # Build multi-turn response ranges lazily if needed
+                if self.multiturn:
+                    if self.output_key:
+                        data = dict(data)
+                        data[self.input_key] = list(data[self.input_key])
+                        data[self.input_key].append(data[self.output_key])
+                        data[self.output_key] = None
 
-            assert (
-                not self.output_key or not data[self.output_key]
-            ), "You should put the whole trajectory into data[input_key] and do not set output_key"
-            input_key = self.input_key
-            apply_chat_template = self.apply_chat_template
-            response_ranges = []
-            for msg_idx, message in enumerate(data[input_key]):
-                if message["role"] == "assistant":
-                    prompt_text = apply_chat_template(
-                        data[input_key][:msg_idx], tokenize=False, add_generation_prompt=True
+                    assert (
+                        not self.output_key or not data[self.output_key]
+                    ), "You should put the whole trajectory into data[input_key] and do not set output_key"
+                    input_key = self.input_key
+                    apply_chat_template = self.apply_chat_template
+                    response_ranges = []
+                    for msg_idx, message in enumerate(data[input_key]):
+                        if message["role"] == "assistant":
+                            prompt_text = apply_chat_template(
+                                data[input_key][:msg_idx], tokenize=False, add_generation_prompt=True
+                            )
+                            response_text = apply_chat_template(data[input_key][: msg_idx + 1], tokenize=False)[
+                                len(prompt_text) :
+                            ]
+
+                            start_token_idx = (
+                                self.tokenizer(
+                                    prompt_text,
+                                    max_length=self.max_length,
+                                    padding=False,
+                                    truncation=True,
+                                    return_tensors="pt",
+                                    add_special_tokens=False,
+                                )["attention_mask"]
+                                .int()
+                                .sum()
+                                .item()
+                            )
+
+                            end_token_idx = (
+                                start_token_idx
+                                + self.tokenizer(
+                                    response_text,
+                                    max_length=self.max_length,
+                                    padding=False,
+                                    truncation=True,
+                                    return_tensors="pt",
+                                    add_special_tokens=False,
+                                )["attention_mask"]
+                                .int()
+                                .sum()
+                                .item()
+                                - 1
+                            )
+                            response_ranges.append((start_token_idx, end_token_idx))
+                    if not response_ranges:
+                        continue  # Skip this sample, try next
+
+                prompt, response = preprocess_data(
+                    data,
+                    None if self.pretrain_mode else self.input_template,
+                    self.input_key,
+                    self.output_key,
+                    apply_chat_template=None if self.pretrain_mode else self.apply_chat_template,
+                    multiturn=self.multiturn,
+                )
+
+                if self.pretrain_mode:
+                    if not prompt:
+                        continue  # Skip this sample, try next
+                    prompt_ids_len = 0
+                else:
+                    if not prompt or not response:
+                        continue  # Skip this sample, try next
+                    prompt_token = self.tokenizer(
+                        prompt,
+                        max_length=self.max_length,
+                        padding=False,
+                        truncation=True,
+                        return_tensors="pt",
+                        add_special_tokens=False,
                     )
-                    response_text = apply_chat_template(data[input_key][: msg_idx + 1], tokenize=False)[
-                        len(prompt_text) :
-                    ]
+                    prompt_ids_len = prompt_token["attention_mask"].int().sum().item()
+                    # filter the sample whose length is greater than max_length (2 for answer length)
+                    if prompt_ids_len >= self.max_length - 2:
+                        continue  # Skip this sample, try next
 
-                    start_token_idx = (
-                        self.tokenizer(
-                            prompt_text,
-                            max_length=self.max_length,
-                            padding=False,
-                            truncation=True,
-                            return_tensors="pt",
-                            add_special_tokens=False,
-                        )["attention_mask"]
-                        .int()
-                        .sum()
-                        .item()
-                    )
+                if not self.pretrain_mode:
+                    text = (prompt + response).rstrip("\n")
+                    if not text.endswith(self.tokenizer.eos_token):
+                        text += " " + self.tokenizer.eos_token
+                else:
+                    text = prompt
 
-                    end_token_idx = (
-                        start_token_idx
-                        + self.tokenizer(
-                            response_text,
-                            max_length=self.max_length,
-                            padding=False,
-                            truncation=True,
-                            return_tensors="pt",
-                            add_special_tokens=False,
-                        )["attention_mask"]
-                        .int()
-                        .sum()
-                        .item()
-                        - 1
-                    )
-                    response_ranges.append((start_token_idx, end_token_idx))
-            if not response_ranges:
-                return None, None, None
+                input_token = self.tokenizer(
+                    text,
+                    max_length=self.max_length,
+                    padding=False,
+                    truncation=True,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                )
+                input_ids = input_token["input_ids"]
+                attention_mask = input_token["attention_mask"]
+                loss_mask = self.get_loss_mask(input_ids, prompt_ids_len, response_ranges)
 
-        prompt, response = preprocess_data(
-            data,
-            None if self.pretrain_mode else self.input_template,
-            self.input_key,
-            self.output_key,
-            apply_chat_template=None if self.pretrain_mode else self.apply_chat_template,
-            multiturn=self.multiturn,
+                # Generate token_type_ids for Gemma3 (0 for prompt, 1 for response)
+                token_type_ids = torch.zeros_like(input_ids, dtype=torch.long)
+                if not self.pretrain_mode and prompt_ids_len > 0:
+                    # Mark response tokens with 1
+                    token_type_ids[0, prompt_ids_len:] = 1
+
+                if not self.pretrain_mode:
+                    # to avoid EOS_token truncation
+                    input_ids[0][-1] = self.tokenizer.eos_token_id
+                    attention_mask[0][-1] = True
+
+                return input_ids, attention_mask, loss_mask, token_type_ids
+
+            except Exception as e:
+                # Log and skip this sample if any error occurs
+                if attempt == 0:  # Only log on first attempt to avoid spam
+                    import warnings
+                    warnings.warn(f"Skipping sample {current_idx} due to error: {e}")
+                continue
+
+        # If we've tried all samples and none are valid, raise an error
+        raise ValueError(
+            f"Could not find any valid samples in dataset after trying all {dataset_len} samples. "
+            "Check your data quality, max_length setting, or dataset format."
         )
-
-        if self.pretrain_mode:
-            if not prompt:
-                return None, None, None
-            prompt_ids_len = 0
-        else:
-            if not prompt or not response:
-                return None, None, None
-            prompt_token = self.tokenizer(
-                prompt,
-                max_length=self.max_length,
-                padding=False,
-                truncation=True,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-            prompt_ids_len = prompt_token["attention_mask"].int().sum().item()
-            # filter the sample whose length is greater than max_length (2 for answer length)
-            if prompt_ids_len >= self.max_length - 2:
-                return None, None, None
-
-        if not self.pretrain_mode:
-            text = (prompt + response).rstrip("\n")
-            if not text.endswith(self.tokenizer.eos_token):
-                text += " " + self.tokenizer.eos_token
-        else:
-            text = prompt
-
-        input_token = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding=False,
-            truncation=True,
-            return_tensors="pt",
-            add_special_tokens=False,
-        )
-        input_ids = input_token["input_ids"]
-        attention_mask = input_token["attention_mask"]
-        loss_mask = self.get_loss_mask(input_ids, prompt_ids_len, response_ranges)
-
-        if not self.pretrain_mode:
-            # to avoid EOS_token truncation
-            input_ids[0][-1] = self.tokenizer.eos_token_id
-            attention_mask[0][-1] = True
-        return input_ids, attention_mask, loss_mask
 
     def get_loss_mask(self, input_ids, prompt_ids_len=None, response_ranges=None):
         if self.pretrain_mode:
@@ -250,18 +239,16 @@ class SFTDataset(Dataset):
         input_ids = []
         attention_masks = []
         loss_masks = []
+        token_type_ids = []
 
-        for input_id, attention_mask, loss_mask in item_list:
-            if input_id is None:
-                continue
+        for input_id, attention_mask, loss_mask, token_type_id in item_list:
             input_ids.append(input_id)
             attention_masks.append(attention_mask)
             loss_masks.append(loss_mask)
-
-        if not input_ids:
-            raise ValueError("All samples in the batch are invalid; check data quality or max_length.")
+            token_type_ids.append(token_type_id)
 
         input_ids = zero_pad_sequences(input_ids, "right", self.tokenizer.pad_token_id)
         attention_masks = zero_pad_sequences(attention_masks, "right")
         loss_masks = zero_pad_sequences(loss_masks, "right")
-        return input_ids, attention_masks, loss_masks
+        token_type_ids = zero_pad_sequences(token_type_ids, "right", 0)
+        return input_ids, attention_masks, loss_masks, token_type_ids
