@@ -73,9 +73,22 @@ def blending_datasets(
             data = load_dataset(dataset, data_dir=data_dir)
             strategy.print(f"loaded {dataset} from files")
 
-        # Select dataset
-        if dataset_split and dataset_split in data:
-            data = data[dataset_split]
+        # Select dataset split if needed
+        from datasets import DatasetDict
+
+        if isinstance(data, DatasetDict):
+            if dataset_split and dataset_split in data:
+                data = data[dataset_split]
+            elif "train" in data:
+                # Default to 'train' split if no split specified
+                data = data["train"]
+                strategy.print(f"No split specified, defaulting to 'train' split")
+            else:
+                # Use the first available split
+                first_split = list(data.keys())[0]
+                data = data[first_split]
+                strategy.print(f"No split specified, using '{first_split}' split")
+
         data = data.select(range(min(max_count, len(data))))
         data_list.append(data)
 
