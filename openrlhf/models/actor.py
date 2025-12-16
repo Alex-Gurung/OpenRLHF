@@ -145,6 +145,7 @@ class Actor(nn.Module):
         sequences: torch.LongTensor,
         action_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
         return_output=False,
         allgather_logits=False,
         return_logprobs=False,
@@ -166,7 +167,11 @@ class Actor(nn.Module):
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
 
-        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids)
+        # Pass token_type_ids if provided (needed for some models like Gemma3)
+        model_kwargs = {"attention_mask": foward_attention_mask, "position_ids": position_ids}
+        if token_type_ids is not None:
+            model_kwargs["token_type_ids"] = token_type_ids
+        output = self.model(sequences, **model_kwargs)
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
 

@@ -128,10 +128,11 @@ class KDTrainer(ABC):
             # train
             self.model.train()
             self.teacher_model.eval()
-            for inputs, attention_masks, loss_masks in self.train_dataloader:
+            for inputs, attention_masks, loss_masks, token_type_ids in self.train_dataloader:
                 inputs = inputs.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_masks.squeeze(1).to(torch.cuda.current_device())
-                output = self.model(inputs, attention_mask=attention_mask, return_output=True)
+                token_type_id = token_type_ids.squeeze(1).to(torch.cuda.current_device())
+                output = self.model(inputs, attention_mask=attention_mask, token_type_ids=token_type_id, return_output=True)
                 prompts_id_len = (loss_masks != 0).int().argmax(dim=-1).squeeze(-1)
 
                 # loss function
@@ -148,7 +149,7 @@ class KDTrainer(ABC):
                 gpt_loss = self.loss_fn(output.logits, labels)
 
                 with torch.no_grad():
-                    teacher_logits = self.teacher_model(inputs, attention_mask=attention_mask, return_output=True)[
+                    teacher_logits = self.teacher_model(inputs, attention_mask=attention_mask, token_type_ids=token_type_id, return_output=True)[
                         "logits"
                     ]
                 distil_loss = self.kd_loss(output.logits, teacher_logits, labels)
@@ -226,10 +227,11 @@ class KDTrainer(ABC):
                 disable=not self.strategy.is_rank_0(),
             )
 
-            for inputs, attention_masks, loss_masks in eval_dataloader:
+            for inputs, attention_masks, loss_masks, token_type_ids in eval_dataloader:
                 inputs = inputs.squeeze(1).to(torch.cuda.current_device())
                 attention_mask = attention_masks.squeeze(1).to(torch.cuda.current_device())
-                logits = self.model(inputs, attention_mask=attention_mask, return_output=True)["logits"]
+                token_type_id = token_type_ids.squeeze(1).to(torch.cuda.current_device())
+                logits = self.model(inputs, attention_mask=attention_mask, token_type_ids=token_type_id, return_output=True)["logits"]
                 prompts_id_len = (loss_masks != 0).int().argmax(dim=-1).squeeze(-1)
 
                 labels = torch.where(
