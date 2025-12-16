@@ -79,6 +79,13 @@ def blending_datasets(
         if isinstance(data, DatasetDict):
             if dataset_split and dataset_split in data:
                 data = data[dataset_split]
+                strategy.print(f"Using '{dataset_split}' split")
+            elif dataset_split:
+                # Split was specified but doesn't exist
+                available_splits = list(data.keys())
+                raise ValueError(
+                    f"Split '{dataset_split}' not found in dataset. Available splits: {available_splits}"
+                )
             elif "train" in data:
                 # Default to 'train' split if no split specified
                 data = data["train"]
