@@ -50,8 +50,9 @@ class SFTDataset(Dataset):
         strategy,
         input_template=None,
         pretrain_mode=False,
-        num_processors=8,  # Specify the number of processors you want to use
         multiturn=False,
+        enable_filtering=True,
+        num_processors=8,
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
@@ -72,40 +73,74 @@ class SFTDataset(Dataset):
             if tokenizer_chat_template:
                 self.tokenizer.chat_template = tokenizer_chat_template
 
-        # Parallel loading datasets
-        processed_dataset = dataset.map(
-            self.process_data,
-            remove_columns=dataset.column_names,
-            num_proc=num_processors,
-        )
-        processed_dataset = processed_dataset.filter(lambda x: x["prompt"] is not None)
+        # Optional lightweight filtering to remove invalid samples upfront
+        if enable_filtering:
+            filtered_dataset = dataset.filter(
+                self._is_valid_sample,
+                num_proc=num_processors,
+            )
+            self.dataset = filtered_dataset
+        else:
+            self.dataset = dataset
 
-        # Store the processed data in class attributes
-        self.prompts = processed_dataset["prompt"]
-        self.responses = processed_dataset["response"]
-        self.prompt_ids_lens = processed_dataset["prompt_ids_len"]
-        self.response_ranges = processed_dataset["response_ranges"] if self.multiturn else None
+    def _is_valid_sample(self, data):
+        """Lightweight validation without full tokenization to filter dataset upfront."""
+        try:
+            # Check basic data structure
+            if self.multiturn:
+                if not data.get(self.input_key):
+                    return False
+                messages = data[self.input_key]
+                if self.output_key and data.get(self.output_key):
+                    # Will be appended in __getitem__
+                    messages = list(messages) + [data[self.output_key]]
+                # Check if there's at least one assistant message
+                has_assistant = any(msg.get("role") == "assistant" for msg in messages if isinstance(msg, dict))
+                if not has_assistant:
+                    return False
+            else:
+                # For non-multiturn, check that required keys exist
+                if not data.get(self.input_key):
+                    return False
+                if not self.pretrain_mode and self.output_key and not data.get(self.output_key):
+                    return False
+            return True
+        except Exception:
+            return False
 
-    def process_data(self, data):
-        if self.multiturn and self.output_key:
-            data[self.input_key].append(data[self.output_key])
-            data[self.output_key] = None
+    def __len__(self):
+        return len(self.dataset)
 
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        response_ranges = None
+
+        # Build multi-turn response ranges lazily if needed
         if self.multiturn:
+            if self.output_key:
+                data = dict(data)
+                data[self.input_key] = list(data[self.input_key])
+                data[self.input_key].append(data[self.output_key])
+                data[self.output_key] = None
+
             assert (
                 not self.output_key or not data[self.output_key]
             ), "You should put the whole trajectory into data[input_key] and do not set output_key"
             input_key = self.input_key
             apply_chat_template = self.apply_chat_template
             response_ranges = []
-            for idx, message in enumerate(data[input_key]):
+            for msg_idx, message in enumerate(data[input_key]):
                 if message["role"] == "assistant":
-                    prompt = apply_chat_template(data[input_key][:idx], tokenize=False, add_generation_prompt=True)
-                    response = apply_chat_template(data[input_key][: idx + 1], tokenize=False)[len(prompt) :]
+                    prompt_text = apply_chat_template(
+                        data[input_key][:msg_idx], tokenize=False, add_generation_prompt=True
+                    )
+                    response_text = apply_chat_template(data[input_key][: msg_idx + 1], tokenize=False)[
+                        len(prompt_text) :
+                    ]
 
-                    start_idx = (
+                    start_token_idx = (
                         self.tokenizer(
-                            prompt,
+                            prompt_text,
                             max_length=self.max_length,
                             padding=False,
                             truncation=True,
@@ -117,10 +152,10 @@ class SFTDataset(Dataset):
                         .item()
                     )
 
-                    end_idx = (
-                        start_idx
+                    end_token_idx = (
+                        start_token_idx
                         + self.tokenizer(
-                            response,
+                            response_text,
                             max_length=self.max_length,
                             padding=False,
                             truncation=True,
@@ -132,7 +167,9 @@ class SFTDataset(Dataset):
                         .item()
                         - 1
                     )
-                    response_ranges.append((start_idx, end_idx))  # left close right close
+                    response_ranges.append((start_token_idx, end_token_idx))
+            if not response_ranges:
+                return None, None, None
 
         prompt, response = preprocess_data(
             data,
@@ -143,7 +180,13 @@ class SFTDataset(Dataset):
             multiturn=self.multiturn,
         )
 
-        if not self.pretrain_mode:
+        if self.pretrain_mode:
+            if not prompt:
+                return None, None, None
+            prompt_ids_len = 0
+        else:
+            if not prompt or not response:
+                return None, None, None
             prompt_token = self.tokenizer(
                 prompt,
                 max_length=self.max_length,
@@ -154,25 +197,8 @@ class SFTDataset(Dataset):
             )
             prompt_ids_len = prompt_token["attention_mask"].int().sum().item()
             # filter the sample whose length is greater than max_length (2 for answer length)
-            if not prompt or not response or prompt_ids_len >= self.max_length - 2:
-                prompt = None
-        else:
-            prompt_ids_len = 0
-
-        return {
-            "prompt": prompt,
-            "response": response,
-            "prompt_ids_len": prompt_ids_len,
-            "response_ranges": response_ranges if self.multiturn else None,
-        }
-
-    def __len__(self):
-        length = len(self.prompts)
-        return length
-
-    def __getitem__(self, idx):
-        prompt = self.prompts[idx]
-        response = self.responses[idx]
+            if prompt_ids_len >= self.max_length - 2:
+                return None, None, None
 
         if not self.pretrain_mode:
             text = (prompt + response).rstrip("\n")
@@ -191,7 +217,7 @@ class SFTDataset(Dataset):
         )
         input_ids = input_token["input_ids"]
         attention_mask = input_token["attention_mask"]
-        loss_mask = self.get_loss_mask(input_ids, idx)
+        loss_mask = self.get_loss_mask(input_ids, prompt_ids_len, response_ranges)
 
         if not self.pretrain_mode:
             # to avoid EOS_token truncation
@@ -199,18 +225,25 @@ class SFTDataset(Dataset):
             attention_mask[0][-1] = True
         return input_ids, attention_mask, loss_mask
 
-    def get_loss_mask(self, input_ids, idx):
+    def get_loss_mask(self, input_ids, prompt_ids_len=None, response_ranges=None):
         if self.pretrain_mode:
             return torch.ones_like(input_ids, dtype=torch.float32)  # shape:[1, seq_len]
 
         loss_mask = torch.zeros_like(input_ids, dtype=torch.float32)
         if not self.multiturn:
-            prompt_ids_len = self.prompt_ids_lens[idx]
-            loss_mask[0, prompt_ids_len - 1 : -1] = 1
+            seq_len = input_ids.size(1)
+            prompt_ids_len = prompt_ids_len or 0
+            prompt_ids_len = min(prompt_ids_len, seq_len)
+            start_idx = max(prompt_ids_len - 1, 0)
+            loss_mask[0, start_idx:-1] = 1
         else:
-            response_ranges = self.response_ranges[idx]
+            seq_len = input_ids.size(1)
+            response_ranges = response_ranges or []
             for start_idx, end_idx in response_ranges:
-                loss_mask[0, start_idx - 1 : end_idx] = 1
+                start_idx = max(start_idx - 1, 0)
+                end_idx = min(end_idx, seq_len - 1)
+                if start_idx <= end_idx:
+                    loss_mask[0, start_idx : end_idx + 1] = 1
         return loss_mask
 
     def collate_fn(self, item_list):
@@ -219,9 +252,14 @@ class SFTDataset(Dataset):
         loss_masks = []
 
         for input_id, attention_mask, loss_mask in item_list:
+            if input_id is None:
+                continue
             input_ids.append(input_id)
             attention_masks.append(attention_mask)
             loss_masks.append(loss_mask)
+
+        if not input_ids:
+            raise ValueError("All samples in the batch are invalid; check data quality or max_length.")
 
         input_ids = zero_pad_sequences(input_ids, "right", self.tokenizer.pad_token_id)
         attention_masks = zero_pad_sequences(attention_masks, "right")
