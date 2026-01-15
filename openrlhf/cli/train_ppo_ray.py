@@ -484,8 +484,8 @@ if __name__ == "__main__":
         "--generator_reward_mode",
         type=str,
         default="ll_delta",
-        choices=["ll_delta", "loo_generate", "direct"],
-        help="Generator reward mode in two-stage: ll_delta (likelihood delta), loo_generate (LOO correctness), or direct (per-sample reward model as in single-stage)",
+        choices=["ll_delta", "loo_generate", "direct", "mc"],
+        help="Generator reward mode in two-stage: ll_delta (likelihood delta), loo_generate (LOO correctness), direct (per-sample reward model), or mc (marginal contribution)",
     )
     parser.add_argument(
         "--loo_reward_correctness_diff",
@@ -524,6 +524,57 @@ if __name__ == "__main__":
         type=float,
         default=10.0,
         help="Scale factor for LL delta rewards to make them comparable to aggregator rewards (default: 10.0)",
+    )
+    # MC (Marginal Contribution) mode arguments
+    parser.add_argument(
+        "--mc_n_groups",
+        type=int,
+        default=24,
+        help="Total number of groups to sample per problem for MC computation",
+    )
+    parser.add_argument(
+        "--mc_group_size",
+        type=int,
+        default=4,
+        help="Number of solutions per group in MC aggregation",
+    )
+    parser.add_argument(
+        "--mc_n_trials",
+        type=int,
+        default=3,
+        help="Number of aggregator trials per group (for RLOO baseline)",
+    )
+    parser.add_argument(
+        "--mc_groups_per_solution",
+        type=int,
+        default=None,
+        help="Target appearances per solution (overrides mc_n_groups if set)",
+    )
+    parser.add_argument(
+        "--mc_sampling_strategy",
+        type=str,
+        default="balanced",
+        choices=["balanced", "random"],
+        help="Group sampling strategy for MC: balanced ensures equal appearances",
+    )
+    parser.add_argument(
+        "--mc_reward_func_path",
+        type=str,
+        default=None,
+        help="Path to Python file with mc_reward_func(prompts, outputs, labels) -> List[float]",
+    )
+    parser.add_argument(
+        "--mc_template_func_path",
+        type=str,
+        default=None,
+        help="Path to Python file with aggregation_template function for MC mode",
+    )
+    parser.add_argument(
+        "--mc_vllm_server_url",
+        type=str,
+        default=None,
+        help="External vLLM server URL for frozen aggregator (e.g., http://localhost:8000). "
+             "If set, aggregator generation uses this server instead of the shared model.",
     )
     parser.add_argument(
         "--score_generator_samples",

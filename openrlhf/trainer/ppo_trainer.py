@@ -20,6 +20,7 @@ from openrlhf.trainer.ppo_utils.group_aggregation import (
     default_aggregation_template,
     process_responses_for_aggregation,
 )
+from openrlhf.trainer.ppo_utils.mc_trainer_mixin import MCTrainerMixin
 from openrlhf.trainer.ppo_utils.replay_buffer import balance_experiences
 from openrlhf.trainer.ray.launcher import RayActorGroup
 from openrlhf.models.utils import masked_mean
@@ -1213,6 +1214,12 @@ class BasePPOTrainer(ABC):
             elif self.generator_reward_mode == "direct":
                 # Leave rewards untouched; they will be computed per-sample by the reward model in make_experience_batch.
                 pass
+            elif self.generator_reward_mode == "mc":
+                # Use MC aggregation for generator rewards
+                mc_rollouts, mc_agg_rollouts, mc_result = self._run_mc_rewards(rollout_samples)
+                rollout_samples = mc_rollouts
+                # Extend aggregator rollouts with MC samples
+                aggregator_rollouts.extend(mc_agg_rollouts)
             else:
                 raise ValueError(f"Unknown generator_reward_mode {self.generator_reward_mode}")
 
@@ -1420,7 +1427,7 @@ class BasePPOTrainer(ABC):
 
 
 @ray.remote
-class PPOTrainer(BasePPOTrainer):
+class PPOTrainer(MCTrainerMixin, BasePPOTrainer):
     """
     Trainer for Proximal Policy Optimization (PPO) / REINFORCE++ / GRPO / RLOO and their variants.
     Single Controller with Multiple ActorGroups
@@ -1492,6 +1499,10 @@ class PPOTrainer(BasePPOTrainer):
         self.ll_delta_normalize = getattr(self.args, "ll_delta_normalize", False)
         self.ll_delta_reward_scale = getattr(self.args, "ll_delta_reward_scale", 10.0)
         self.loo_reward_correctness_diff = getattr(self.args, "loo_reward_correctness_diff", False)
+
+        # MC (Marginal Contribution) mode initialization
+        if self.generator_reward_mode == "mc":
+            self._init_mc_aggregation()
 
         # Optional two-stage aggregation (shared actor/vLLM by default)
         self.use_two_stage = getattr(self.args, "use_two_stage", False)
