@@ -311,7 +311,12 @@ class SamplesGenerator:
         if exhausted:
             return [], prompts_consumed, exhausted
 
-        pending_refs = self._dispatch_prompts_to_vllm(prompts, labels, **generate_kwargs)
+        # Track group IDs for each prompt (for MC reward computation)
+        group_id_counter = getattr(self, "_group_id_counter", 0)
+        group_ids = list(range(group_id_counter, group_id_counter + len(prompts)))
+        self._group_id_counter = group_id_counter + len(prompts)
+
+        pending_refs = self._dispatch_prompts_to_vllm(prompts, labels, group_ids=group_ids, **generate_kwargs)
         prompts_consumed += len(prompts)
 
         accepted_experiences: List[Experience] = []
@@ -354,13 +359,30 @@ class SamplesGenerator:
                         return [], prompts_consumed, True
                     # Otherwise dispatch the new prompt to keep filling the queue.
                     else:
-                        new_refs = self._dispatch_prompts_to_vllm(new_prompts, new_labels, **generate_kwargs)
+                        new_group_ids = [self._group_id_counter]
+                        self._group_id_counter += 1
+                        new_refs = self._dispatch_prompts_to_vllm(
+                            new_prompts, new_labels, group_ids=new_group_ids, **generate_kwargs
+                        )
                         pending_refs.extend(new_refs)
 
         return accepted_experiences, prompts_consumed, exhausted
 
-    def _dispatch_prompts_to_vllm(self, prompts: List[str], labels: List[str], **generate_kwargs) -> List:
-        """Send prompts to rollout executors and return Ray object refs."""
+    def _dispatch_prompts_to_vllm(
+        self, prompts: List[str], labels: List[str], group_ids: List[int] = None, **generate_kwargs
+    ) -> List:
+        """Send prompts to rollout executors and return Ray object refs.
+
+        Args:
+            prompts: List of prompt strings
+            labels: List of labels for each prompt
+            group_ids: Optional list of group IDs for tracking (for MC reward computation)
+            **generate_kwargs: Generation parameters
+        """
+        # Default group_ids if not provided
+        if group_ids is None:
+            group_ids = list(range(len(prompts)))
+
         sampling_params = SamplingParams(
             temperature=generate_kwargs.get("temperature", 1.0),
             top_p=generate_kwargs.get("top_p", 1.0),
@@ -395,6 +417,7 @@ class SamplesGenerator:
                 max_length=truncate_length,
                 hf_tokenizer=self.tokenizer,
                 num_samples=self.args.n_samples_per_prompt,
+                group_id=group_ids[idx],
             )
             refs.append(ref)
 
@@ -439,6 +462,10 @@ class SamplesGenerator:
             "total_length": torch.tensor([total_length]),
             "response_clip_ratio": torch.tensor([is_clipped]),
         }
+        # Track group_id for MC reward computation
+        group_id = response.get("group_id")
+        if group_id is not None:
+            info["group_id"] = torch.tensor([group_id])
         if reward_val is not None:
             info["reward"] = torch.tensor([reward_val])
         if score_val is not None:
@@ -525,13 +552,19 @@ class RemoteExperienceMaker:
         return samples_list
 
     @torch.no_grad()
-    def make_experience_batch(self, rollout_samples) -> List[Experience]:
+    def make_experience_batch(self, rollout_samples, group_size: int = None) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
 
         This method will first calculate the response sequences and rewards for the given prompts.
         Then, if we need certain processing for the rewards or do certain filtering, we can process the rollout as a whole.
         After that, we will calculate the advantages and returns for each experience.
+
+        Args:
+            rollout_samples: List of Experience objects from generate_samples
+            group_size: Override for n_samples_per_prompt in advantage computation.
+                       If None, uses args.n_samples_per_prompt.
+                       Use this for MC aggregator training with different group structures.
         """
         # Each batch of samples will be scheduled to a effective Ray Actor (i.e, a DP rank)
         samples_list = self.split_rollout_samples(rollout_samples)
@@ -540,7 +573,7 @@ class RemoteExperienceMaker:
         experiences = self.make_experience(samples_list)
 
         # Process experiences (reward shaping, etc.)
-        experiences = self.compute_advantages_and_returns(experiences)
+        experiences = self.compute_advantages_and_returns(experiences, group_size=group_size)
         return experiences
 
     @torch.no_grad()
@@ -672,6 +705,12 @@ class RemoteExperienceMaker:
             samples.kl = kl
             samples.info["kl"] = kl_mean
 
+            # Handle missing rollout_log_probs for IS correction compatibility
+            # This happens with MC aggregator samples that don't come from vLLM
+            # Setting rollout_log_probs = action_log_probs makes IS ratio = 1.0 (neutral)
+            if samples.rollout_log_probs is None and args.enable_vllm_is_correction:
+                samples.rollout_log_probs = action_log_probs.clone()
+
         end_time = time.time()
         duration = end_time - start_time
         time_str = str(timedelta(seconds=duration)).split(".")[0]
@@ -680,7 +719,7 @@ class RemoteExperienceMaker:
 
     @torch.no_grad()
     def compute_advantages_and_returns(
-        self, experiences: List[Experience], **kwargs
+        self, experiences: List[Experience], group_size: int = None, **kwargs
     ) -> Tuple[List[Experience], List[torch.Tensor]]:
         """
         Process experiences, this can be used to filter out some experiences or do some processing on the rewards.
@@ -688,11 +727,19 @@ class RemoteExperienceMaker:
             >>> rewards: [0, 1, 0.5, 1], indices: [1, 2, 0, 3], n_samples_per_prompt: 2
             >>> sorted rewards: [0,5, 0, 1, 1], reward shaping: [0.25, 0.25, 1, 1]
             >>> map back: [0.25, 1, 0.25, 1]
+
+        Args:
+            experiences: List of Experience objects
+            group_size: Override for n_samples_per_prompt. If None, uses args.n_samples_per_prompt.
+                       Use this for MC aggregator training with different group structures.
+
         Output:
         - experiences: List of Experience
         - rewards: List of rewards
         """
         args = self.strategy.args
+        # Allow overriding group size for MC aggregator training
+        n_samples_per_prompt = group_size if group_size is not None else args.n_samples_per_prompt
 
         # DAPO reward shaping with optional overlong penalty - Apply BEFORE dynamic indices processing
         if args.overlong_buffer_len is not None:
@@ -724,20 +771,24 @@ class RemoteExperienceMaker:
         rewards = torch.empty_like(raw_rewards)
         rewards[indices] = raw_rewards  # sorted
 
-        rewards = rewards.reshape(-1, args.n_samples_per_prompt)
+        rewards = rewards.reshape(-1, n_samples_per_prompt)
 
         # log group reward std
-        if args.n_samples_per_prompt > 1:
+        if n_samples_per_prompt > 1:
             group_reward_stds = (
-                rewards.std(-1, keepdim=True).repeat(1, args.n_samples_per_prompt).reshape(-1)[indices].split(exp_len)
+                rewards.std(-1, keepdim=True).repeat(1, n_samples_per_prompt).reshape(-1)[indices].split(exp_len)
             )
             for experience, group_reward_std in zip(experiences, group_reward_stds):
                 experience.info["group_reward_std"] = group_reward_std
 
         # reward shaping
         if args.advantage_estimator == "rloo":
-            baseline = (rewards.sum(-1, keepdim=True) - rewards) / (args.n_samples_per_prompt - 1)
-            rewards = rewards - baseline
+            # Handle group_size == 1: fall back to simple reinforce (no baseline)
+            if n_samples_per_prompt == 1:
+                logger.warning("RLOO with group_size=1 has no baseline, using simple rewards")
+            else:
+                baseline = (rewards.sum(-1, keepdim=True) - rewards) / (n_samples_per_prompt - 1)
+                rewards = rewards - baseline
         elif args.advantage_estimator in ["reinforce_baseline", "dr_grpo"]:
             # REINFORCE++-baseline and Dr. GRPO removed the `/std` in GRPO as `/ std` is not needed in RL variance reduction theory.
             # And `k3 KL` has a larger variance than `k1 KL` under a categorical distribution.

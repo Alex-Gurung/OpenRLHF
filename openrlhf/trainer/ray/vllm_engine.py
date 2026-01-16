@@ -165,8 +165,21 @@ class LLMRayActor:
         max_length: int,
         hf_tokenizer,
         num_samples: int = 1,
+        group_id: Optional[int] = None,
+        skip_reward: bool = False,
     ):
-        """Generate N samples for a single prompt."""
+        """Generate N samples for a single prompt.
+
+        Args:
+            prompt: The prompt string
+            label: Label/metadata for scoring
+            sampling_params: vLLM SamplingParams
+            max_length: Maximum sequence length
+            hf_tokenizer: Tokenizer for decoding
+            num_samples: Number of samples to generate
+            group_id: Optional group identifier for tracking samples by prompt
+            skip_reward: If True, skip executor's reward computation (caller will score separately)
+        """
         tasks = [
             self.executor.execute(
                 prompt=prompt,
@@ -175,6 +188,8 @@ class LLMRayActor:
                 max_length=max_length,
                 hf_tokenizer=hf_tokenizer,
                 llm_engine=self,
+                group_id=group_id,
+                skip_reward=skip_reward,
             )
             for _ in range(num_samples)
         ]

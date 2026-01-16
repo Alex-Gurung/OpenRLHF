@@ -98,6 +98,33 @@ class BasePPOTrainer(ABC):
             tokenizer,
         )
 
+        # MC config loaded here, but MCRewardComputer created lazily in _ensure_mc_computer()
+        # This is because vllm_lock may be set after __init__ in async mode (TrainingActor)
+        self.mc_computer = None
+        self._mc_config = None
+        if getattr(self.args, "mc_config_path", None):
+            from openrlhf.trainer.ppo_utils.mc import load_mc_config
+
+            self._mc_config = load_mc_config(self.args.mc_config_path)
+            # Override config params from CLI args
+            self._mc_config.group_size = getattr(self.args, "mc_group_size", self._mc_config.group_size)
+            self._mc_config.quota = getattr(self.args, "mc_quota", self._mc_config.quota)
+            self._mc_config.n_trials = getattr(self.args, "mc_n_trials", self._mc_config.n_trials)
+            # Filtering params
+            self._mc_config.filter_solutions = getattr(self.args, "mc_filter_solutions", self._mc_config.filter_solutions)
+            if hasattr(self.args, "mc_filter_reward_range") and self.args.mc_filter_reward_range:
+                self._mc_config.filter_reward_range = tuple(self.args.mc_filter_reward_range)
+            # Streaming params
+            self._mc_config.streaming_batch_size = getattr(
+                self.args, "mc_streaming_batch_size", self._mc_config.streaming_batch_size
+            )
+            logger.info(
+                f"MC reward computation enabled: group_size={self._mc_config.group_size}, "
+                f"quota={self._mc_config.quota}, n_trials={self._mc_config.n_trials}, "
+                f"filter_solutions={self._mc_config.filter_solutions}, "
+                f"streaming_batch_size={self._mc_config.streaming_batch_size}"
+            )
+
         # Tracking backends
         self.wandb_logger = WandbLogger(self.args) if self.args.use_wandb else None
         self.tensorboard_logger = TensorboardLogger(self.args) if self.args.use_tensorboard else None
@@ -105,9 +132,57 @@ class BasePPOTrainer(ABC):
     def fit(self):
         raise NotImplementedError("fit method is not implemented")
 
+    def _ensure_mc_computer(self):
+        """Lazily initialize MCRewardComputer on first use.
+
+        This handles the async mode case where vllm_lock is set AFTER __init__
+        (in TrainingActor, vllm_lock is set after super().__init__()).
+        """
+        if self._mc_config is not None and self.mc_computer is None:
+            from openrlhf.trainer.ppo_utils.mc import MCRewardComputer
+
+            self.mc_computer = MCRewardComputer(
+                self._mc_config,
+                self.vllm_engines,
+                self.tokenizer,
+                vllm_enable_sleep=getattr(self.args, "vllm_enable_sleep", False),
+                vllm_lock=getattr(self, "vllm_lock", None),  # Now correctly captures async lock
+                enable_vllm_is_correction=getattr(self.args, "enable_vllm_is_correction", False),
+            )
+
     def train_step(self, rollout_samples, global_step: int) -> Tuple[Dict, int]:
+        # Ensure MC computer is initialized (lazy init for async mode compatibility)
+        self._ensure_mc_computer()
+
+        # Run MC reward computation BEFORE experience making if configured
+        # This writes MC rewards to rollout_samples, so experience_maker skips reward model
+        mc_metrics = {}
+        agg_samples = []
+        if self.mc_computer is not None:
+            mc_metrics, agg_samples = self.mc_computer.compute_and_apply(
+                rollout_samples,
+                self.args.n_samples_per_prompt,
+            )
+
         # Turn raw rollouts into PPO-ready trajectories with rewards.
         experiences = self.experience_maker.make_experience_batch(rollout_samples)
+
+        # Wire up aggregator training if configured
+        mc_aggregator_weight = getattr(self.args, "mc_aggregator_weight", 0.0)
+        mc_n_trials = getattr(self.args, "mc_n_trials", 1)
+        if mc_aggregator_weight > 0 and agg_samples:
+            # Scale rewards to control gradient contribution
+            for sample in agg_samples:
+                sample.rewards = sample.rewards * mc_aggregator_weight
+                if sample.info and "reward" in sample.info:
+                    sample.info["reward"] = sample.info["reward"] * mc_aggregator_weight
+
+            # Build aggregator experiences with different group_size for RLOO
+            agg_experiences = self.experience_maker.make_experience_batch(
+                agg_samples, group_size=mc_n_trials
+            )
+            # Merge - after advantages computed, samples are independent
+            experiences = experiences + agg_experiences
 
         # Peek at the first decoded sample for quick sanity check.
         sample0 = [
@@ -128,6 +203,9 @@ class BasePPOTrainer(ABC):
 
         # Perform PPO optimization for actor/critic and gather metrics.
         status = self.ppo_train(global_step)
+
+        # Add MC metrics to status
+        status.update(mc_metrics)
 
         # Sync weights to vLLM.
         if self.vllm_engines is not None:

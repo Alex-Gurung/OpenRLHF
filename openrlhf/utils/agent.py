@@ -11,7 +11,15 @@ logger = init_logger(__name__)
 
 class AgentExecutorBase(ABC):
     @abstractmethod
-    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
+    async def execute(
+        self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, group_id=None, skip_reward=False
+    ):
+        """Execute generation for a single prompt.
+
+        Args:
+            skip_reward: If True, skip any reward computation (caller will score separately).
+                        Used by MC aggregation to avoid double-scoring.
+        """
         raise NotImplementedError("AgentExecutorBase.execute is not implemented")
 
 
@@ -33,8 +41,11 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
         assert issubclass(agent_instance_cls, AgentInstanceBase), "AgentInstance must inherit from AgentInstanceBase"
         self.agent_instance_cls = agent_instance_cls
 
-    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
+    async def execute(
+        self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, group_id=None, skip_reward=False
+    ):
         # Treat each AgentInstance as an isolated environment; bind every prompt to its own independent instance
+        # Note: skip_reward is accepted for API consistency but not used here (rewards come from agent step)
         agent_instance = self.agent_instance_cls()
 
         # Initialize with reset function
@@ -138,6 +149,7 @@ class MultiTurnAgentExecutor(AgentExecutorBase):
             "action_ranges": action_ranges,
             "rollout_log_probs": rollout_log_probs,
             "extra_logs": extra_logs,
+            "group_id": group_id,
         }
         return final_response
 
@@ -160,7 +172,9 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
             spec.loader.exec_module(reward_module)
             self.reward_func = reward_module.reward_func
 
-    async def execute(self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine):
+    async def execute(
+        self, prompt, label, sampling_params, max_length: int, hf_tokenizer, llm_engine, group_id=None, skip_reward=False
+    ):
         # Tokenize the initial observation.
         prompt_token_ids = hf_tokenizer(prompt, add_special_tokens=False, return_tensors="pt")["input_ids"][0].tolist()
 
@@ -202,10 +216,12 @@ class SingleTurnAgentExecutor(AgentExecutorBase):
             "reward": None,
             "scores": None,
             "extra_logs": {},
+            # Group tracking for MC.
+            "group_id": group_id,
         }
 
-        # Compute reward/score after generation.
-        if self.reward_endpoints:
+        # Compute reward/score after generation (skip if caller will score separately).
+        if self.reward_endpoints and not skip_reward:
             try:
                 query = hf_tokenizer.decode(output["observation_tokens"], skip_special_tokens=False)
                 if self.reward_func:

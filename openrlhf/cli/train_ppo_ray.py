@@ -473,6 +473,42 @@ if __name__ == "__main__":
         "--dynamic_filtering_reward_range", nargs=2, default=(0, 1), type=float, help="Dynamic filtering rewards range"
     )
 
+    # Marginal Contribution (MC) reward computation
+    parser.add_argument(
+        "--mc_config_path",
+        type=str,
+        default=None,
+        help="Path to Python file with mc_config = MCConfig(...) for MC-based reward computation",
+    )
+    parser.add_argument("--mc_group_size", type=int, default=4, help="MC aggregation group size (k)")
+    parser.add_argument("--mc_quota", type=int, default=4, help="MC quota: each solution appears in this many groups")
+    parser.add_argument("--mc_n_trials", type=int, default=1, help="MC aggregator trials per group")
+    parser.add_argument(
+        "--mc_aggregator_weight",
+        type=float,
+        default=0.0,
+        help="Weight for aggregator PPO training (0=skip aggregator training, 1=equal to generator)",
+    )
+    parser.add_argument(
+        "--mc_filter_solutions",
+        action="store_true",
+        default=False,
+        help="Enable DAPO-style filtering of generator solutions based on reward",
+    )
+    parser.add_argument(
+        "--mc_filter_reward_range",
+        nargs=2,
+        type=float,
+        default=(-1.0, 1.0),
+        help="(min, max) reward range for solution filtering. Solutions outside this range are excluded.",
+    )
+    parser.add_argument(
+        "--mc_streaming_batch_size",
+        type=int,
+        default=0,
+        help="Batch size for streaming generation+scoring. 0 disables streaming.",
+    )
+
     # TensorBoard parameters
     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")
 
