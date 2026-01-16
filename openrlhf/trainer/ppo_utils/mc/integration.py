@@ -662,24 +662,43 @@ class MCRewardComputer:
             prob = problem_by_idx.get(prob_idx)
             label = prob.label if prob else None
 
-            # Extract text from response dict
-            output = response["text"]
+            # Extract from response dict - use observation_tokens directly from vLLM
+            # to ensure rollout_log_probs aligns correctly
+            output_text = response["text"]
             rollout_log_probs_raw = response.get("rollout_log_probs")
+            observation_tokens = response.get("observation_tokens", [])
+            action_ranges = response.get("action_ranges", [])
 
             # Handle empty outputs: use a dummy token to maintain group contiguity
             # Set reward to -1 (failure) for empty outputs
-            if not output:
-                output = self.tokenizer.eos_token or "</s>"
+            if not observation_tokens:
+                # Fallback: tokenize prompt + dummy output
+                dummy_output = self.tokenizer.eos_token or "</s>"
+                full_text = prompt + dummy_output
+                tokens = self.tokenizer(full_text, add_special_tokens=False, return_tensors="pt")
+                sequences = tokens["input_ids"]
+                attention_mask = tokens["attention_mask"]
+                prompt_tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
+                prompt_len = prompt_tokens["input_ids"].shape[1]
+                seq_len = sequences.shape[1]
+                response_len = seq_len - prompt_len
                 reward = -1.0
+                rollout_log_probs_raw = None  # No logprobs for fallback
+            else:
+                # Use tokens directly from vLLM (already aligned with rollout_log_probs)
+                sequences = torch.tensor(observation_tokens).unsqueeze(0)
+                attention_mask = torch.ones_like(sequences)
+                seq_len = len(observation_tokens)
 
-            # Tokenize prompt + output
-            full_text = prompt + output
-            tokens = self.tokenizer(full_text, add_special_tokens=False, return_tensors="pt")
-            prompt_tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
+                # Get prompt_len from action_ranges (more reliable than re-tokenizing)
+                if action_ranges:
+                    prompt_len = action_ranges[0][0]  # Start of first action range
+                else:
+                    # Fallback: tokenize prompt to get length
+                    prompt_tokens = self.tokenizer(prompt, add_special_tokens=False, return_tensors="pt")
+                    prompt_len = prompt_tokens["input_ids"].shape[1]
 
-            seq_len = tokens["input_ids"].shape[1]
-            prompt_len = prompt_tokens["input_ids"].shape[1]
-            response_len = seq_len - prompt_len
+                response_len = seq_len - prompt_len
 
             # Create action_mask (1 for response tokens, 0 for prompt)
             # In experience_maker.py, action_mask is created full-length then sliced with [1:]:
@@ -692,22 +711,23 @@ class MCRewardComputer:
                 action_mask[prompt_len - 1 :] = True
 
             # Process rollout_log_probs if available (for IS correction)
-            # Align with action_mask: apply [1:] offset like experience_maker does
+            # rollout_log_probs_raw is aligned with observation_tokens from vLLM
+            # Apply [1:] offset to match action_mask shape
             rollout_log_probs = None
-            if rollout_log_probs_raw is not None:
-                # rollout_log_probs_raw is a list of length seq_len (prompt + response)
-                # Apply [1:seq_len] slice to match action_mask shape
-                rlp_len = min(len(rollout_log_probs_raw), seq_len)
-                if rlp_len > 1:
-                    rollout_log_probs = torch.tensor(rollout_log_probs_raw[1:rlp_len]).to("cpu")
-                    # Pad to match action_mask length if needed
-                    if len(rollout_log_probs) < seq_len - 1:
-                        pad_len = seq_len - 1 - len(rollout_log_probs)
-                        rollout_log_probs = torch.cat([
-                            rollout_log_probs,
-                            torch.zeros(pad_len),
-                        ])
-                    rollout_log_probs = rollout_log_probs.unsqueeze(0)
+            if rollout_log_probs_raw is not None and len(rollout_log_probs_raw) > 1:
+                # rollout_log_probs_raw has length seq_len (prompt placeholders + response logprobs)
+                # Apply [1:] slice to match action_mask shape (seq_len - 1)
+                rollout_log_probs = torch.tensor(rollout_log_probs_raw[1:]).to("cpu")
+                # Ensure length matches action_mask
+                if len(rollout_log_probs) > seq_len - 1:
+                    rollout_log_probs = rollout_log_probs[: seq_len - 1]
+                elif len(rollout_log_probs) < seq_len - 1:
+                    pad_len = seq_len - 1 - len(rollout_log_probs)
+                    rollout_log_probs = torch.cat([
+                        rollout_log_probs,
+                        torch.zeros(pad_len),
+                    ])
+                rollout_log_probs = rollout_log_probs.unsqueeze(0)
 
             # Create info dict with tensors (not tuples!) for _merge_item compatibility
             # _merge_item merges dicts by recursively merging values of each key
@@ -723,8 +743,8 @@ class MCRewardComputer:
 
             # Create proper Experience object with rollout_log_probs for IS correction
             sample = Experience(
-                sequences=tokens["input_ids"],
-                attention_mask=tokens["attention_mask"],
+                sequences=sequences,
+                attention_mask=attention_mask,
                 action_mask=action_mask.unsqueeze(0),
                 rollout_log_probs=rollout_log_probs,
                 prompts=[prompt],

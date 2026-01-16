@@ -78,6 +78,12 @@ class MCConfig:
     """Batch size for streaming generation+scoring. 0 disables streaming (all at once).
     When > 0, overlaps aggregation scoring with next batch generation for better throughput."""
 
+    # Prompt suffix for generator (e.g., summary instruction)
+    prompt_suffix: Optional[str] = None
+    """Text appended to generator prompts at data loading time.
+    Use this to add summary instructions for summary-based MC aggregation.
+    The aggregation_builder should strip this before building the aggregator prompt."""
+
     def __post_init__(self):
         """Validate configuration."""
         if self.group_size < 1:

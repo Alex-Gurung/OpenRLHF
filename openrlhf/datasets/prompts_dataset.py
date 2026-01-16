@@ -2,7 +2,14 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 
-def preprocess_data(data, input_template=None, input_key="input", label_key=None, apply_chat_template=None) -> str:
+def preprocess_data(
+    data,
+    input_template=None,
+    input_key="input",
+    label_key=None,
+    apply_chat_template=None,
+    prompt_suffix=None,
+) -> str:
     if apply_chat_template:
         chat = data[input_key]
         if isinstance(chat, str):
@@ -12,6 +19,10 @@ def preprocess_data(data, input_template=None, input_key="input", label_key=None
         prompt = data[input_key]
         if input_template:
             prompt = input_template.format(prompt)
+
+    # Append suffix if provided (e.g., summary instruction for MC training)
+    if prompt_suffix:
+        prompt = prompt + prompt_suffix
 
     # for Reinforced Fine-tuning
     label = "" if label_key is None else data[label_key]
@@ -48,11 +59,23 @@ class PromptDataset(Dataset):
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
 
+        # Load prompt suffix from MC config if available
+        prompt_suffix = None
+        mc_config_path = getattr(self.strategy.args, "mc_config_path", None)
+        if mc_config_path:
+            try:
+                from openrlhf.trainer.ppo_utils.mc import load_mc_config
+
+                mc_config = load_mc_config(mc_config_path)
+                prompt_suffix = getattr(mc_config, "prompt_suffix", None)
+            except Exception:
+                pass  # MC config may not have prompt_suffix
+
         self.prompts = []
         self.labels = []
         self.datasources = []
         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
-            prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
+            prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template, prompt_suffix)
             self.prompts.append(prompt)
             self.labels.append(label)
             self.datasources.append(data.get("datasource", "default"))
