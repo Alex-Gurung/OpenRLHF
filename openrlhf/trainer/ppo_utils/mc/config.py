@@ -43,7 +43,7 @@ class MCConfig:
     """m: Number of aggregator samples per group"""
 
     # Generation parameters for aggregator
-    aggregator_temperature: float = 0.7
+    aggregator_temperature: float = 1.0
     """Temperature for aggregator generation"""
 
     aggregator_max_tokens: int = 2048

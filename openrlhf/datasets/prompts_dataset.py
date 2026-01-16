@@ -10,19 +10,32 @@ def preprocess_data(
     apply_chat_template=None,
     prompt_suffix=None,
 ) -> str:
+    # Get raw content first
+    content = data[input_key]
+
+    # Append suffix to content BEFORE applying chat template
+    # This ensures the suffix appears inside the user message, not after <|assistant|>
+    if prompt_suffix:
+        if isinstance(content, str):
+            content = content + prompt_suffix
+        elif isinstance(content, list):
+            # For chat format, append to the last user message
+            content = list(content)  # Make a copy
+            for i in range(len(content) - 1, -1, -1):
+                if content[i].get("role") == "user":
+                    content[i] = {**content[i], "content": content[i]["content"] + prompt_suffix}
+                    break
+
+    # Now apply chat template (suffix is already in the content)
     if apply_chat_template:
-        chat = data[input_key]
+        chat = content
         if isinstance(chat, str):
             chat = [{"role": "user", "content": chat}]
         prompt = apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
     else:
-        prompt = data[input_key]
+        prompt = content
         if input_template:
             prompt = input_template.format(prompt)
-
-    # Append suffix if provided (e.g., summary instruction for MC training)
-    if prompt_suffix:
-        prompt = prompt + prompt_suffix
 
     # for Reinforced Fine-tuning
     label = "" if label_key is None else data[label_key]
