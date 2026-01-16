@@ -1,6 +1,7 @@
 """MC reward computation orchestration and vLLM integration."""
 
 import concurrent.futures
+import logging
 import math
 from collections import defaultdict
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from openrlhf.trainer.ppo_utils.mc.computation import MCResult, aggregate_mc_sta
 from openrlhf.trainer.ppo_utils.mc.config import MCConfig
 from openrlhf.trainer.ppo_utils.mc.sampling import quota_sample_groups
 from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -232,24 +235,24 @@ class MCRewardComputer:
         problems: List[ProblemData],
         gen_rewards: Dict[int, float],
     ) -> Tuple[List[ProblemData], Dict[int, float], Dict[str, float], Dict[int, float]]:
-        """Filter solutions based on reward range (DAPO-style).
+        """Filter prompts based on mean reward range (DAPO-style, prompt-level).
 
-        Removes solutions with rewards outside filter_reward_range from MC computation.
-        Skips problems that have fewer than group_size solutions remaining.
+        Computes the mean generator reward per prompt and keeps only prompts whose
+        mean reward is within filter_reward_range. This is a prompt-level filter,
+        not per-solution.
 
-        IMPORTANT: Filtered-out samples still need rewards to avoid mixed None/tensor
-        state in experience_maker. The returned excluded_rewards dict maps filtered
-        sample indices to their generator rewards (used as fallback).
+        IMPORTANT: Filtered-out prompts still need rewards to avoid mixed None/tensor
+        state in experience_maker. The returned excluded_rewards dict maps all
+        sample indices in filtered-out prompts to their generator rewards.
 
         Returns:
             (filtered_problems, filtered_gen_rewards, filter_metrics, excluded_rewards):
-                - filtered_problems: Problems with enough valid solutions for MC
-                - filtered_gen_rewards: Rewards for kept solutions
+                - filtered_problems: Problems kept for MC computation
+                - filtered_gen_rewards: Rewards for samples in kept prompts
                 - filter_metrics: Logging metrics
-                - excluded_rewards: sample_idx -> gen_reward for filtered-out samples
+                - excluded_rewards: sample_idx -> gen_reward for filtered-out prompts
         """
         min_r, max_r = self.config.filter_reward_range
-        min_solutions = self.config.group_size
 
         filtered_problems = []
         filtered_gen_rewards = {}
@@ -261,40 +264,25 @@ class MCRewardComputer:
         kept_problems = 0
 
         for prob in problems:
-            # Filter solutions for this problem
-            filtered_solutions = []
-            filtered_indices = []
-
-            for sol_idx, (solution, sample_idx) in enumerate(zip(prob.solutions, prob.sample_indices)):
+            # Compute mean reward for this prompt
+            rewards = []
+            for sample_idx in prob.sample_indices:
                 total_solutions += 1
-                reward = gen_rewards.get(sample_idx, 0.0)
+                rewards.append(gen_rewards.get(sample_idx, 0.0))
 
-                # Keep solution if reward is within range (inclusive bounds)
-                if min_r <= reward <= max_r:
-                    filtered_solutions.append(solution)
-                    filtered_indices.append(sample_idx)
+            mean_reward = float(np.mean(rewards)) if rewards else 0.0
+
+            # Keep prompt if mean reward is within range (inclusive bounds)
+            if min_r <= mean_reward <= max_r:
+                filtered_problems.append(prob)
+                kept_problems += 1
+                for sample_idx, reward in zip(prob.sample_indices, rewards):
                     filtered_gen_rewards[sample_idx] = reward
                     kept_solutions += 1
-                else:
-                    # Track excluded samples with their generator reward as fallback
-                    excluded_rewards[sample_idx] = reward
-
-            # Keep problem if enough solutions remain
-            if len(filtered_solutions) >= min_solutions:
-                filtered_problems.append(
-                    ProblemData(
-                        prompt_idx=prob.prompt_idx,
-                        prompt=prob.prompt,
-                        label=prob.label,
-                        solutions=filtered_solutions,
-                        sample_indices=filtered_indices,
-                    )
-                )
-                kept_problems += 1
             else:
-                # Problem dropped entirely - all its solutions go to excluded_rewards
-                for sample_idx in filtered_indices:
-                    excluded_rewards[sample_idx] = filtered_gen_rewards.pop(sample_idx)
+                # Prompt dropped entirely - all its solutions go to excluded_rewards
+                for sample_idx, reward in zip(prob.sample_indices, rewards):
+                    excluded_rewards[sample_idx] = reward
 
         # Compute filter metrics
         filter_metrics = {
@@ -340,12 +328,25 @@ class MCRewardComputer:
         all_labels = []
         metadata = []  # (problem_idx, group_indices, trial_idx) for each prompt
 
+        # Track aggregation_builder stats across all groups
+        aggregated_stats: Dict[str, float] = {}
+
         problem_by_idx = {p.prompt_idx: p for p in problems}
 
         for prob_idx, group_indices in all_groups:
             prob = problem_by_idx[prob_idx]
             group_solutions = [prob.solutions[i] for i in group_indices]
-            agg_prompt = self.config.aggregation_builder(prob.prompt, group_solutions)
+            result = self.config.aggregation_builder(prob.prompt, group_solutions)
+
+            # Handle tuple return (prompt, stats) or plain string
+            if isinstance(result, tuple):
+                agg_prompt, stats = result
+                # Accumulate stats
+                for key, value in stats.items():
+                    if isinstance(value, (int, float)):
+                        aggregated_stats[key] = aggregated_stats.get(key, 0) + value
+            else:
+                agg_prompt = result
 
             for trial in range(self.config.n_trials):
                 all_prompts.append(agg_prompt)
@@ -373,7 +374,28 @@ class MCRewardComputer:
         # 6. Aggregator metrics from trial rewards
         agg_metrics = self._compute_agg_metrics(metadata, all_rewards)
 
-        # 7. Build agg samples for optional aggregator training (pass full response dicts)
+        # 7. Add aggregation_builder stats to metrics (e.g., summary extraction rates)
+        if aggregated_stats:
+            # Compute derived metrics
+            total = aggregated_stats.get("total_solutions", 0)
+            extracted = aggregated_stats.get("extracted_summaries", 0)
+            if total > 0:
+                rate = extracted / total
+                missing = total - extracted
+                agg_metrics["mc/summary_extraction_rate"] = rate
+                agg_metrics["mc/summary_missing_count"] = missing
+                agg_metrics["mc/summary_total_count"] = total
+                logger.info(
+                    "[MC] Summary extraction rate: %.4f (%d/%d, missing=%d)",
+                    rate,
+                    extracted,
+                    total,
+                    missing,
+                )
+            else:
+                logger.info("[MC] Summary extraction stats present but total_solutions=0")
+
+        # 8. Build agg samples for optional aggregator training (pass full response dicts)
         agg_samples = self._build_agg_samples(all_prompts, all_responses, all_rewards, metadata, problems)
 
         return sample_rewards, mc_results, agg_samples, agg_metrics

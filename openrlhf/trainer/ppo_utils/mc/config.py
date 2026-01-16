@@ -1,7 +1,7 @@
 """MC configuration dataclass and loader."""
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
 @dataclass
@@ -9,12 +9,18 @@ class MCConfig:
     """Configuration for Marginal Contribution reward computation.
 
     User must provide:
-        aggregation_builder: (prompt, solutions) -> aggregation_prompt
+        aggregation_builder: (prompt, solutions) -> aggregation_prompt or (aggregation_prompt, stats)
         reward_fn: (prompts, outputs, labels) -> rewards
 
     Example:
         def aggregation_builder(prompt: str, solutions: List[str]) -> str:
             return f"Problem: {prompt}\\n\\nSolutions:\\n" + "\\n".join(solutions)
+
+        # Or with stats (for tracking extraction metrics):
+        def aggregation_builder_with_stats(prompt: str, solutions: List[str]) -> Tuple[str, Dict]:
+            extracted = [extract(s) for s in solutions if extract(s)]
+            stats = {"total_solutions": len(solutions), "extracted_summaries": len(extracted)}
+            return f"Problem: {prompt}\\n" + "\\n".join(extracted), stats
 
         def reward_fn(prompts, outputs, labels):
             return [score(p, o, l) for p, o, l in zip(prompts, outputs, labels)]
@@ -26,8 +32,12 @@ class MCConfig:
     """
 
     # Required: user provides these
-    aggregation_builder: Callable[[str, List[str]], str]
-    """(prompt, solutions) -> aggregation_prompt string"""
+    aggregation_builder: Callable[[str, List[str]], Union[str, Tuple[str, Dict[str, Any]]]]
+    """(prompt, solutions) -> aggregation_prompt string, or (prompt, stats_dict) tuple.
+    When returning a tuple, stats_dict can contain metrics like:
+    - total_solutions: number of input solutions
+    - extracted_summaries: number successfully extracted
+    These are aggregated across all groups and logged to wandb."""
 
     reward_fn: Callable[[List[str], List[str], List[Any]], List[float]]
     """(prompts, outputs, labels) -> list of reward floats"""
@@ -63,14 +73,14 @@ class MCConfig:
     solution_extractor: Optional[Callable[[Any, Any], str]] = None
     """(sample, tokenizer) -> solution_text. Default: decode response tokens."""
 
-    # DAPO-style solution filtering
+    # DAPO-style prompt filtering
     filter_solutions: bool = False
-    """Enable filtering of generator solutions based on reward before MC computation"""
+    """Enable prompt-level filtering based on mean reward before MC computation"""
 
     filter_reward_range: Tuple[float, float] = (-1.0, 1.0)
-    """(min, max) reward range (inclusive). Solutions with reward outside [min, max] are excluded
-    from MC computation but still get their generator reward assigned. Filtered-out samples
-    don't participate in MC but are included in training with their original reward.
+    """(min, max) mean reward range (inclusive) at the prompt level.
+    Prompts with mean reward outside [min, max] are excluded from MC computation but
+    their samples still get their generator reward assigned for training.
     Use (-inf, 0.99) to filter out easy problems, or (0.01, inf) to filter impossible ones."""
 
     # Streaming generation + scoring
