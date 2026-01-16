@@ -173,12 +173,28 @@ class ActorPPOTrainer(ABC):
         status_list = []
         status_mean = {}
         for epoch in range(self.max_epochs):
+            num_steps = len(dataloader)
+            min_steps = num_steps
+            if torch.distributed.is_initialized():
+                device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+                steps_tensor = torch.tensor([num_steps], device=device)
+                torch.distributed.all_reduce(steps_tensor, op=torch.distributed.ReduceOp.MIN)
+                min_steps = int(steps_tensor.item())
+            if min_steps == 0:
+                if self.strategy.is_rank_0():
+                    logger.warning("PPO dataloader has zero steps on at least one rank; skipping epoch %d", epoch + 1)
+                continue
+
             pbar = tqdm(
                 dataloader,
                 desc=f"Train epoch [{epoch + 1}/{self.max_epochs}]",
                 disable=not self.strategy.is_rank_0(),
             )
+            if self.strategy.is_rank_0() and min_steps != num_steps:
+                logger.info("PPO dataloader steps: local=%d, min=%d (truncating)", num_steps, min_steps)
             for step, experience in enumerate(pbar):
+                if step >= min_steps:
+                    break
 
                 experience.to_device(device)
                 status = self.training_step(experience, kl_ctl, step)
