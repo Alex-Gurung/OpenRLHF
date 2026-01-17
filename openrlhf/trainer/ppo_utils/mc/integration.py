@@ -82,6 +82,16 @@ class MCRewardComputer:
                 - metrics_dict: Logging metrics for gen/agg/mc
                 - agg_samples: List of Experience for aggregator training (optional)
         """
+        # 0. Extract ALL generator token lengths before any filtering (pre-filter)
+        all_gen_lengths = []
+        for sample in rollout_samples:
+            if sample.info and "response_length" in sample.info:
+                length = sample.info["response_length"]
+                if isinstance(length, torch.Tensor):
+                    all_gen_lengths.append(length.item())
+                else:
+                    all_gen_lengths.append(float(length))
+
         # 1. Extract problems from rollouts (decode responses, group by prompt)
         problems = self._build_problems_from_rollouts(rollout_samples, n_samples_per_prompt)
 
@@ -101,16 +111,35 @@ class MCRewardComputer:
                 self._apply_mc_rewards(rollout_samples, excluded_rewards)
                 return filter_metrics, []
 
-        # 4. Sample groups, build agg prompts, generate, score, compute MC
+        # 4. Extract post-filter generator lengths (samples still in use)
+        filtered_gen_lengths = []
+        for prob in problems:
+            for sample_idx in prob.sample_indices:
+                sample = rollout_samples[sample_idx]
+                if sample.info and "response_length" in sample.info:
+                    length = sample.info["response_length"]
+                    if isinstance(length, torch.Tensor):
+                        filtered_gen_lengths.append(length.item())
+                    else:
+                        filtered_gen_lengths.append(float(length))
+
+        # 5. Sample groups, build agg prompts, generate, score, compute MC
         sample_rewards, mc_results, agg_samples, agg_metrics = self._run_mc_pipeline(problems)
 
-        # 5. Write MC rewards to rollout_samples
+        # 6. Write MC rewards to rollout_samples
         # Include excluded_rewards so filtered-out samples get their generator reward as fallback
-        all_rewards = {**excluded_rewards, **sample_rewards}
-        self._apply_mc_rewards(rollout_samples, all_rewards)
+        all_mc_rewards = {**excluded_rewards, **sample_rewards}
+        self._apply_mc_rewards(rollout_samples, all_mc_rewards)
 
-        # 6. Compute and return metrics
-        metrics = self._compute_metrics(problems, gen_rewards, mc_results, agg_metrics)
+        # 7. Compute and return metrics
+        metrics = self._compute_metrics(
+            problems,
+            gen_rewards,
+            mc_results,
+            agg_metrics,
+            gen_lengths=filtered_gen_lengths,
+            all_gen_lengths=all_gen_lengths,
+        )
         metrics.update(filter_metrics)
 
         return metrics, agg_samples
@@ -366,6 +395,21 @@ class MCRewardComputer:
             all_output_texts = [r["text"] for r in all_responses]
             all_rewards = self.config.reward_fn(all_prompts, all_output_texts, all_labels)
 
+        # 4b. Extract aggregator response lengths from all_responses
+        agg_lengths = []
+        for response in all_responses:
+            obs_tokens = response.get("observation_tokens", [])
+            action_ranges = response.get("action_ranges", [])
+            if action_ranges:
+                # Sum all action spans for multi-range responses
+                response_len = sum(end - start for start, end in action_ranges)
+            elif obs_tokens:
+                # Fallback: use total length (includes prompt)
+                response_len = len(obs_tokens)
+            else:
+                response_len = 0
+            agg_lengths.append(response_len)
+
         # 5. Reshape and compute MC
         sample_rewards, mc_results = self._compute_mc_from_flat_results(
             problems, problem_groups, metadata, all_rewards
@@ -373,6 +417,17 @@ class MCRewardComputer:
 
         # 6. Aggregator metrics from trial rewards
         agg_metrics = self._compute_agg_metrics(metadata, all_rewards)
+
+        # 6b. Add aggregator response length metrics
+        if agg_lengths:
+            agg_metrics["agg/response_length_mean"] = float(np.mean(agg_lengths))
+            agg_metrics["agg/response_length_std"] = float(np.std(agg_lengths))
+
+        # 6c. Compute best/worst group metrics based on MC values
+        best_worst_metrics = self._compute_best_worst_group_metrics(
+            mc_results, problems, metadata, all_rewards
+        )
+        agg_metrics.update(best_worst_metrics)
 
         # 7. Add aggregation_builder stats to metrics (e.g., summary extraction rates)
         if aggregated_stats:
@@ -802,8 +857,19 @@ class MCRewardComputer:
         gen_rewards: Dict[int, float],
         mc_results: List[MCResult],
         agg_metrics: Dict[str, float],
+        gen_lengths: List[float] = None,
+        all_gen_lengths: List[float] = None,
     ) -> Dict[str, float]:
-        """Compute logging metrics from results."""
+        """Compute logging metrics from results.
+
+        Args:
+            problems: List of ProblemData (post-filter if filtering enabled)
+            gen_rewards: Dict[sample_idx -> reward] for generator solutions
+            mc_results: List of MCResult per problem
+            agg_metrics: Aggregator metrics from _compute_agg_metrics
+            gen_lengths: Post-filter generator response lengths (samples in problems)
+            all_gen_lengths: Pre-filter generator response lengths (all rollout samples)
+        """
         metrics = {}
 
         # Generator metrics
@@ -813,7 +879,16 @@ class MCRewardComputer:
             metrics["gen/reward_std"] = float(np.std(gen_values))
             metrics["gen/pass_rate"] = float(np.mean([r > 0 for r in gen_values]))
 
-            # Pass@k across problems
+        # Generator token length metrics
+        if gen_lengths:
+            metrics["gen/response_length_mean"] = float(np.mean(gen_lengths))
+            metrics["gen/response_length_std"] = float(np.std(gen_lengths))
+        if all_gen_lengths:
+            metrics["gen/response_length_all_mean"] = float(np.mean(all_gen_lengths))
+            metrics["gen/response_length_all_std"] = float(np.std(all_gen_lengths))
+
+        # Pass@k across problems (generator)
+        if gen_rewards and problems:
             n_values = [len(prob.sample_indices) for prob in problems if prob.sample_indices]
             max_n = max(n_values) if n_values else 0
             for k in self._select_pass_k_values(max_n):
@@ -911,5 +986,75 @@ class MCRewardComputer:
         any_success = [any(r > 0 for r in rewards) for rewards in group_rewards.values()]
         if any_success:
             metrics["agg/group_pass_rate"] = float(np.mean(any_success))
+
+        return metrics
+
+    def _compute_best_worst_group_metrics(
+        self,
+        mc_results: List[MCResult],
+        problems: List[ProblemData],
+        metadata: List[Tuple[int, Tuple[int, ...], int]],
+        all_rewards: List[float],
+    ) -> Dict[str, float]:
+        """Find best/worst groups by sum of MC values, compute their metrics.
+
+        Best group = group with highest sum of MC values of its solutions
+        Worst group = group with lowest sum of MC values of its solutions
+
+        Args:
+            mc_results: List of MCResult, one per problem (in same order as problems)
+            problems: List of ProblemData (same order as mc_results)
+            metadata: (problem_idx, group_indices, trial_idx) per trial
+            all_rewards: Reward for each trial (same order as metadata)
+
+        Returns:
+            Dict with mc/best_group_* and mc/worst_group_* metrics
+        """
+        if not mc_results or not problems:
+            return {}
+
+        # Group trial rewards by (problem_idx, group_indices)
+        trial_rewards: Dict[Tuple[int, Tuple[int, ...]], List[float]] = defaultdict(list)
+        for (prob_idx, group_indices, _), reward in zip(metadata, all_rewards):
+            trial_rewards[(prob_idx, group_indices)].append(reward)
+
+        best_group_trial_rewards = []
+        worst_group_trial_rewards = []
+
+        # mc_results and problems are in the same order
+        for result, prob in zip(mc_results, problems):
+            if not result.groups:
+                continue
+
+            # Compute sum of MC values for each group
+            group_mc_sums = []
+            for group in result.groups:
+                mc_sum = sum(result.mc_rewards.get(sol_idx, 0.0) for sol_idx in group)
+                group_mc_sums.append(mc_sum)
+
+            if not group_mc_sums:
+                continue
+
+            # Find best and worst group indices
+            best_idx = int(np.argmax(group_mc_sums))
+            worst_idx = int(np.argmin(group_mc_sums))
+
+            # Get trial rewards for these groups using (prob_idx, group_indices) key
+            best_group_key = (prob.prompt_idx, tuple(result.groups[best_idx]))
+            worst_group_key = (prob.prompt_idx, tuple(result.groups[worst_idx]))
+
+            best_trials = trial_rewards.get(best_group_key, [])
+            worst_trials = trial_rewards.get(worst_group_key, [])
+
+            best_group_trial_rewards.extend(best_trials)
+            worst_group_trial_rewards.extend(worst_trials)
+
+        metrics = {}
+        if best_group_trial_rewards:
+            metrics["mc/best_group_reward"] = float(np.mean(best_group_trial_rewards))
+            metrics["mc/best_group_pass_rate"] = float(np.mean([r > 0 for r in best_group_trial_rewards]))
+        if worst_group_trial_rewards:
+            metrics["mc/worst_group_reward"] = float(np.mean(worst_group_trial_rewards))
+            metrics["mc/worst_group_pass_rate"] = float(np.mean([r > 0 for r in worst_group_trial_rewards]))
 
         return metrics
