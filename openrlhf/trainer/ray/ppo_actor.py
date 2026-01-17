@@ -308,12 +308,31 @@ class ActorPPOTrainer(ABC):
         if self.args.entropy_loss_coef is not None:
             status["entropy_loss"] = entropy_loss.detach().item()
 
-        # merge logs from info field
-        for k, v in experience.info.items():
-            if isinstance(v, list):
-                status[k] = torch.tensor(v, dtype=torch.float).mean().item()
-            elif isinstance(v, torch.Tensor):
-                status[k] = v.float().mean().item()
+        # Normalize info keys to avoid rank divergence in all_reduce.
+        # Only include stable metrics that exist for both generator and aggregator samples.
+        allowed_info_keys = (
+            "reward",
+            "return",
+            "response_length",
+            "total_length",
+            "response_clip_ratio",
+            "kl",
+            "ppo_clip_ratio",
+            "ppo_kl",
+            "vllm_kl",
+            "score",
+        )
+        info = experience.info if isinstance(experience.info, dict) else {}
+        for key in allowed_info_keys:
+            value = info.get(key)
+            if isinstance(value, list):
+                status[key] = torch.tensor(value, dtype=torch.float).mean().item()
+            elif isinstance(value, torch.Tensor):
+                status[key] = value.float().mean().item()
+            elif value is None:
+                status[key] = 0.0
+            else:
+                status[key] = float(value)
         return status
 
     def broadcast_to_vllm(self):
