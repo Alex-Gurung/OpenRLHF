@@ -1,6 +1,5 @@
 """MC reward computation orchestration and vLLM integration."""
 
-import concurrent.futures
 import logging
 import math
 from collections import defaultdict
@@ -382,54 +381,84 @@ class MCRewardComputer:
                 all_labels.append(prob.label)
                 metadata.append((prob_idx, tuple(group_indices), trial))
 
-        # 3. Generate and score aggregator outputs
-        # Use streaming if configured (overlaps scoring with next batch generation)
-        if self.config.streaming_batch_size > 0:
-            all_responses, all_rewards = self._generate_and_score_streaming(
-                all_prompts, all_labels, batch_size=self.config.streaming_batch_size
-            )
-        else:
-            # Original: single batch for all
-            all_responses = self._batch_generate(all_prompts, all_labels)
-            # Extract text for reward_fn (needs plain strings)
-            all_output_texts = [r["text"] for r in all_responses]
-            all_rewards = self.config.reward_fn(all_prompts, all_output_texts, all_labels)
+        # 3. Generate, score, and build agg_samples in CHUNKS to reduce peak memory
+        # Key insight: We need all_rewards for MC computation, but can build agg_samples
+        # incrementally and discard observation_tokens after each chunk.
+        chunk_size = self.config.streaming_batch_size if self.config.streaming_batch_size > 0 else 64
+        all_rewards: List[float] = []
+        agg_samples: List = []
+        agg_lengths: List[int] = []
 
-        # 4b. Extract aggregator response lengths from all_responses
-        agg_lengths = []
-        for response in all_responses:
-            obs_tokens = response.get("observation_tokens", [])
-            action_ranges = response.get("action_ranges", [])
-            if action_ranges:
-                # Sum all action spans for multi-range responses
-                response_len = sum(end - start for start, end in action_ranges)
-            elif obs_tokens:
-                # Fallback: use total length (includes prompt)
-                response_len = len(obs_tokens)
-            else:
-                response_len = 0
-            agg_lengths.append(response_len)
+        # Check if we need agg_samples (skip if aggregator_weight == 0)
+        build_samples = getattr(self.config, "aggregator_weight", 1.0) > 0
 
-        # 5. Reshape and compute MC
+        # Wake vLLM once before all chunks (if sleep mode enabled)
+        if self.vllm_enable_sleep and all_prompts:
+            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+
+        try:
+            for chunk_start in range(0, len(all_prompts), chunk_size):
+                chunk_end = min(chunk_start + chunk_size, len(all_prompts))
+                chunk_prompts = all_prompts[chunk_start:chunk_end]
+                chunk_labels = all_labels[chunk_start:chunk_end]
+                chunk_metadata = metadata[chunk_start:chunk_end]
+
+                # Generate this chunk (skip_sleep=True since we handle wake/sleep outside loop)
+                chunk_responses = self._batch_generate(chunk_prompts, chunk_labels, skip_sleep=True)
+
+                # Score this chunk
+                chunk_texts = [r["text"] for r in chunk_responses]
+                chunk_rewards = self.config.reward_fn(chunk_prompts, chunk_texts, chunk_labels)
+                all_rewards.extend(chunk_rewards)
+
+                # Extract aggregator response lengths from this chunk
+                for response in chunk_responses:
+                    obs_tokens = response.get("observation_tokens", [])
+                    action_ranges = response.get("action_ranges", [])
+                    if action_ranges:
+                        # Sum all action spans for multi-range responses
+                        response_len = sum(end - start for start, end in action_ranges)
+                    elif obs_tokens:
+                        # Fallback: use total length (includes prompt)
+                        response_len = len(obs_tokens)
+                    else:
+                        response_len = 0
+                    agg_lengths.append(response_len)
+
+                # Build agg_samples for this chunk (if needed)
+                if build_samples:
+                    chunk_samples = self._build_agg_samples(
+                        chunk_prompts, chunk_responses, chunk_rewards, chunk_metadata, problems
+                    )
+                    agg_samples.extend(chunk_samples)
+
+                # Free chunk responses immediately (observation_tokens are large)
+                del chunk_responses
+        finally:
+            # Sleep vLLM once after all chunks (if sleep mode enabled)
+            if self.vllm_enable_sleep and all_prompts:
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
+
+        # 4. Compute MC from accumulated rewards
         sample_rewards, mc_results = self._compute_mc_from_flat_results(
             problems, problem_groups, metadata, all_rewards
         )
 
-        # 6. Aggregator metrics from trial rewards
+        # 5. Aggregator metrics from trial rewards
         agg_metrics = self._compute_agg_metrics(metadata, all_rewards)
 
-        # 6b. Add aggregator response length metrics
+        # 5b. Add aggregator response length metrics
         if agg_lengths:
             agg_metrics["agg/response_length_mean"] = float(np.mean(agg_lengths))
             agg_metrics["agg/response_length_std"] = float(np.std(agg_lengths))
 
-        # 6c. Compute best/worst group metrics based on MC values
+        # 5c. Compute best/worst group metrics based on MC values
         best_worst_metrics = self._compute_best_worst_group_metrics(
             mc_results, problems, metadata, all_rewards
         )
         agg_metrics.update(best_worst_metrics)
 
-        # 7. Add aggregation_builder stats to metrics (e.g., summary extraction rates)
+        # 6. Add aggregation_builder stats to metrics (e.g., summary extraction rates)
         if aggregated_stats:
             # Compute derived metrics
             total = aggregated_stats.get("total_solutions", 0)
@@ -450,19 +479,23 @@ class MCRewardComputer:
             else:
                 logger.info("[MC] Summary extraction stats present but total_solutions=0")
 
-        # 8. Build agg samples for optional aggregator training (pass full response dicts)
-        agg_samples = self._build_agg_samples(all_prompts, all_responses, all_rewards, metadata, problems)
-
         return sample_rewards, mc_results, agg_samples, agg_metrics
 
-    def _batch_generate(self, prompts: List[str], labels: List[Any]) -> List[Dict]:
+    def _batch_generate(
+        self, prompts: List[str], labels: List[Any], skip_sleep: bool = False
+    ) -> List[Dict]:
         """Dispatch ALL prompts to vLLM engines in ONE batch, collect outputs.
 
         Uses same pattern as experience_maker._dispatch_prompts_to_vllm but:
         - Takes explicit prompt list (not from dataloader)
         - Returns response dicts with text, rollout_log_probs, etc.
-        - Handles wake/sleep manually
+        - Handles wake/sleep manually (unless skip_sleep=True)
         - Acquires vllm_lock if provided (for async mode safety)
+
+        Args:
+            prompts: List of prompt strings
+            labels: List of labels for scoring
+            skip_sleep: If True, skip wake/sleep (caller manages it)
 
         Returns:
             List of response dicts with keys: "text", "rollout_log_probs",
@@ -477,13 +510,20 @@ class MCRewardComputer:
             ray.get(self.vllm_lock.acquire.remote())
 
         try:
-            return self._batch_generate_impl(prompts, labels)
+            return self._batch_generate_impl(prompts, labels, skip_sleep=skip_sleep)
         finally:
             if self.vllm_lock is not None:
                 ray.get(self.vllm_lock.release.remote())
 
-    def _batch_generate_impl(self, prompts: List[str], labels: List[Any]) -> List[Dict]:
+    def _batch_generate_impl(
+        self, prompts: List[str], labels: List[Any], skip_sleep: bool = False
+    ) -> List[Dict]:
         """Internal implementation of batch generation (called with lock held if needed).
+
+        Args:
+            prompts: List of prompt strings
+            labels: List of labels for scoring
+            skip_sleep: If True, skip wake/sleep (caller manages it)
 
         Returns:
             List of response dicts with keys:
@@ -499,8 +539,8 @@ class MCRewardComputer:
                 "Ensure vllm_engines is not empty when using MC rewards."
             )
 
-        # Wake vLLM if sleep mode enabled
-        if self.vllm_enable_sleep:
+        # Wake vLLM if sleep mode enabled (unless caller handles it)
+        if self.vllm_enable_sleep and not skip_sleep:
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
         # Set logprobs=1 when IS correction is enabled to capture rollout log probabilities
@@ -531,8 +571,8 @@ class MCRewardComputer:
         # Collect results (blocks until all complete)
         results = ray.get(refs)
 
-        # Sleep vLLM if enabled
-        if self.vllm_enable_sleep:
+        # Sleep vLLM if enabled (unless caller handles it)
+        if self.vllm_enable_sleep and not skip_sleep:
             batch_vllm_engine_call(self.vllm_engines, "sleep")
 
         # Process executor outputs into response dicts
@@ -570,68 +610,6 @@ class MCRewardComputer:
             })
 
         return responses
-
-    def _generate_and_score_streaming(
-        self,
-        prompts: List[str],
-        labels: List[Any],
-        batch_size: int = 64,
-    ) -> Tuple[List[Dict], List[float]]:
-        """Generate aggregator outputs in batches, score while next batch generates.
-
-        This is for AGGREGATION only (step 3-4 of MC pipeline). Generator solution
-        scoring (step 2) runs to completion first since filtering depends on those
-        rewards.
-
-        Overlaps CPU-bound aggregator scoring with GPU-bound aggregator generation
-        for better throughput. Useful when reward_fn is slow (e.g., code execution).
-
-        Args:
-            prompts: All aggregation prompts
-            labels: Corresponding labels
-            batch_size: Number of aggregation prompts per batch
-
-        Returns:
-            (all_responses, all_rewards): Response dicts and rewards in input order
-        """
-        if not prompts:
-            return [], []
-
-        all_responses: List[Dict] = []
-        all_rewards: List[float] = []
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as scoring_executor:
-            pending_scoring = None
-
-            for batch_start in range(0, len(prompts), batch_size):
-                batch_end = min(batch_start + batch_size, len(prompts))
-                batch_prompts = prompts[batch_start:batch_end]
-                batch_labels = labels[batch_start:batch_end]
-
-                # Generate this batch (GPU) - returns response dicts
-                batch_responses = self._batch_generate(batch_prompts, batch_labels)
-                all_responses.extend(batch_responses)
-
-                # Collect previous batch's scores if ready
-                if pending_scoring is not None:
-                    all_rewards.extend(pending_scoring.result())
-
-                # Extract text for reward_fn (needs plain strings)
-                batch_output_texts = [r["text"] for r in batch_responses]
-
-                # Submit this batch for scoring (CPU, runs while next batch generates)
-                pending_scoring = scoring_executor.submit(
-                    self.config.reward_fn,
-                    batch_prompts,
-                    batch_output_texts,
-                    batch_labels,
-                )
-
-            # Collect final batch's scores
-            if pending_scoring is not None:
-                all_rewards.extend(pending_scoring.result())
-
-        return all_responses, all_rewards
 
     def _compute_mc_from_flat_results(
         self,

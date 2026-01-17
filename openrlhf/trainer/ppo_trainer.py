@@ -118,6 +118,10 @@ class BasePPOTrainer(ABC):
             self._mc_config.streaming_batch_size = getattr(
                 self.args, "mc_streaming_batch_size", self._mc_config.streaming_batch_size
             )
+            # Aggregator weight (for skipping agg_samples when 0)
+            self._mc_config.aggregator_weight = getattr(
+                self.args, "mc_aggregator_weight", self._mc_config.aggregator_weight
+            )
             logger.info(
                 f"MC reward computation enabled: group_size={self._mc_config.group_size}, "
                 f"quota={self._mc_config.quota}, n_trials={self._mc_config.n_trials}, "

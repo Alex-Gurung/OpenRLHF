@@ -83,16 +83,20 @@ class MCConfig:
     their samples still get their generator reward assigned for training.
     Use (-inf, 0.99) to filter out easy problems, or (0.01, inf) to filter impossible ones."""
 
-    # Streaming generation + scoring
+    # Chunk size for generate/score/build loop
     streaming_batch_size: int = 0
-    """Batch size for streaming generation+scoring. 0 disables streaming (all at once).
-    When > 0, overlaps aggregation scoring with next batch generation for better throughput."""
+    """Chunk size for aggregator generate/score/build loop. 0 uses default of 64.
+    Smaller values reduce peak memory but may increase overhead from per-chunk vLLM calls."""
 
     # Prompt suffix for generator (e.g., summary instruction)
     prompt_suffix: Optional[str] = None
     """Text appended to generator prompts at data loading time.
     Use this to add summary instructions for summary-based MC aggregation.
     The aggregation_builder should strip this before building the aggregator prompt."""
+
+    # Aggregator training weight (for skipping agg_samples when 0)
+    aggregator_weight: float = 1.0
+    """Weight for aggregator PPO training. When 0, skip building agg_samples to save memory."""
 
     def __post_init__(self):
         """Validate configuration."""
