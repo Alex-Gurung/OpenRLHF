@@ -76,13 +76,10 @@ class PromptDataset(Dataset):
         prompt_suffix = None
         mc_config_path = getattr(self.strategy.args, "mc_config_path", None)
         if mc_config_path:
-            try:
-                from openrlhf.trainer.ppo_utils.mc import load_mc_config
+            from openrlhf.trainer.ppo_utils.mc import load_mc_config
 
-                mc_config = load_mc_config(mc_config_path)
-                prompt_suffix = getattr(mc_config, "prompt_suffix", None)
-            except Exception:
-                pass  # MC config may not have prompt_suffix
+            mc_config = load_mc_config(mc_config_path)
+            prompt_suffix = getattr(mc_config, "prompt_suffix", None)
 
         self.prompts = []
         self.labels = []
