@@ -388,8 +388,9 @@ class PPOTrainer(BasePPOTrainer):
             )
             while True:
                 # Draw one mini-batch of prompts; stop when loader is exhausted.
+                skip_sleep = self._mc_config is not None
                 rollout_samples, filter_pass_rate, prompts_consumed, is_exhausted = (
-                    self.samples_generator.generate_samples(**self.generate_kwargs)
+                    self.samples_generator.generate_samples(skip_sleep=skip_sleep, **self.generate_kwargs)
                 )
                 total_consumed_prompts += prompts_consumed
                 if is_exhausted:

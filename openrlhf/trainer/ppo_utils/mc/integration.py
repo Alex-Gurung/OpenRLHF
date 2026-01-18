@@ -81,67 +81,73 @@ class MCRewardComputer:
                 - metrics_dict: Logging metrics for gen/agg/mc
                 - agg_samples: List of Experience for aggregator training (optional)
         """
-        # 0. Extract ALL generator token lengths before any filtering (pre-filter)
-        all_gen_lengths = []
-        for sample in rollout_samples:
-            if sample.info and "response_length" in sample.info:
-                length = sample.info["response_length"]
-                if isinstance(length, torch.Tensor):
-                    all_gen_lengths.append(length.item())
-                else:
-                    all_gen_lengths.append(float(length))
-
-        # 1. Extract problems from rollouts (decode responses, group by prompt)
-        problems = self._build_problems_from_rollouts(rollout_samples, n_samples_per_prompt)
-
-        if not problems:
-            return {}, []
-
-        # 2. Score generator solutions FIRST (needed for filtering and logging)
-        gen_rewards = self._score_generator_solutions(problems)
-
-        # 3. Filter solutions if configured (DAPO-style)
-        filter_metrics = {}
-        excluded_rewards = {}  # Fallback rewards for filtered-out samples
-        if self.config.filter_solutions:
-            problems, gen_rewards, filter_metrics, excluded_rewards = self._filter_solutions(problems, gen_rewards)
-            if not problems:
-                # All problems filtered out - use generator rewards as fallback for all samples
-                self._apply_mc_rewards(rollout_samples, excluded_rewards)
-                return filter_metrics, []
-
-        # 4. Extract post-filter generator lengths (samples still in use)
-        filtered_gen_lengths = []
-        for prob in problems:
-            for sample_idx in prob.sample_indices:
-                sample = rollout_samples[sample_idx]
+        try:
+            # 0. Extract ALL generator token lengths before any filtering (pre-filter)
+            all_gen_lengths = []
+            for sample in rollout_samples:
                 if sample.info and "response_length" in sample.info:
                     length = sample.info["response_length"]
                     if isinstance(length, torch.Tensor):
-                        filtered_gen_lengths.append(length.item())
+                        all_gen_lengths.append(length.item())
                     else:
-                        filtered_gen_lengths.append(float(length))
+                        all_gen_lengths.append(float(length))
 
-        # 5. Sample groups, build agg prompts, generate, score, compute MC
-        sample_rewards, mc_results, agg_samples, agg_metrics = self._run_mc_pipeline(problems)
+            # 1. Extract problems from rollouts (decode responses, group by prompt)
+            problems = self._build_problems_from_rollouts(rollout_samples, n_samples_per_prompt)
 
-        # 6. Write MC rewards to rollout_samples
-        # Include excluded_rewards so filtered-out samples get their generator reward as fallback
-        all_mc_rewards = {**excluded_rewards, **sample_rewards}
-        self._apply_mc_rewards(rollout_samples, all_mc_rewards)
+            if not problems:
+                return {}, []
 
-        # 7. Compute and return metrics
-        metrics = self._compute_metrics(
-            problems,
-            gen_rewards,
-            mc_results,
-            agg_metrics,
-            gen_lengths=filtered_gen_lengths,
-            all_gen_lengths=all_gen_lengths,
-        )
-        metrics.update(filter_metrics)
+            # 2. Score generator solutions FIRST (needed for filtering and logging)
+            gen_rewards = self._score_generator_solutions(problems)
 
-        return metrics, agg_samples
+            # 3. Filter solutions if configured (DAPO-style)
+            filter_metrics = {}
+            excluded_rewards = {}  # Fallback rewards for filtered-out samples
+            if self.config.filter_solutions:
+                problems, gen_rewards, filter_metrics, excluded_rewards = self._filter_solutions(problems, gen_rewards)
+                if not problems:
+                    # All problems filtered out - use generator rewards as fallback for all samples
+                    self._apply_mc_rewards(rollout_samples, excluded_rewards)
+                    return filter_metrics, []
+
+            # 4. Extract post-filter generator lengths (samples still in use)
+            filtered_gen_lengths = []
+            for prob in problems:
+                for sample_idx in prob.sample_indices:
+                    sample = rollout_samples[sample_idx]
+                    if sample.info and "response_length" in sample.info:
+                        length = sample.info["response_length"]
+                        if isinstance(length, torch.Tensor):
+                            filtered_gen_lengths.append(length.item())
+                        else:
+                            filtered_gen_lengths.append(float(length))
+
+            # 5. Sample groups, build agg prompts, generate, score, compute MC
+            sample_rewards, mc_results, agg_samples, agg_metrics = self._run_mc_pipeline(problems)
+
+            # 6. Write MC rewards to rollout_samples
+            # Include excluded_rewards so filtered-out samples get their generator reward as fallback
+            all_mc_rewards = {**excluded_rewards, **sample_rewards}
+            self._apply_mc_rewards(rollout_samples, all_mc_rewards)
+
+            # 7. Compute and return metrics
+            metrics = self._compute_metrics(
+                problems,
+                gen_rewards,
+                mc_results,
+                agg_metrics,
+                gen_lengths=filtered_gen_lengths,
+                all_gen_lengths=all_gen_lengths,
+            )
+            metrics.update(filter_metrics)
+
+            return metrics, agg_samples
+        finally:
+            # Always sleep vLLM at end of MC computation (if sleep mode enabled)
+            # This ensures sleep happens even on early returns (no problems, all filtered)
+            if self.vllm_enable_sleep:
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
 
     def _build_problems_from_rollouts(
         self,
@@ -396,48 +402,44 @@ class MCRewardComputer:
         if self.vllm_enable_sleep and all_prompts:
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
-        try:
-            for chunk_start in range(0, len(all_prompts), chunk_size):
-                chunk_end = min(chunk_start + chunk_size, len(all_prompts))
-                chunk_prompts = all_prompts[chunk_start:chunk_end]
-                chunk_labels = all_labels[chunk_start:chunk_end]
-                chunk_metadata = metadata[chunk_start:chunk_end]
+        for chunk_start in range(0, len(all_prompts), chunk_size):
+            chunk_end = min(chunk_start + chunk_size, len(all_prompts))
+            chunk_prompts = all_prompts[chunk_start:chunk_end]
+            chunk_labels = all_labels[chunk_start:chunk_end]
+            chunk_metadata = metadata[chunk_start:chunk_end]
 
-                # Generate this chunk (skip_sleep=True since we handle wake/sleep outside loop)
-                chunk_responses = self._batch_generate(chunk_prompts, chunk_labels, skip_sleep=True)
+            # Generate this chunk (skip_sleep=True since we handle wake/sleep outside loop)
+            chunk_responses = self._batch_generate(chunk_prompts, chunk_labels, skip_sleep=True)
 
-                # Score this chunk
-                chunk_texts = [r["text"] for r in chunk_responses]
-                chunk_rewards = self.config.reward_fn(chunk_prompts, chunk_texts, chunk_labels)
-                all_rewards.extend(chunk_rewards)
+            # Score this chunk
+            chunk_texts = [r["text"] for r in chunk_responses]
+            chunk_rewards = self.config.reward_fn(chunk_prompts, chunk_texts, chunk_labels)
+            all_rewards.extend(chunk_rewards)
 
-                # Extract aggregator response lengths from this chunk
-                for response in chunk_responses:
-                    obs_tokens = response.get("observation_tokens", [])
-                    action_ranges = response.get("action_ranges", [])
-                    if action_ranges:
-                        # Sum all action spans for multi-range responses
-                        response_len = sum(end - start for start, end in action_ranges)
-                    elif obs_tokens:
-                        # Fallback: use total length (includes prompt)
-                        response_len = len(obs_tokens)
-                    else:
-                        response_len = 0
-                    agg_lengths.append(response_len)
+            # Extract aggregator response lengths from this chunk
+            for response in chunk_responses:
+                obs_tokens = response.get("observation_tokens", [])
+                action_ranges = response.get("action_ranges", [])
+                if action_ranges:
+                    # Sum all action spans for multi-range responses
+                    response_len = sum(end - start for start, end in action_ranges)
+                elif obs_tokens:
+                    # Fallback: use total length (includes prompt)
+                    response_len = len(obs_tokens)
+                else:
+                    response_len = 0
+                agg_lengths.append(response_len)
 
-                # Build agg_samples for this chunk (if needed)
-                if build_samples:
-                    chunk_samples = self._build_agg_samples(
-                        chunk_prompts, chunk_responses, chunk_rewards, chunk_metadata, problems
-                    )
-                    agg_samples.extend(chunk_samples)
+            # Build agg_samples for this chunk (if needed)
+            if build_samples:
+                chunk_samples = self._build_agg_samples(
+                    chunk_prompts, chunk_responses, chunk_rewards, chunk_metadata, problems
+                )
+                agg_samples.extend(chunk_samples)
 
-                # Free chunk responses immediately (observation_tokens are large)
-                del chunk_responses
-        finally:
-            # Sleep vLLM once after all chunks (if sleep mode enabled)
-            if self.vllm_enable_sleep and all_prompts:
-                batch_vllm_engine_call(self.vllm_engines, "sleep")
+            # Free chunk responses immediately (observation_tokens are large)
+            del chunk_responses
+        # Note: Sleep is handled by compute_and_apply() finally block
 
         # 4. Compute MC from accumulated rewards
         sample_rewards, mc_results = self._compute_mc_from_flat_results(

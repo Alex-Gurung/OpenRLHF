@@ -271,7 +271,9 @@ class SamplesGenerator:
         return experiences
 
     @torch.no_grad()
-    def generate_samples(self, **generate_kwargs) -> Tuple[List[Experience], Optional[float], int, bool]:
+    def generate_samples(
+        self, skip_sleep: bool = False, **generate_kwargs
+    ) -> Tuple[List[Experience], Optional[float], int, bool]:
         """Produce one batch and indicate if the dataloader is exhausted."""
         if getattr(self, "_dataloader_iter", None) is None:
             self._dataloader_iter = iter(self.prompts_dataloader)
@@ -287,9 +289,14 @@ class SamplesGenerator:
             **generate_kwargs,
         )
 
-        # Put engines back to sleep when enabled.
+        # Put engines back to sleep when enabled, unless caller keeps them awake.
+        # If the dataloader is exhausted, sleep even when skip_sleep is set because
+        # no further MC generation will run in this step.
         if self.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "sleep")
+            if exhausted and skip_sleep:
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
+            elif not skip_sleep:
+                batch_vllm_engine_call(self.vllm_engines, "sleep")
 
         filter_pass_rate = None
         if self.args.dynamic_filtering and prompts_consumed:
