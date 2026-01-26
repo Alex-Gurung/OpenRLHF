@@ -122,11 +122,32 @@ class BasePPOTrainer(ABC):
             self._mc_config.aggregator_weight = getattr(
                 self.args, "mc_aggregator_weight", self._mc_config.aggregator_weight
             )
+            # Generator training weights
+            self._mc_config.generator_correctness_weight = getattr(
+                self.args, "mc_generator_correctness_weight", self._mc_config.generator_correctness_weight
+            )
+            self._mc_config.generator_mc_weight = getattr(
+                self.args, "mc_generator_mc_weight", self._mc_config.generator_mc_weight
+            )
+            # Validate that at least one training signal is enabled
+            if (
+                self._mc_config.generator_correctness_weight <= 0
+                and self._mc_config.generator_mc_weight <= 0
+                and self._mc_config.aggregator_weight <= 0
+            ):
+                raise ValueError(
+                    "MC mode requires at least one positive weight: "
+                    f"generator_correctness_weight={self._mc_config.generator_correctness_weight}, "
+                    f"generator_mc_weight={self._mc_config.generator_mc_weight}, "
+                    f"aggregator_weight={self._mc_config.aggregator_weight}"
+                )
             logger.info(
                 f"MC reward computation enabled: group_size={self._mc_config.group_size}, "
                 f"quota={self._mc_config.quota}, n_trials={self._mc_config.n_trials}, "
                 f"filter_solutions={self._mc_config.filter_solutions}, "
-                f"streaming_batch_size={self._mc_config.streaming_batch_size}"
+                f"streaming_batch_size={self._mc_config.streaming_batch_size}, "
+                f"weights=(corr={self._mc_config.generator_correctness_weight}, "
+                f"mc={self._mc_config.generator_mc_weight}, agg={self._mc_config.aggregator_weight})"
             )
 
         # Tracking backends
@@ -158,35 +179,60 @@ class BasePPOTrainer(ABC):
         # Ensure MC computer is initialized (lazy init for async mode compatibility)
         self._ensure_mc_computer()
 
-        # Run MC reward computation BEFORE experience making if configured
-        # This writes MC rewards to rollout_samples, so experience_maker skips reward model
         mc_metrics = {}
-        agg_samples = []
+        experiences = []
+
         if self.mc_computer is not None:
-            mc_metrics, agg_samples = self.mc_computer.compute_and_apply(
+            # MC mode: get separate sample lists for each training signal
+            mc_metrics, gen_corr_samples, gen_mc_samples, agg_samples = self.mc_computer.compute_and_apply(
                 rollout_samples,
                 self.args.n_samples_per_prompt,
             )
 
-        # Turn raw rollouts into PPO-ready trajectories with rewards.
-        experiences = self.experience_maker.make_experience_batch(rollout_samples)
+            mc_n_trials = getattr(self.args, "mc_n_trials", 1)
 
-        # Wire up aggregator training if configured
-        mc_aggregator_weight = getattr(self.args, "mc_aggregator_weight", 0.0)
-        mc_n_trials = getattr(self.args, "mc_n_trials", 1)
-        if mc_aggregator_weight > 0 and agg_samples:
-            # Scale rewards to control gradient contribution
-            for sample in agg_samples:
-                sample.rewards = sample.rewards * mc_aggregator_weight
-                if sample.info and "reward" in sample.info:
-                    sample.info["reward"] = sample.info["reward"] * mc_aggregator_weight
+            # Process generator correctness samples
+            mc_gen_corr_weight = getattr(self.args, "mc_generator_correctness_weight", 0.0)
+            if mc_gen_corr_weight > 0 and gen_corr_samples:
+                gen_corr_experiences = self.experience_maker.make_experience_batch(gen_corr_samples)
+                for exp in gen_corr_experiences:
+                    exp.advantages = exp.advantages * mc_gen_corr_weight
+                experiences.extend(gen_corr_experiences)
 
-            # Build aggregator experiences with different group_size for RLOO
-            agg_experiences = self.experience_maker.make_experience_batch(
-                agg_samples, group_size=mc_n_trials
-            )
-            # Merge - after advantages computed, samples are independent
-            experiences = experiences + agg_experiences
+            # Process generator MC samples
+            mc_gen_mc_weight = getattr(self.args, "mc_generator_mc_weight", 1.0)
+            if mc_gen_mc_weight > 0 and gen_mc_samples:
+                gen_mc_experiences = self.experience_maker.make_experience_batch(gen_mc_samples)
+                for exp in gen_mc_experiences:
+                    exp.advantages = exp.advantages * mc_gen_mc_weight
+                experiences.extend(gen_mc_experiences)
+
+            # Process aggregator samples
+            mc_aggregator_weight = getattr(self.args, "mc_aggregator_weight", 0.0)
+            if mc_aggregator_weight > 0 and agg_samples:
+                agg_experiences = self.experience_maker.make_experience_batch(
+                    agg_samples, group_size=mc_n_trials
+                )
+                for exp in agg_experiences:
+                    exp.advantages = exp.advantages * mc_aggregator_weight
+                experiences.extend(agg_experiences)
+
+            # Warn if no samples will be trained on
+            if not experiences:
+                logger.warning(
+                    "MC mode: no experiences generated. Check weights: "
+                    f"gen_correctness={mc_gen_corr_weight}, gen_mc={mc_gen_mc_weight}, agg={mc_aggregator_weight}"
+                )
+        else:
+            # Non-MC mode: use reward model directly
+            experiences = self.experience_maker.make_experience_batch(rollout_samples)
+
+        if not experiences:
+            logger.warning("No experiences produced for this step; skipping PPO update.")
+            status = {"skip_step": 1}
+            status.update(mc_metrics)
+            status["generated_samples"] = None
+            return status, global_step + 1
 
         # Peek at the first decoded sample for quick sanity check.
         sample0 = [

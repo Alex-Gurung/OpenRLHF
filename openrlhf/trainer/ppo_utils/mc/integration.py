@@ -69,17 +69,19 @@ class MCRewardComputer:
         self,
         rollout_samples: List,
         n_samples_per_prompt: int,
-    ) -> Tuple[Dict[str, float], List]:
-        """Main entry: compute MC rewards and write to samples.
+    ) -> Tuple[Dict[str, float], List, List, List]:
+        """Main entry: compute MC rewards and build sample lists for training.
 
         Args:
             rollout_samples: List of Experience objects from generate_samples
             n_samples_per_prompt: Number of solutions per prompt (n)
 
         Returns:
-            (metrics_dict, agg_samples):
+            (metrics_dict, gen_correctness_samples, gen_mc_samples, agg_samples):
                 - metrics_dict: Logging metrics for gen/agg/mc
-                - agg_samples: List of Experience for aggregator training (optional)
+                - gen_correctness_samples: Generator samples with correctness reward
+                - gen_mc_samples: Generator samples with MC reward
+                - agg_samples: Aggregator samples with correctness reward
         """
         try:
             # 0. Extract ALL generator token lengths before any filtering (pre-filter)
@@ -96,7 +98,7 @@ class MCRewardComputer:
             problems = self._build_problems_from_rollouts(rollout_samples, n_samples_per_prompt)
 
             if not problems:
-                return {}, []
+                return {}, [], [], []
 
             # 2. Score generator solutions FIRST (needed for filtering and logging)
             gen_rewards = self._score_generator_solutions(problems)
@@ -107,9 +109,9 @@ class MCRewardComputer:
             if self.config.filter_solutions:
                 problems, gen_rewards, filter_metrics, excluded_rewards = self._filter_solutions(problems, gen_rewards)
                 if not problems:
-                    # All problems filtered out - use generator rewards as fallback for all samples
-                    self._apply_mc_rewards(rollout_samples, excluded_rewards)
-                    return filter_metrics, []
+                    # All problems filtered out - no training samples (DAPO-style)
+                    # Filtered samples have zero gradient anyway (all same reward)
+                    return filter_metrics, [], [], []
 
             # 4. Extract post-filter generator lengths (samples still in use)
             filtered_gen_lengths = []
@@ -126,10 +128,21 @@ class MCRewardComputer:
             # 5. Sample groups, build agg prompts, generate, score, compute MC
             sample_rewards, mc_results, agg_samples, agg_metrics = self._run_mc_pipeline(problems)
 
-            # 6. Write MC rewards to rollout_samples
-            # Include excluded_rewards so filtered-out samples get their generator reward as fallback
-            all_mc_rewards = {**excluded_rewards, **sample_rewards}
-            self._apply_mc_rewards(rollout_samples, all_mc_rewards)
+            # 6. Build generator sample lists based on config weights
+            # Note: filtered samples are NOT included (DAPO-style) - they have zero
+            # gradient contribution anyway since all samples have same reward
+            gen_correctness_samples = []
+            gen_mc_samples = []
+
+            if self.config.generator_correctness_weight > 0:
+                gen_correctness_samples = self._build_gen_samples_with_rewards(
+                    rollout_samples, gen_rewards  # Only unfiltered samples
+                )
+
+            if self.config.generator_mc_weight > 0:
+                gen_mc_samples = self._build_gen_samples_with_rewards(
+                    rollout_samples, sample_rewards  # Only unfiltered samples with MC
+                )
 
             # 7. Compute and return metrics
             metrics = self._compute_metrics(
@@ -142,7 +155,7 @@ class MCRewardComputer:
             )
             metrics.update(filter_metrics)
 
-            return metrics, agg_samples
+            return metrics, gen_correctness_samples, gen_mc_samples, agg_samples
         finally:
             # Always sleep vLLM at end of MC computation (if sleep mode enabled)
             # This ensures sleep happens even on early returns (no problems, all filtered)
@@ -830,6 +843,50 @@ class MCRewardComputer:
                 if sample.info is None:
                     sample.info = {}
                 sample.info["reward"] = torch.tensor([reward])
+
+    def _build_gen_samples_with_rewards(
+        self,
+        rollout_samples: List,
+        sample_rewards: Dict[int, float],
+    ) -> List:
+        """Create copies of rollout samples with specified rewards.
+
+        Unlike _apply_mc_rewards which modifies in-place, this creates
+        new Experience objects to allow multiple reward types per sample.
+
+        Args:
+            rollout_samples: Original rollout samples
+            sample_rewards: Dict mapping sample_index -> reward
+
+        Returns:
+            List of Experience objects with specified rewards set
+        """
+        result = []
+        for idx, sample in enumerate(rollout_samples):
+            if idx not in sample_rewards:
+                continue
+
+            reward = sample_rewards[idx]
+
+            # Create new info dict with updated reward
+            new_info = dict(sample.info) if sample.info else {}
+            new_info["reward"] = torch.tensor([reward])
+
+            # Create new Experience with same tensors but new reward
+            new_sample = Experience(
+                sequences=sample.sequences,
+                attention_mask=sample.attention_mask,
+                action_mask=sample.action_mask,
+                rollout_log_probs=sample.rollout_log_probs,
+                prompts=sample.prompts,
+                labels=sample.labels,
+                rewards=torch.tensor([reward]),
+                scores=sample.scores if hasattr(sample, "scores") else None,
+                info=new_info,
+            )
+            result.append(new_sample)
+
+        return result
 
     def _compute_metrics(
         self,

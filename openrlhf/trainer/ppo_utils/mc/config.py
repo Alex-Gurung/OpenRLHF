@@ -98,6 +98,13 @@ class MCConfig:
     aggregator_weight: float = 1.0
     """Weight for aggregator PPO training. When 0, skip building agg_samples to save memory."""
 
+    # Generator training weights
+    generator_correctness_weight: float = 0.0
+    """Weight for generator PPO training with correctness reward. 0=skip (default)."""
+
+    generator_mc_weight: float = 1.0
+    """Weight for generator PPO training with MC reward. 1.0=full weight (default for backward compat)."""
+
     def __post_init__(self):
         """Validate configuration."""
         if self.group_size < 1:
@@ -115,6 +122,14 @@ class MCConfig:
                 f"aggregator_max_length ({self.aggregator_max_length}) must be > "
                 f"aggregator_max_tokens ({self.aggregator_max_tokens})"
             )
+        # Validate training weights
+        for name, weight in [
+            ("aggregator_weight", self.aggregator_weight),
+            ("generator_correctness_weight", self.generator_correctness_weight),
+            ("generator_mc_weight", self.generator_mc_weight),
+        ]:
+            if weight < 0:
+                raise ValueError(f"{name} must be >= 0, got {weight}")
 
 
 def load_mc_config(path: str) -> MCConfig:

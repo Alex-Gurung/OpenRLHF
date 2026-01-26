@@ -490,6 +490,18 @@ if __name__ == "__main__":
         help="Weight for aggregator PPO training (0=skip aggregator training, 1=equal to generator)",
     )
     parser.add_argument(
+        "--mc_generator_correctness_weight",
+        type=float,
+        default=0.0,
+        help="Weight for generator PPO training with correctness reward (0=skip, 1=full weight)",
+    )
+    parser.add_argument(
+        "--mc_generator_mc_weight",
+        type=float,
+        default=1.0,
+        help="Weight for generator PPO training with MC reward (default 1.0 for backward compat)",
+    )
+    parser.add_argument(
         "--mc_filter_solutions",
         action="store_true",
         default=False,
@@ -534,6 +546,24 @@ if __name__ == "__main__":
             args.critic_pretrain = args.reward_pretrain.split(",")[0]
         else:
             args.critic_pretrain = args.pretrain
+
+    # MC mode validation: require critic off (non-GAE) and at least one training signal
+    if args.mc_config_path:
+        if args.advantage_estimator == "gae":
+            raise ValueError("MC mode requires advantage_estimator != 'gae' (critic must be off).")
+        if args.critic_pretrain is not None:
+            raise ValueError("MC mode requires critic_pretrain=None.")
+        if (
+            getattr(args, "mc_generator_correctness_weight", 0.0) <= 0
+            and getattr(args, "mc_generator_mc_weight", 0.0) <= 0
+            and getattr(args, "mc_aggregator_weight", 0.0) <= 0
+        ):
+            raise ValueError(
+                "MC mode requires at least one positive weight: "
+                f"mc_generator_correctness_weight={getattr(args, 'mc_generator_correctness_weight', 0.0)}, "
+                f"mc_generator_mc_weight={getattr(args, 'mc_generator_mc_weight', 0.0)}, "
+                f"mc_aggregator_weight={getattr(args, 'mc_aggregator_weight', 0.0)}"
+            )
 
     if args.advantage_estimator in ["rloo", "reinforce_baseline", "group_norm"]:
         assert args.n_samples_per_prompt > 1, f"{args.advantage_estimator} requires n_samples_per_prompt > 1"
