@@ -94,8 +94,13 @@ def make_experience_batch(items: List[BufferItem], packing_samples=False) -> Exp
     }
 
     # Process info dictionary
+    # Use intersection of keys across all items to handle mixed experience types
+    # (e.g., generator vs aggregator samples with different info keys in MC mode)
     kwargs["info"] = {}
-    for key in items[0].info.keys():
+    all_keys = set(items[0].info.keys())
+    for item in items[1:]:
+        all_keys &= set(item.info.keys())
+    for key in all_keys:
         values = [item.info[key] for item in items]
         if not values:
             continue

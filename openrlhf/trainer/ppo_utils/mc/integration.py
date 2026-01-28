@@ -411,9 +411,8 @@ class MCRewardComputer:
         # Check if we need agg_samples (skip if aggregator_weight == 0)
         build_samples = getattr(self.config, "aggregator_weight", 1.0) > 0
 
-        # Wake vLLM once before all chunks (if sleep mode enabled)
-        if self.vllm_enable_sleep and all_prompts:
-            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+        # Note: vLLM is already awake here. generate_samples(skip_sleep=True)
+        # keeps it awake for MC. Sleep is handled by compute_and_apply's finally block.
 
         for chunk_start in range(0, len(all_prompts), chunk_size):
             chunk_end = min(chunk_start + chunk_size, len(all_prompts))
@@ -806,6 +805,7 @@ class MCRewardComputer:
                 "reward": torch.tensor([reward]),
                 "response_length": torch.tensor([response_len]),
                 "total_length": torch.tensor([seq_len]),
+                "response_clip_ratio": torch.tensor([float(seq_len >= self.config.aggregator_max_length)]),
                 # Convert group_id to integer for _merge_item compatibility
                 # This unique ID represents (prob_idx, group_indices) combination
                 "mc_group_id": torch.tensor([prob_idx * 1000 + hash(group_indices) % 1000]),
