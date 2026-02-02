@@ -520,6 +520,12 @@ if __name__ == "__main__":
         default=0,
         help="Batch size for streaming generation+scoring. 0 disables streaming.",
     )
+    parser.add_argument(
+        "--mc_use_summaries",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override summary-based MC aggregation and prompt suffix (default: use mc_config).",
+    )
 
     # TensorBoard parameters
     parser.add_argument("--use_tensorboard", type=str, default=None, help="TensorBoard logging path")

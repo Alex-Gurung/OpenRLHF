@@ -80,6 +80,16 @@ class PromptDataset(Dataset):
 
             mc_config = load_mc_config(mc_config_path)
             prompt_suffix = getattr(mc_config, "prompt_suffix", None)
+            mc_use_summaries = getattr(self.strategy.args, "mc_use_summaries", None)
+            if mc_use_summaries is not None:
+                setattr(mc_config, "use_summaries", bool(mc_use_summaries))
+                if mc_use_summaries:
+                    summary_suffix = getattr(mc_config, "summary_prompt_suffix", None)
+                    if summary_suffix is None:
+                        summary_suffix = prompt_suffix
+                    prompt_suffix = summary_suffix
+                else:
+                    prompt_suffix = None
 
         self.prompts = []
         self.labels = []

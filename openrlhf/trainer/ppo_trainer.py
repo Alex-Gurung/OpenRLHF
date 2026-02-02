@@ -129,6 +129,18 @@ class BasePPOTrainer(ABC):
             self._mc_config.generator_mc_weight = getattr(
                 self.args, "mc_generator_mc_weight", self._mc_config.generator_mc_weight
             )
+            # Optional override for summary-based MC aggregation
+            mc_use_summaries = getattr(self.args, "mc_use_summaries", None)
+            if mc_use_summaries is not None:
+                self._mc_config.use_summaries = bool(mc_use_summaries)
+                if self._mc_config.use_summaries:
+                    summary_suffix = getattr(self._mc_config, "summary_prompt_suffix", None)
+                    if summary_suffix is None:
+                        summary_suffix = getattr(self._mc_config, "prompt_suffix", None)
+                    if summary_suffix is not None:
+                        self._mc_config.prompt_suffix = summary_suffix
+                else:
+                    self._mc_config.prompt_suffix = None
             # Validate that at least one training signal is enabled
             if (
                 self._mc_config.generator_correctness_weight <= 0
@@ -146,6 +158,7 @@ class BasePPOTrainer(ABC):
                 f"quota={self._mc_config.quota}, n_trials={self._mc_config.n_trials}, "
                 f"filter_solutions={self._mc_config.filter_solutions}, "
                 f"streaming_batch_size={self._mc_config.streaming_batch_size}, "
+                f"use_summaries={getattr(self._mc_config, 'use_summaries', None)}, "
                 f"weights=(corr={self._mc_config.generator_correctness_weight}, "
                 f"mc={self._mc_config.generator_mc_weight}, agg={self._mc_config.aggregator_weight})"
             )
