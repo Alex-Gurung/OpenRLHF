@@ -1,4 +1,5 @@
 import argparse
+import os
 from datetime import datetime
 
 import ray
@@ -18,7 +19,18 @@ from openrlhf.utils import get_strategy
 def train(args):
     # initialize ray if not initialized
     if not ray.is_initialized():
-        ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}})
+        env_vars = {
+            "TOKENIZERS_PARALLELISM": os.environ.get("TOKENIZERS_PARALLELISM", "true"),
+            "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
+        }
+        for name in (
+            "NCCL_SHM_DISABLE",
+            "NCCL_CUMEM_ENABLE",
+            "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS",
+        ):
+            if name in os.environ:
+                env_vars[name] = os.environ[name]
+        ray.init(runtime_env={"env_vars": env_vars})
 
     # configure strategy
     strategy = get_strategy(args)
