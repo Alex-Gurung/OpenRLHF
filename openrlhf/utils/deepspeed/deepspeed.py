@@ -156,6 +156,7 @@ class DeepspeedStrategy(ABC):
     ) -> None:
         if isinstance(model, Actor):
             model = model.model
+        self._align_lr_scheduler_to_optimizer(getattr(model, "lr_scheduler", scheduler))
         model.step()
 
     def setup_dataloader(
@@ -243,12 +244,40 @@ class DeepspeedStrategy(ABC):
         )
         if self.deepcompile:
             engine.compile()
+        self._align_lr_scheduler_to_optimizer(scheduler)
         if is_actor:
             model.model = engine
         else:
             model = engine
 
         return model, optim, scheduler
+
+    @staticmethod
+    def _align_lr_scheduler_to_optimizer(scheduler):
+        if scheduler is None:
+            return
+        optimizer = getattr(scheduler, "optimizer", None)
+        param_groups = getattr(optimizer, "param_groups", None)
+        if not param_groups:
+            return
+        group_count = len(param_groups)
+
+        def align_sequence(attr):
+            values = getattr(scheduler, attr, None)
+            if not isinstance(values, list) or len(values) == group_count:
+                return
+            if len(values) > group_count:
+                setattr(scheduler, attr, values[:group_count])
+            elif values:
+                setattr(scheduler, attr, values + [values[-1]] * (group_count - len(values)))
+
+        # DeepSpeed may consolidate optimizer param groups after initialization.
+        # PyTorch 2.10 uses strict zip in LRScheduler.step(), so Hugging Face
+        # schedulers created before DeepSpeed wrapping must be resized to the
+        # optimizer groups that the engine actually steps.
+        align_sequence("base_lrs")
+        align_sequence("_last_lr")
+        align_sequence("lr_lambdas")
 
     def get_ds_train_config(self, is_actor):
         # DS Config
