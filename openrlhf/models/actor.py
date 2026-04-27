@@ -182,24 +182,67 @@ class Actor(nn.Module):
         if hasattr(train, "module"):
             train = train.module
 
-        # tie parameters: same storage, no grads on shadow
+        def resolve_train_name(name, train_names, *, allow_lora_base_layer):
+            candidates = [name, f"base_model.model.{name}"]
+            if allow_lora_base_layer and (name.endswith(".weight") or name.endswith(".bias")):
+                parent, suffix = name.rsplit(".", 1)
+                candidates.extend(
+                    [
+                        f"{parent}.base_layer.{suffix}",
+                        f"base_model.model.{parent}.base_layer.{suffix}",
+                    ]
+                )
+            for candidate in candidates:
+                if candidate in train_names:
+                    return candidate
+            return None
+
+        # tie parameters: same storage, no grads on shadow. When the train
+        # model is PEFT/LoRA-wrapped, base weights are nested under
+        # base_model.model and wrapped linear weights live under base_layer.
         t_params = dict(train.named_parameters())
+        missing_params = []
         for name, p_s in self.shadow_model.named_parameters():
             p_s.requires_grad_(False)
-            p_t = t_params[name]
+            train_name = resolve_train_name(name, t_params, allow_lora_base_layer=True)
+            if train_name is None:
+                missing_params.append(name)
+                continue
+            p_t = t_params[train_name]
             # rebind storage; no allocation
             if p_s.data.data_ptr() != p_t.data.data_ptr():
                 p_s.data = p_t.data
+        if missing_params:
+            preview = ", ".join(missing_params[:5])
+            print(f"Skipped tying {len(missing_params)} shadow parameters with no train match: {preview}")
 
         # (Optional) tie buffers as well (also rebind)
         t_bufs = dict(train.named_buffers())
         for name, b_s in self.shadow_model.named_buffers():
-            if name in t_bufs:
-                b_t = t_bufs[name]
-                if b_s.data.data_ptr() != b_t.data.data_ptr():
-                    b_s.data = b_t.data
+            train_name = resolve_train_name(name, t_bufs, allow_lora_base_layer=False)
+            if train_name is None:
+                continue
+            b_t = t_bufs[train_name]
+            if b_s.data.data_ptr() != b_t.data.data_ptr():
+                b_s.data = b_t.data
 
         self._shadow_tied = True
+
+    @staticmethod
+    def _resolve_shadow_train_name(name, train_names, *, allow_lora_base_layer=True):
+        candidates = [name, f"base_model.model.{name}"]
+        if allow_lora_base_layer and (name.endswith(".weight") or name.endswith(".bias")):
+            parent, suffix = name.rsplit(".", 1)
+            candidates.extend(
+                [
+                    f"{parent}.base_layer.{suffix}",
+                    f"base_model.model.{parent}.base_layer.{suffix}",
+                ]
+            )
+        for candidate in candidates:
+            if candidate in train_names:
+                return candidate
+        return None
 
     def ensure_still_tied(self, sample_names=None, every_n: int = 1, deep_every: int = 0):
         """
@@ -232,17 +275,18 @@ class Actor(nn.Module):
             "lm_head.weight",
         ]
         for n in sample_names:
-            if n not in t_params or n not in s_params or \
-            t_params[n].data.data_ptr() != s_params[n].data.data_ptr():
+            train_name = self._resolve_shadow_train_name(n, t_params)
+            if n not in s_params or train_name is None or \
+            t_params[train_name].data.data_ptr() != s_params[n].data.data_ptr():
                 self._shadow_tied = False
                 self._tie_shadow_to_train_if_needed()
                 return
 
         # optional full sweep every deep_every calls
         if deep_every and (c % deep_every) == 0:
-            for n, tp in t_params.items():
-                sp = s_params.get(n, None)
-                if sp is None or tp.data.data_ptr() != sp.data.data_ptr():
+            for n, sp in s_params.items():
+                train_name = self._resolve_shadow_train_name(n, t_params)
+                if train_name is None or t_params[train_name].data.data_ptr() != sp.data.data_ptr():
                     self._shadow_tied = False
                     self._tie_shadow_to_train_if_needed()
                     return
