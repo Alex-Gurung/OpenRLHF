@@ -26,11 +26,11 @@ from transformers.modeling_outputs import (
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-from transformers.utils import LossKwargs, auto_docstring, can_return_tuple, logging
+from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
 
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention, Qwen2MLP, Qwen2RMSNorm, 
-    Qwen2PreTrainedModel, Qwen2RotaryEmbedding, Qwen2Model, KwargsForCausalLM,
+    Qwen2PreTrainedModel, Qwen2RotaryEmbedding, Qwen2Model,
     Qwen2ForCausalLM
 )
 from transformers.models.qwen2.configuration_qwen2 import Qwen2Config as OldQwen2Config
@@ -1006,7 +1006,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         given_is_reasoning_embedding_mask: Optional[torch.BoolTensor] = None,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> CausalLMOutputWithPast:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1081,7 +1081,7 @@ class Qwen2ForCausalLM(Qwen2ForCausalLM):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **kwargs: Unpack[KwargsForCausalLM],
+        **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.FloatTensor, torch.BoolTensor]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
