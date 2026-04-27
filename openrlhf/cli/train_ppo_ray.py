@@ -26,6 +26,7 @@ def train(args):
         for name in (
             "NCCL_SHM_DISABLE",
             "NCCL_CUMEM_ENABLE",
+            "NCCL_CUMEM_HOST_ENABLE",
             "RAY_ENABLE_ZERO_COPY_TORCH_TENSORS",
         ):
             if name in os.environ:

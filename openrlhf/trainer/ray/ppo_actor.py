@@ -663,10 +663,12 @@ class PolicyModelActor(BaseModelActor):
         self.max_steps = max_steps
 
         if getattr(args, "vllm_num_engines", 0) > 0:
-            # To prevent hanging during NCCL synchronization of weights between DeepSpeed and vLLM.
-            # see https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+            # Keep NCCL off the tiny /dev/shm mount during both DeepSpeed init
+            # and later vLLM weight synchronization. NCCL 2.24+ can use cuMem
+            # host allocations instead of /dev/shm when the runtime supports it.
             if getattr(args, "vllm_sync_backend", "nccl") == "nccl":
-                os.environ["NCCL_CUMEM_ENABLE"] = "0"
+                os.environ.setdefault("NCCL_SHM_DISABLE", "1")
+                os.environ.setdefault("NCCL_CUMEM_HOST_ENABLE", "1")
 
         self._setup_distributed(strategy)
 
