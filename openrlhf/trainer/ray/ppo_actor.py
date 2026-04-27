@@ -550,15 +550,41 @@ class ActorPPOTrainer(ABC):
         torch.cuda.empty_cache()
         print(f"emptied cache")
         model = self.actor.model.module
-        count, num_params = 0, len(list(model.named_parameters()))
 
-        def _broadcast_param(param, count, num_params):
+        lora_base = getattr(model, "base_model", None)
+        lora_was_merged = False
+
+        def _vllm_weight_name(name):
+            lora_markers = (
+                ".lora_A.",
+                ".lora_B.",
+                ".lora_embedding_A.",
+                ".lora_embedding_B.",
+                ".lora_magnitude_vector.",
+            )
+            if any(marker in name for marker in lora_markers):
+                return None
+            while name.startswith("base_model.model."):
+                name = name[len("base_model.model.") :]
+            name = name.replace(".base_layer.", ".")
+            if name.startswith("model.reasoning_projector.") or name.startswith("reasoning_projector."):
+                return None
+            return name
+
+        named_params = [
+            (vllm_name, param)
+            for name, param in model.named_parameters()
+            if (vllm_name := _vllm_weight_name(name)) is not None
+        ]
+        count, num_params = 0, len(named_params)
+
+        def _broadcast_param(weight_name, param, count, num_params):
             use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
             # Fire all vllm engines for broadcast
             if torch.distributed.get_rank() == 0:
                 shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
                 refs = [
-                    engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
+                    engine.update_weight.remote(weight_name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
                     for engine in self.vllm_engines
                 ]
 
@@ -570,7 +596,7 @@ class ActorPPOTrainer(ABC):
                     self._model_update_group.broadcast(param.data, src=0, stream=torch.cuda.current_stream())
                 ray.get(refs)
 
-        def _handle_cuda_ipc(param, count, num_params):
+        def _handle_cuda_ipc(weight_name, param, count, num_params):
             from torch.multiprocessing.reductions import reduce_tensor
 
             weight = param.data.clone()
@@ -588,7 +614,7 @@ class ActorPPOTrainer(ABC):
                 shape = param.shape if self.strategy.args.zero_stage != 3 else param.ds_shape
                 refs = [
                     engine.update_weight_cuda_ipc.remote(
-                        name,
+                        weight_name,
                         dtype=param.dtype,
                         shape=shape,
                         ipc_handles=ipc_handles,
@@ -599,26 +625,38 @@ class ActorPPOTrainer(ABC):
                 ray.get(refs)
             torch_dist_barrier_and_cuda_sync()
 
-        for name, param in model.named_parameters():
-            count += 1  # empty_cache at last param
+        try:
+            if lora_base is not None and hasattr(lora_base, "merge_adapter"):
+                if torch.distributed.get_rank() == 0:
+                    print("merging LoRA adapters for vLLM weight sync")
+                lora_base.merge_adapter()
+                lora_was_merged = True
 
-            # broadcast
-            if not self.use_cuda_ipc:
-                # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
-                if self.strategy.args.ds_tensor_parallel_size > 1:
-                    with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
-                        _broadcast_param(param, count, num_params)
+            for name, param in named_params:
+                count += 1  # empty_cache at last param
+
+                # broadcast
+                if not self.use_cuda_ipc:
+                    # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
+                    if self.strategy.args.ds_tensor_parallel_size > 1:
+                        with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
+                            _broadcast_param(name, param, count, num_params)
+                    else:
+                        with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                            _broadcast_param(name, param, count, num_params)
+                # CUDA IPC
                 else:
-                    with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                        _broadcast_param(param, count, num_params)
-            # CUDA IPC
-            else:
-                if self.strategy.args.ds_tensor_parallel_size > 1:
-                    with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
-                        _handle_cuda_ipc(param, count, num_params)
-                else:
-                    with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                        _handle_cuda_ipc(param, count, num_params)
+                    if self.strategy.args.ds_tensor_parallel_size > 1:
+                        with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
+                            _handle_cuda_ipc(name, param, count, num_params)
+                    else:
+                        with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
+                            _handle_cuda_ipc(name, param, count, num_params)
+        finally:
+            if lora_was_merged:
+                lora_base.unmerge_adapter()
+                if torch.distributed.get_rank() == 0:
+                    print("unmerged LoRA adapters after vLLM weight sync")
         print("finished per parameter broadcast to vllm")
         if cache_reset_refs:
             print(f"resetting cache for each engine")
