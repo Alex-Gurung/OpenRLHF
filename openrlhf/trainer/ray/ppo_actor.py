@@ -710,6 +710,9 @@ class PolicyModelActor(BaseModelActor):
 
         self._setup_distributed(strategy)
 
+        use_reasoning_projector_model = bool(getattr(args, "enable_reasoning_projector_training", False)) or os.environ.get(
+            "OPENRLHF_USE_REASONING_PROJECTOR", ""
+        ).lower() in {"1", "true", "yes", "on"}
         actor = Actor(
             pretrain,
             attn_implementation=strategy.args.attn_implementation,
@@ -723,7 +726,7 @@ class PolicyModelActor(BaseModelActor):
             packing_samples=strategy.args.packing_samples,
             temperature=strategy.args.temperature,
             use_liger_kernel=strategy.args.use_liger_kernel,
-            use_shadow_model=True,
+            use_shadow_model=use_reasoning_projector_model,
         )
         strategy.print(actor)
 

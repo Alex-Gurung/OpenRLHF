@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import deepspeed
@@ -97,10 +98,13 @@ class Actor(nn.Module):
                 fused_linear_cross_entropy=False  # set True only for TRAINING with fused head+CE
             )
 
-            # TODO: FIX THIS HACK FOR NOW
-            from .final_qwen2 import Qwen2ForCausalLM
-            
-            model_class = Qwen2ForCausalLM
+            use_reasoning_projector_model = use_shadow_model or os.environ.get(
+                "OPENRLHF_USE_REASONING_PROJECTOR", ""
+            ).lower() in {"1", "true", "yes", "on"}
+            if use_reasoning_projector_model:
+                from .final_qwen2 import Qwen2ForCausalLM
+
+                model_class = Qwen2ForCausalLM
 
             self.model = model_class.from_pretrained(
                 pretrain_or_model,
@@ -326,8 +330,8 @@ class Actor(nn.Module):
         # output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, labels=labels)
         is_reasoning_embedding_mask = None
         input_embeds = None
-        print(f"use_shadow_model: {self.use_shadow_model}; ignore_grad: {self.ignore_grad}")
         if self.use_shadow_model:
+            print(f"use_shadow_model: {self.use_shadow_model}; ignore_grad: {self.ignore_grad}")
             self._tie_shadow_to_train_if_needed()
 
             # We batch only the final full forward. Here we prepare per-sample
