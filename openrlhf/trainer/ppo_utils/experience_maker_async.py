@@ -113,7 +113,8 @@ class SamplesGeneratorAsync(SamplesGenerator):
             # Process extra_logs
             extra_logs = output.get("extra_logs", {})
             for key, value in extra_logs.items():
-                info[key] = torch.tensor([value.item()])
+                scalar = value.item() if hasattr(value, "item") else value
+                info[key] = torch.tensor([scalar])
 
             experience = Experience(
                 sequences=sequences.unsqueeze(0),
