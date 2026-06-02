@@ -229,9 +229,13 @@ class Actor(nn.Module):
         ring_attn_group: Optional[dist.ProcessGroup] = None,
         packed_seq_lens: Optional[list[int]] = None,
         return_entropy=False,
+        logits_to_keep: Optional[int] = None,
         **mm_inputs,
     ) -> torch.Tensor:
         """Returns action log probs"""
+        if logits_to_keep is not None and return_entropy:
+            raise ValueError("logits_to_keep is not compatible with return_entropy")
+
         batch, seqlen = sequences.size()
         if self.packing_samples:
             sequences, position_ids, rolled_sequences, ring_attn_pad_len, indices = unpad_and_slice_tensor(
@@ -262,7 +266,11 @@ class Actor(nn.Module):
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(attention_mask == 0, 1)
 
-        output = self.model(sequences, attention_mask=foward_attention_mask, position_ids=position_ids, **mm_inputs)
+        forward_kwargs = dict(attention_mask=foward_attention_mask, position_ids=position_ids, **mm_inputs)
+        if logits_to_keep is not None:
+            forward_kwargs["logits_to_keep"] = logits_to_keep
+
+        output = self.model(sequences, **forward_kwargs)
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
 
@@ -281,6 +289,9 @@ class Actor(nn.Module):
                     output["logits"], ring_attn_group, ring_attn_pad_len, indices, batch, seqlen
                 )
             return output
+
+        if logits_to_keep is not None:
+            rolled_sequences = rolled_sequences[:, -logits_to_keep:]
 
         log_probs = log_probs_from_logits(output["logits"], rolled_sequences, temperature=self.temperature)
 

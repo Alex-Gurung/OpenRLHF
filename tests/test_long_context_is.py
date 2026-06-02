@@ -1,9 +1,10 @@
 from types import SimpleNamespace
 
 import torch
+import torch.nn as nn
 
 from openrlhf.datasets.prompts_dataset import PromptDataset
-from openrlhf.models import LongContextISLoss
+from openrlhf.models import Actor, LongContextISLoss
 from openrlhf.trainer.ppo_utils.experience import Experience, make_experience_batch, split_experience_batch
 
 
@@ -128,3 +129,47 @@ def test_long_context_is_loss_uses_log_space_clip_and_stop_gradient_denominator(
     loss.backward()
     assert long_log_probs.grad is not None
     assert short_log_probs.grad is None
+
+
+class _TinyCausalLM(nn.Module):
+    def __init__(self, vocab_size=8):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.last_logits_to_keep = None
+
+    def forward(self, input_ids, logits_to_keep=0, **kwargs):
+        self.last_logits_to_keep = logits_to_keep
+        batch, seqlen = input_ids.shape
+        values = torch.arange(batch * seqlen * self.vocab_size, dtype=torch.float32)
+        logits = values.view(batch, seqlen, self.vocab_size)
+        if logits_to_keep:
+            logits = logits[:, -logits_to_keep:, :]
+        return {"logits": logits}
+
+
+def test_actor_logits_to_keep_matches_full_action_log_probs(monkeypatch):
+    def log_probs_from_logits_cpu(logits, labels, temperature=1.0):
+        if temperature != 1.0:
+            logits = logits / temperature
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+    monkeypatch.setattr("openrlhf.models.actor.log_probs_from_logits", log_probs_from_logits_cpu)
+
+    model = _TinyCausalLM()
+    actor = Actor(model)
+    actor.packing_samples = False
+    sequences = torch.tensor([[1, 2, 3, 4, 5]])
+    attention_mask = torch.ones_like(sequences)
+    action_mask = torch.tensor([[True, True]])
+
+    full_log_probs = actor(sequences, action_mask, attention_mask=attention_mask)
+    kept_log_probs = actor(
+        sequences,
+        action_mask,
+        attention_mask=attention_mask,
+        logits_to_keep=action_mask.shape[1] + 1,
+    )
+
+    assert model.last_logits_to_keep == 3
+    assert torch.allclose(kept_log_probs, full_log_probs)
