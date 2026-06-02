@@ -223,9 +223,19 @@ class PolicyLoss(nn.Module):
 
 
 class LongContextISLoss(nn.Module):
-    """Sequence-level IS objective for paired short-prompt/long-prompt training."""
+    """Sequence-level IS objective for paired short-prompt/long-prompt training.
 
-    def __init__(self, beta: float = 1.0, log_ratio_clip: Tuple[float, float] = (-20.0, 5.0)) -> None:
+    The IS ratio is computed in log space and clipped before exponentiation:
+        w = exp(clip(log pi_long(y) - sg(log pi_short(y)))).
+
+    The clip bounds are therefore log-weight bounds. For example, a lower
+    bound of -5 floors the post-exp weight at about 0.0067. This is biased
+    relative to exact IS, but prevents the long-context objective from going
+    numerically silent when the full-context prompt initially assigns much
+    lower sequence probability than the paired short prompt.
+    """
+
+    def __init__(self, beta: float = 1.0, log_ratio_clip: Tuple[float, float] = (-5.0, 2.0)) -> None:
         super().__init__()
         self.beta = beta
         self.log_ratio_clip = log_ratio_clip
@@ -233,7 +243,7 @@ class LongContextISLoss(nn.Module):
     def forward(
         self,
         long_log_probs: torch.Tensor,
-        old_short_log_probs: torch.Tensor,
+        short_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         short_action_mask: torch.Tensor,
         long_action_mask: torch.Tensor,
@@ -246,12 +256,19 @@ class LongContextISLoss(nn.Module):
         valid_mask = valid_mask & (long_action_mask.sum(dim=-1) > 0) & (short_action_mask.sum(dim=-1) > 0)
         valid_float = valid_mask.float()
 
-        old_short_seq_logp = (old_short_log_probs.detach() * short_action_mask).sum(dim=-1)
+        # The paired response is sampled from the short-prompt policy. The
+        # denominator is stop-gradient by construction, so this loss only
+        # trains the model to raise/lower pi_long(y | long_prompt).
+        short_seq_logp = (short_log_probs.detach() * short_action_mask).sum(dim=-1)
         long_seq_logp = (long_log_probs * long_action_mask).sum(dim=-1)
-        raw_log_ratio = long_seq_logp - old_short_seq_logp
+        raw_log_ratio = long_seq_logp - short_seq_logp
 
         low, high = self.log_ratio_clip
         clipped_log_ratio = raw_log_ratio.clamp(min=low, max=high)
+        # Detach the weight itself: the score-function surrogate is
+        # -w * A * log pi_long. Backpropagating through w would add an
+        # extra log-probability-gradient term that is not part of the IS
+        # policy gradient.
         is_weight = clipped_log_ratio.exp().detach() * valid_float
 
         short_token_counts = short_action_mask.sum(dim=-1).clamp(min=1)
@@ -266,7 +283,7 @@ class LongContextISLoss(nn.Module):
             global_batch_size=global_batch_size,
         )
 
-        short_token_logp = old_short_seq_logp / short_token_counts
+        short_token_logp = short_seq_logp / short_token_counts
         long_token_logp = long_seq_logp.detach() / long_action_mask.sum(dim=-1).clamp(min=1)
         metrics = {
             "long_is/raw_log_ratio": raw_log_ratio.detach() * valid_float,
@@ -275,7 +292,7 @@ class LongContextISLoss(nn.Module):
             "long_is/clip_low": ((raw_log_ratio < low) & valid_mask).float(),
             "long_is/clip_high": ((raw_log_ratio > high) & valid_mask).float(),
             "long_is/valid_rate": valid_float,
-            "long_is/short_seq_logp": old_short_seq_logp.detach() * valid_float,
+            "long_is/short_seq_logp": short_seq_logp.detach() * valid_float,
             "long_is/long_seq_logp": long_seq_logp.detach() * valid_float,
             "long_is/token_logp_gap": (long_token_logp - short_token_logp).detach() * valid_float,
         }

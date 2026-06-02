@@ -275,8 +275,11 @@ if __name__ == "__main__":
         "--algo.long_context_is.log_ratio_clip",
         type=float,
         nargs=2,
-        default=[-20.0, 5.0],
-        help="Low and high log-ratio clipping bounds for exp(log pi_long - sg(log pi_short)).",
+        default=[-5.0, 2.0],
+        help=(
+            "Low and high log-space clipping bounds applied before exp(log pi_long - sg(log pi_short)); "
+            "the resulting positive IS weight is bounded by exp(low) and exp(high)."
+        ),
     )
     parser.add_argument(
         "--algo.long_context_is.overlength_strategy",

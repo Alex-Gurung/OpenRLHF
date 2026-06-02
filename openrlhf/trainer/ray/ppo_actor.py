@@ -355,7 +355,7 @@ class ActorPPOTrainer(ABC):
                 )
                 long_context_is_loss, long_context_metrics = self.long_context_is_loss_fn(
                     long_action_log_probs,
-                    old_action_log_probs,
+                    action_log_probs,
                     advantages,
                     experience.action_mask,
                     long_action_mask,

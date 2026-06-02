@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from openrlhf.datasets.prompts_dataset import PromptDataset
+from openrlhf.models import LongContextISLoss
 from openrlhf.trainer.ppo_utils.experience import Experience, make_experience_batch, split_experience_batch
 
 
@@ -93,3 +94,37 @@ def test_experience_batching_preserves_long_context_fields():
     split = split_experience_batch(batch)
     assert split[0].long_prompts == ["long-1"]
     assert split[1].long_prompts == ["long-2"]
+
+
+def test_long_context_is_loss_uses_log_space_clip_and_stop_gradient_denominator():
+    loss_fn = LongContextISLoss(beta=0.5, log_ratio_clip=(-5.0, 2.0))
+    long_log_probs = torch.tensor([[-2.0, -3.0, -1.0], [-1.0, -1.0, -1.0]], requires_grad=True)
+    short_log_probs = torch.tensor([[-10.0, -10.0, -10.0], [5.0, 5.0, 5.0]], requires_grad=True)
+    advantages = torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])
+    action_mask = torch.ones_like(long_log_probs, dtype=torch.bool)
+    valid = torch.tensor([True, True])
+
+    loss, metrics = loss_fn(
+        long_log_probs,
+        short_log_probs,
+        advantages,
+        action_mask,
+        action_mask,
+        valid,
+    )
+
+    raw_log_ratio = long_log_probs.detach().sum(dim=-1) - short_log_probs.detach().sum(dim=-1)
+    clipped_log_ratio = raw_log_ratio.clamp(min=-5.0, max=2.0)
+    weights = clipped_log_ratio.exp()
+    seq_advantages = advantages.mean(dim=-1)
+    expected_token_loss = -0.5 * weights.unsqueeze(-1) * seq_advantages.unsqueeze(-1) * long_log_probs
+    expected_loss = expected_token_loss.mean()
+
+    assert torch.allclose(metrics["long_is/raw_log_ratio"], raw_log_ratio)
+    assert torch.allclose(metrics["long_is/clipped_log_ratio"], clipped_log_ratio)
+    assert torch.allclose(metrics["long_is/weight"], weights)
+    assert torch.allclose(loss, expected_loss)
+
+    loss.backward()
+    assert long_log_probs.grad is not None
+    assert short_log_probs.grad is None
