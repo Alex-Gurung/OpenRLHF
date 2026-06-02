@@ -264,6 +264,9 @@ class LongContextISLoss(nn.Module):
         raw_log_ratio = long_seq_logp - short_seq_logp
 
         low, high = self.log_ratio_clip
+        # Clip the log-ratio before exponentiating. The resulting positive IS
+        # weight is bounded in [exp(low), exp(high)], so a negative low value is
+        # a small floor, not a negative post-exp weight.
         clipped_log_ratio = raw_log_ratio.clamp(min=low, max=high)
         # Detach the weight itself: the score-function surrogate is
         # -w * A * log pi_long. Backpropagating through w would add an

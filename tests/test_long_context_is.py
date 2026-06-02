@@ -142,8 +142,11 @@ class _TinyCausalLM(nn.Module):
         batch, seqlen = input_ids.shape
         values = torch.arange(batch * seqlen * self.vocab_size, dtype=torch.float32)
         logits = values.view(batch, seqlen, self.vocab_size)
-        if logits_to_keep:
-            logits = logits[:, -logits_to_keep:, :]
+        if isinstance(logits_to_keep, int):
+            if logits_to_keep:
+                logits = logits[:, -logits_to_keep:, :]
+        else:
+            logits = logits[:, logits_to_keep, :]
         return {"logits": logits}
 
 
@@ -172,4 +175,47 @@ def test_actor_logits_to_keep_matches_full_action_log_probs(monkeypatch):
     )
 
     assert model.last_logits_to_keep == 3
+    assert torch.allclose(kept_log_probs, full_log_probs)
+
+
+def test_actor_packed_action_logits_to_keep_matches_full_action_log_probs(monkeypatch):
+    def log_probs_from_logits_cpu(logits, labels, temperature=1.0):
+        if temperature != 1.0:
+            logits = logits / temperature
+        log_probs = torch.log_softmax(logits, dim=-1)
+        return log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+
+    monkeypatch.setattr("openrlhf.models.actor.log_probs_from_logits", log_probs_from_logits_cpu)
+
+    model = _TinyCausalLM()
+    actor = Actor(model)
+    actor.packing_samples = True
+    sequences = torch.tensor(
+        [
+            [1, 2, 3, 4, 0],
+            [5, 6, 7, 0, 0],
+        ]
+    )
+    attention_mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 0],
+            [1, 1, 1, 0, 0],
+        ]
+    )
+    action_mask = torch.tensor(
+        [
+            [False, True, True, False],
+            [False, True, False, False],
+        ]
+    )
+
+    full_log_probs = actor(sequences, action_mask, attention_mask=attention_mask)
+    kept_log_probs = actor(
+        sequences,
+        action_mask,
+        attention_mask=attention_mask,
+        logits_to_keep_action=True,
+    )
+
+    assert model.last_logits_to_keep.tolist() == [1, 2, 5]
     assert torch.allclose(kept_log_probs, full_log_probs)

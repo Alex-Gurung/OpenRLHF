@@ -230,22 +230,65 @@ class Actor(nn.Module):
         packed_seq_lens: Optional[list[int]] = None,
         return_entropy=False,
         logits_to_keep: Optional[int] = None,
+        logits_to_keep_action=False,
         **mm_inputs,
     ) -> torch.Tensor:
         """Returns action log probs"""
         if logits_to_keep is not None and return_entropy:
             raise ValueError("logits_to_keep is not compatible with return_entropy")
+        if logits_to_keep_action and return_entropy:
+            raise ValueError("logits_to_keep_action is not compatible with return_entropy")
+        if logits_to_keep is not None and logits_to_keep_action:
+            raise ValueError("logits_to_keep and logits_to_keep_action are mutually exclusive")
+        if logits_to_keep_action and action_mask is None:
+            raise ValueError("action_mask is required when logits_to_keep_action is enabled")
 
         batch, seqlen = sequences.size()
         if self.packing_samples:
+            original_action_mask = action_mask
+            original_attention_mask = attention_mask
             sequences, position_ids, rolled_sequences, ring_attn_pad_len, indices = unpad_and_slice_tensor(
                 sequences, attention_mask, ring_attn_group
             )
             foward_attention_mask = None
+
+            action_logits_to_keep = None
+            if logits_to_keep_action:
+                action_width = original_action_mask.shape[1]
+                action_start = seqlen - 1 - action_width
+                if action_start < 0:
+                    raise ValueError("action_mask is longer than the sequence log-probability width")
+
+                action_position_mask = torch.zeros(
+                    (batch, seqlen), dtype=torch.bool, device=original_action_mask.device
+                )
+                action_position_mask[:, action_start : seqlen - 1] = original_action_mask.bool()
+                if torch.any(action_position_mask & ~original_attention_mask.bool()):
+                    raise ValueError("action_mask selects padded tokens")
+
+                flat_action_positions = action_position_mask.reshape(-1).nonzero(as_tuple=False).flatten()
+                indices_long = indices.long()
+                packed_positions = torch.empty(batch * seqlen, dtype=torch.long, device=indices.device)
+                packed_positions[indices_long] = torch.arange(indices.numel(), dtype=torch.long, device=indices.device)
+                global_action_logits_to_keep = packed_positions[flat_action_positions.to(indices.device)]
+
+                action_logits_to_keep = global_action_logits_to_keep
+                if ring_attn_group is not None:
+                    ring_attn_rank = dist.get_rank(group=ring_attn_group)
+                    ring_attn_size = dist.get_world_size(group=ring_attn_group)
+                    local_seq_len = (indices.numel() + ring_attn_pad_len) // ring_attn_size
+                    local_start = ring_attn_rank * local_seq_len
+                    local_end = local_start + local_seq_len
+                    local_keep_mask = (global_action_logits_to_keep >= local_start) & (
+                        global_action_logits_to_keep < local_end
+                    )
+                    action_logits_to_keep = global_action_logits_to_keep[local_keep_mask] - local_start
         else:
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
             rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
             foward_attention_mask = attention_mask
+            if logits_to_keep_action:
+                logits_to_keep = action_mask.shape[1] + 1
 
             if getattr(self, "is_vlm", False):
                 # VLM: let the model compute its own position_ids
@@ -267,12 +310,26 @@ class Actor(nn.Module):
                 position_ids.masked_fill_(attention_mask == 0, 1)
 
         forward_kwargs = dict(attention_mask=foward_attention_mask, position_ids=position_ids, **mm_inputs)
+        if self.packing_samples and logits_to_keep_action:
+            forward_kwargs["logits_to_keep"] = action_logits_to_keep
         if logits_to_keep is not None:
             forward_kwargs["logits_to_keep"] = logits_to_keep
 
         output = self.model(sequences, **forward_kwargs)
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
+
+        if self.packing_samples and logits_to_keep_action:
+            selected_labels = rolled_sequences[:, action_logits_to_keep]
+            selected_log_probs = log_probs_from_logits(
+                output["logits"], selected_labels, temperature=self.temperature
+            )
+            log_probs = output["logits"].new_zeros((1, sequences.shape[1]))
+            log_probs[:, action_logits_to_keep] = selected_log_probs
+            log_probs = gather_and_pad_tensor(log_probs, ring_attn_group, ring_attn_pad_len, indices, batch, seqlen)
+            log_probs = log_probs[:, :-1]
+            action_log_probs = log_probs[:, -action_mask.shape[1] :] * action_mask.float()
+            return (action_log_probs, output) if return_output else action_log_probs
 
         if return_entropy:
             assert return_output

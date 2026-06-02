@@ -346,19 +346,13 @@ class ActorPPOTrainer(ABC):
 
             global_long_tokens = long_loss_batch_info["batch_num_tokens"].item()
             if global_long_tokens > 0:
-                long_logits_to_keep = None
-                if long_action_mask.shape[0] == 1:
-                    # For long-context IS we only need logits for response
-                    # positions. Keep one extra position because causal labels
-                    # are shifted by one token.
-                    long_logits_to_keep = long_action_mask.shape[1] + 1
                 long_action_log_probs = self.actor(
                     experience.long_sequences,
                     long_action_mask,
                     attention_mask=experience.long_attention_mask,
                     ring_attn_group=self.strategy.ring_attn_group,
                     packed_seq_lens=packed_seq_lens,
-                    logits_to_keep=long_logits_to_keep,
+                    logits_to_keep_action=True,
                 )
                 long_context_is_loss, long_context_metrics = self.long_context_is_loss_fn(
                     long_action_log_probs,
