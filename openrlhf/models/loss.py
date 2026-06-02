@@ -222,6 +222,66 @@ class PolicyLoss(nn.Module):
         return loss, clip_ratio, ppo_kl, vllm_kl
 
 
+class LongContextISLoss(nn.Module):
+    """Sequence-level IS objective for paired short-prompt/long-prompt training."""
+
+    def __init__(self, beta: float = 1.0, log_ratio_clip: Tuple[float, float] = (-20.0, 5.0)) -> None:
+        super().__init__()
+        self.beta = beta
+        self.log_ratio_clip = log_ratio_clip
+
+    def forward(
+        self,
+        long_log_probs: torch.Tensor,
+        old_short_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        short_action_mask: torch.Tensor,
+        long_action_mask: torch.Tensor,
+        long_is_valid: torch.Tensor,
+        dp_size: int = 1,
+        batch_num_tokens: Optional[float] = None,
+        global_batch_size: Optional[float] = None,
+    ):
+        valid_mask = long_is_valid.to(long_log_probs.device).bool().view(-1)
+        valid_mask = valid_mask & (long_action_mask.sum(dim=-1) > 0) & (short_action_mask.sum(dim=-1) > 0)
+        valid_float = valid_mask.float()
+
+        old_short_seq_logp = (old_short_log_probs.detach() * short_action_mask).sum(dim=-1)
+        long_seq_logp = (long_log_probs * long_action_mask).sum(dim=-1)
+        raw_log_ratio = long_seq_logp - old_short_seq_logp
+
+        low, high = self.log_ratio_clip
+        clipped_log_ratio = raw_log_ratio.clamp(min=low, max=high)
+        is_weight = clipped_log_ratio.exp().detach() * valid_float
+
+        short_token_counts = short_action_mask.sum(dim=-1).clamp(min=1)
+        seq_advantages = (advantages.detach() * short_action_mask).sum(dim=-1) / short_token_counts
+        token_loss = -self.beta * is_weight.unsqueeze(-1) * seq_advantages.unsqueeze(-1) * long_log_probs
+        loss = aggregate_loss(
+            token_loss,
+            long_action_mask,
+            token_level_loss=True,
+            dp_size=dp_size,
+            batch_num_tokens=batch_num_tokens,
+            global_batch_size=global_batch_size,
+        )
+
+        short_token_logp = old_short_seq_logp / short_token_counts
+        long_token_logp = long_seq_logp.detach() / long_action_mask.sum(dim=-1).clamp(min=1)
+        metrics = {
+            "long_is/raw_log_ratio": raw_log_ratio.detach() * valid_float,
+            "long_is/clipped_log_ratio": clipped_log_ratio.detach() * valid_float,
+            "long_is/weight": is_weight.detach(),
+            "long_is/clip_low": ((raw_log_ratio < low) & valid_mask).float(),
+            "long_is/clip_high": ((raw_log_ratio > high) & valid_mask).float(),
+            "long_is/valid_rate": valid_float,
+            "long_is/short_seq_logp": old_short_seq_logp.detach() * valid_float,
+            "long_is/long_seq_logp": long_seq_logp.detach() * valid_float,
+            "long_is/token_logp_gap": (long_token_logp - short_token_logp).detach() * valid_float,
+        }
+        return loss, metrics
+
+
 class ValueLoss(nn.Module):
     """
     Value Loss for PPO

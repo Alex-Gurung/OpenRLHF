@@ -269,6 +269,22 @@ if __name__ == "__main__":
         choices=["tis", "icepop", "seq-mask-tis"],
         help="vLLM IS correction type: tis (token-level clamp), icepop (token-level filter), seq-mask-tis (sequence-level geom mean)",
     )
+    parser.add_argument("--algo.long_context_is.enable", action="store_true", default=False)
+    parser.add_argument("--algo.long_context_is.beta", type=float, default=1.0)
+    parser.add_argument(
+        "--algo.long_context_is.log_ratio_clip",
+        type=float,
+        nargs=2,
+        default=[-20.0, 5.0],
+        help="Low and high log-ratio clipping bounds for exp(log pi_long - sg(log pi_short)).",
+    )
+    parser.add_argument(
+        "--algo.long_context_is.overlength_strategy",
+        type=str,
+        default="skip",
+        choices=["skip", "error"],
+        help="How to handle long prompt + sampled response sequences longer than data.long_max_len.",
+    )
 
     # Async training using ray
     parser.add_argument("--train.async_enable", action="store_true", default=False, help="Enable async training")
@@ -540,8 +556,18 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--data.input_key", type=str, default="input", help="JSON dataset key")
+    parser.add_argument(
+        "--data.long_input_key", type=str, default=None, help="JSON dataset key for paired long prompt"
+    )
     parser.add_argument("--data.label_key", type=str, default=None, help="JSON dataset key")
     parser.add_argument("--data.input_template", type=str, default=None)
+    parser.add_argument("--data.long_input_template", type=str, default=None)
+    parser.add_argument(
+        "--data.long_max_len",
+        type=int,
+        default=None,
+        help="Max total sequence length for paired long prompt + response. Defaults to data.max_len.",
+    )
     parser.add_argument(
         "--data.apply_chat_template", action="store_true", default=False, help="Use HF tokenizer chat template"
     )
@@ -594,6 +620,9 @@ if __name__ == "__main__":
     if args.actor.eps_clip_low_high is None:
         args.actor.eps_clip_low_high = (args.actor.eps_clip, args.actor.eps_clip)
 
+    if args.data.long_max_len is None:
+        args.data.long_max_len = args.data.max_len
+
     if args.train.agent_func_path:
         args.reward.remote_url = "agent"
 
@@ -634,6 +663,25 @@ if __name__ == "__main__":
             "[Warning] input_template contains \\n characters instead of newline. "
             "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
         )
+
+    if args.data.long_input_template and "{}" not in args.data.long_input_template:
+        print("[Warning] '{}' not in args.data.long_input_template, set to None")
+        args.data.long_input_template = None
+
+    if args.data.long_input_template and "\\n" in args.data.long_input_template:
+        print(
+            "[Warning] long_input_template contains \\n characters instead of newline. "
+            "You likely want to pass $'\\n' in Bash or \"`n\" in PowerShell."
+        )
+
+    if args.algo.long_context_is.enable:
+        assert args.data.long_input_key, "--algo.long_context_is.enable requires --data.long_input_key"
+        assert args.data.long_max_len > 1, "--data.long_max_len must be greater than 1"
+        assert args.algo.long_context_is.log_ratio_clip[0] < args.algo.long_context_is.log_ratio_clip[1], (
+            "--algo.long_context_is.log_ratio_clip low bound must be less than high bound"
+        )
+        assert not args.train.agent_func_path, "long-context IS v1 supports single-turn text rollouts only"
+        assert args.data.max_images_per_prompt == 0, "long-context IS v1 supports text-only rollouts"
 
     if args.ds.ring_attn_size > 1:
         if not args.ds.packing_samples:

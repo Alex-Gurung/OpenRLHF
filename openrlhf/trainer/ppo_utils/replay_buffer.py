@@ -44,6 +44,8 @@ class NaiveReplayBuffer(ABC):
         self.dynamic_sample_loss_scale: List[float] = []
         self.dynamic_batch_num_tokens: List[float] = []
         self.dynamic_global_batch_size: List[float] = []
+        self.dynamic_long_batch_num_tokens: List[float] = []
+        self.dynamic_long_global_batch_size: List[float] = []
         self.dynamic_optimizer_step: List[int] = []
 
     @torch.no_grad()
@@ -90,7 +92,17 @@ class NaiveReplayBuffer(ABC):
 
     def setup_dynamic_batch(self, strategy):
         args = strategy.args
-        sample_lengths = [sample.total_length.item() for sample in self.items]
+        long_context_args = getattr(getattr(args, "algo", None), "long_context_is", None)
+        long_context_enable = bool(getattr(long_context_args, "enable", False))
+
+        def _effective_total_length(sample):
+            total_length = sample.total_length.item()
+            if long_context_enable and sample.long_is_valid is not None and sample.long_total_length is not None:
+                if bool(sample.long_is_valid.item()):
+                    total_length = max(total_length, sample.long_total_length.item())
+            return total_length
+
+        sample_lengths = [_effective_total_length(sample) for sample in self.items]
 
         dp_group = strategy.ds_device_mesh["dp"].get_group()
         dp_size = dist.get_world_size(group=dp_group)
@@ -110,6 +122,8 @@ class NaiveReplayBuffer(ABC):
             self.dynamic_sample_loss_scale = []
             self.dynamic_batch_num_tokens = []
             self.dynamic_global_batch_size = []
+            self.dynamic_long_batch_num_tokens = []
+            self.dynamic_long_global_batch_size = []
             self.dynamic_optimizer_step = []
             return
 
@@ -149,6 +163,8 @@ class NaiveReplayBuffer(ABC):
         sample_loss_scales = []
         batch_num_tokens = []
         global_batch_sizes = []
+        long_batch_num_tokens = []
+        long_global_batch_sizes = []
         optimizer_steps = []
         for partitions in data_partitions:
             sample_num = sum(len(partition) for partition in partitions)
@@ -165,13 +181,39 @@ class NaiveReplayBuffer(ABC):
                 device=torch.cuda.current_device(),
             )
             dist.all_reduce(global_num_tokens, op=dist.ReduceOp.SUM, group=dp_group)
+            global_long_valid_sample_num = torch.tensor(0.0, dtype=torch.float, device=torch.cuda.current_device())
+            global_long_num_tokens = torch.tensor(0.0, dtype=torch.float, device=torch.cuda.current_device())
+            if long_context_enable:
+                long_valid_sample_num = 0
+                long_num_tokens = 0
+                for partition in partitions:
+                    for idx in partition:
+                        sample = self.items[idx]
+                        if sample.long_action_mask is None or sample.long_is_valid is None:
+                            continue
+                        is_valid = bool(sample.long_is_valid.item())
+                        action_tokens = int(sample.long_action_mask.sum().item())
+                        long_valid_sample_num += int(is_valid and action_tokens > 0)
+                        long_num_tokens += action_tokens if is_valid else 0
+                global_long_valid_sample_num = torch.tensor(
+                    long_valid_sample_num, dtype=torch.float, device=torch.cuda.current_device()
+                )
+                dist.all_reduce(global_long_valid_sample_num, op=dist.ReduceOp.SUM, group=dp_group)
+                global_long_num_tokens = torch.tensor(
+                    long_num_tokens, dtype=torch.float, device=torch.cuda.current_device()
+                )
+                dist.all_reduce(global_long_num_tokens, op=dist.ReduceOp.SUM, group=dp_group)
             sample_loss_scale = [len(partition) / sample_num for partition in partitions]
             optimizer_step = [0] * (len(partitions) - 1) + [1]
             sample_loss_scales.extend(sample_loss_scale)
             batch_num_tokens.extend([global_num_tokens.item()] * len(partitions))
             global_batch_sizes.extend([global_valid_sample_num.item()] * len(partitions))
+            long_batch_num_tokens.extend([global_long_num_tokens.item()] * len(partitions))
+            long_global_batch_sizes.extend([global_long_valid_sample_num.item()] * len(partitions))
             optimizer_steps.extend(optimizer_step)
         self.dynamic_sample_loss_scale = sample_loss_scales
         self.dynamic_batch_num_tokens = batch_num_tokens
         self.dynamic_global_batch_size = global_batch_sizes
+        self.dynamic_long_batch_num_tokens = long_batch_num_tokens
+        self.dynamic_long_global_batch_size = long_global_batch_sizes
         self.dynamic_optimizer_step = optimizer_steps

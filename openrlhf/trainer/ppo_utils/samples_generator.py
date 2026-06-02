@@ -20,21 +20,22 @@ def _collect_prompt_batch(dataloader_iter, num_prompts: int):
     collecting the returned prompts. Callers should still process any partial
     batch that was collected before exhaustion.
     """
-    prompts, labels, images = [], [], []
+    prompts, labels, images, long_prompts = [], [], [], []
     exhausted = False
 
     while len(prompts) < num_prompts:
         try:
-            _, batch_prompts, batch_labels, batch_images = next(dataloader_iter)
+            _, batch_prompts, batch_labels, batch_images, batch_long_prompts = next(dataloader_iter)
             remaining = num_prompts - len(prompts)
             prompts.extend(batch_prompts[:remaining])
             labels.extend(batch_labels[:remaining])
             images.extend(batch_images[:remaining])
+            long_prompts.extend(batch_long_prompts[:remaining])
         except StopIteration:
             exhausted = True
             break
 
-    return prompts, labels, images, exhausted
+    return prompts, labels, images, long_prompts, exhausted
 
 
 class SamplesGenerator:
@@ -62,6 +63,9 @@ class SamplesGenerator:
         """Generate evaluation samples for the entire eval dataloader."""
         if getattr(self, "_eval_dataloader_iter", None) is None:
             self._eval_dataloader_iter = iter(self.eval_dataloader)
+
+        generate_kwargs = dict(generate_kwargs)
+        generate_kwargs["long_context_is_enable"] = False
 
         if self.args.vllm.enable_sleep:
             batch_vllm_engine_call(self.vllm_engines, "wake_up")
@@ -148,12 +152,14 @@ class SamplesGenerator:
         prompts_consumed = 0
         accepted_experiences: List[Experience] = []
 
-        prompts, labels, images, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
+        prompts, labels, images, long_prompts, exhausted = _collect_prompt_batch(dataloader_iter, num_prompts)
         if not prompts:
             return [], prompts_consumed, True
 
         target_num_prompts = len(prompts)
-        pending_refs = self._dispatch_prompts_to_vllm(prompts, labels, images=images, **generate_kwargs)
+        pending_refs = self._dispatch_prompts_to_vllm(
+            prompts, labels, images=images, long_prompts=long_prompts, **generate_kwargs
+        )
         prompts_consumed += target_num_prompts
 
         pbar = tqdm(range(target_num_prompts), desc="Generate samples")
@@ -182,7 +188,9 @@ class SamplesGenerator:
                     pbar.update()
                 elif dynamic_filtering:
                     # Dispatch replacement for filtered prompt.
-                    new_prompts, new_labels, new_images, exhausted = _collect_prompt_batch(dataloader_iter, 1)
+                    new_prompts, new_labels, new_images, new_long_prompts, exhausted = _collect_prompt_batch(
+                        dataloader_iter, 1
+                    )
                     prompts_consumed += len(new_prompts)
                     if exhausted and not new_prompts:
                         for remaining_ref in pending_refs:
@@ -190,14 +198,24 @@ class SamplesGenerator:
                         return [], prompts_consumed, True
                     if new_prompts:
                         new_refs = self._dispatch_prompts_to_vllm(
-                            new_prompts, new_labels, images=new_images, **generate_kwargs
+                            new_prompts,
+                            new_labels,
+                            images=new_images,
+                            long_prompts=new_long_prompts,
+                            **generate_kwargs,
                         )
                         pending_refs.extend(new_refs)
 
         return accepted_experiences, prompts_consumed, exhausted
 
     def _dispatch_prompts_to_vllm(
-        self, prompts: List[str], labels: List[str], *, images: List = None, **generate_kwargs
+        self,
+        prompts: List[str],
+        labels: List[str],
+        *,
+        images: List = None,
+        long_prompts: List[str] = None,
+        **generate_kwargs,
     ) -> List:
         """Send prompts to rollout executors and return Ray object refs."""
         sampling_params = SamplingParams(
@@ -226,9 +244,11 @@ class SamplesGenerator:
 
         if images is None:
             images = [None] * len(prompts)
+        if long_prompts is None:
+            long_prompts = [None] * len(prompts)
 
         refs = []
-        for idx, (prompt, label, img) in enumerate(zip(prompts, labels, images)):
+        for idx, (prompt, label, img, long_prompt) in enumerate(zip(prompts, labels, images, long_prompts)):
             # Spread work across engines/workers in load-aware order.
             llm_engine = self.vllm_engines[engine_indices[idx]]
             ref = llm_engine.generate_responses.remote(
@@ -239,6 +259,7 @@ class SamplesGenerator:
                 hf_tokenizer=self.tokenizer,
                 num_samples=n_samples,
                 images=img,
+                long_prompt=long_prompt,
             )
             refs.append(ref)
 
@@ -277,6 +298,9 @@ class SamplesGenerator:
         response_length = (ones_indices[-1] - ones_indices[0] + 1).item() if len(ones_indices) else 0
         total_length = attention_mask.float().sum()
         is_clipped = total_length >= truncate_length
+        long_fields = self._build_long_context_fields(
+            response, sequences, action_mask, truncate_length, generate_kwargs
+        )
 
         # Check if response was truncated (hit max_tokens limit, finish_reason == "length")
         is_truncated = response.get("truncated", False)
@@ -295,14 +319,25 @@ class SamplesGenerator:
             if isinstance(value, torch.Tensor):
                 value = value.flatten()[0].item()
             info[key] = torch.tensor([value])
+        info.update(long_fields.pop("info"))
 
         return Experience(
             sequences=sequences.unsqueeze(0),
             attention_mask=attention_mask.unsqueeze(0),
             action_mask=action_mask.unsqueeze(0),
+            long_sequences=long_fields["long_sequences"].unsqueeze(0)
+            if long_fields["long_sequences"] is not None
+            else None,
+            long_attention_mask=long_fields["long_attention_mask"].unsqueeze(0)
+            if long_fields["long_attention_mask"] is not None
+            else None,
+            long_action_mask=long_fields["long_action_mask"].unsqueeze(0)
+            if long_fields["long_action_mask"] is not None
+            else None,
             rollout_log_probs=rollout_log_probs.unsqueeze(0) if rollout_log_probs is not None else None,
             prompts=[response["prompt"]],
             labels=[response["label"]],
+            long_prompts=[response.get("long_prompt")],
             images=[response.get("images")],
             mm_train_inputs=[response.get("mm_train_inputs")],
             rewards=torch.tensor([reward_val]) if reward_val is not None else None,
@@ -310,5 +345,78 @@ class SamplesGenerator:
             response_length=torch.tensor([response_length]),
             truncated=torch.tensor([is_truncated]),
             total_length=torch.tensor([total_length]),
+            long_total_length=long_fields["long_total_length"],
+            long_is_valid=long_fields["long_is_valid"],
             info=info,
         )
+
+    def _build_long_context_fields(
+        self, response, short_sequences, short_action_mask, truncate_length, generate_kwargs
+    ):
+        long_context_args = getattr(getattr(self.args, "algo", None), "long_context_is", None)
+        if not generate_kwargs.get("long_context_is_enable", True) or not bool(
+            getattr(long_context_args, "enable", False)
+        ):
+            return {
+                "long_sequences": None,
+                "long_attention_mask": None,
+                "long_action_mask": None,
+                "long_total_length": None,
+                "long_is_valid": None,
+                "info": {},
+            }
+
+        long_prompt = response.get("long_prompt")
+        if long_prompt is None:
+            raise ValueError("long_prompt is required when long-context IS is enabled")
+
+        action_tokens = short_sequences[1:][short_action_mask.bool()].tolist()
+        long_prompt_tokens = self.tokenizer(text=long_prompt, add_special_tokens=False, return_tensors="pt")[
+            "input_ids"
+        ][0].tolist()
+        attempted_len = len(long_prompt_tokens) + len(action_tokens)
+        long_max_len = getattr(self.args.data, "long_max_len", None) or getattr(
+            self.args.data, "max_len", truncate_length
+        )
+        overlength = attempted_len > long_max_len
+        no_actions = len(action_tokens) == 0
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id or 0
+
+        if overlength:
+            strategy = getattr(long_context_args, "overlength_strategy", "skip")
+            if strategy == "error":
+                raise ValueError(
+                    f"Long-context sequence length {attempted_len} exceeds data.long_max_len={long_max_len}"
+                )
+
+        if overlength or no_actions:
+            return {
+                "long_sequences": torch.tensor([pad_token_id, pad_token_id], dtype=torch.long),
+                "long_attention_mask": torch.ones(2, dtype=torch.long),
+                "long_action_mask": torch.zeros(1, dtype=torch.bool),
+                "long_total_length": torch.tensor([attempted_len]),
+                "long_is_valid": torch.tensor([False]),
+                "info": {
+                    "long_is/overlength": torch.tensor([overlength]),
+                    "long_is/attempted_length": torch.tensor([attempted_len]),
+                },
+            }
+
+        long_token_ids = long_prompt_tokens + action_tokens
+        raw_action_mask = torch.zeros(len(long_token_ids), dtype=torch.bool)
+        raw_action_mask[len(long_prompt_tokens) :] = True
+
+        return {
+            "long_sequences": torch.tensor(long_token_ids, dtype=torch.long),
+            "long_attention_mask": torch.ones(len(long_token_ids), dtype=torch.long),
+            "long_action_mask": raw_action_mask[1:],
+            "long_total_length": torch.tensor([attempted_len]),
+            "long_is_valid": torch.tensor([True]),
+            "info": {
+                "long_is/overlength": torch.tensor([False]),
+                "long_is/attempted_length": torch.tensor([attempted_len]),
+            },
+        }

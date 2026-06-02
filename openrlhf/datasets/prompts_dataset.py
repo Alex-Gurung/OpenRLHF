@@ -61,6 +61,7 @@ class PromptDataset(Dataset):
         tokenizer,
         strategy,
         input_template=None,
+        include_long_prompt=None,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -71,6 +72,13 @@ class PromptDataset(Dataset):
         input_key = getattr(self.strategy.args.data, "input_key", None)
         label_key = getattr(self.strategy.args.data, "label_key", None)
         apply_chat_template = getattr(self.strategy.args.data, "apply_chat_template", False)
+        long_context_args = getattr(getattr(self.strategy.args, "algo", None), "long_context_is", None)
+        long_context_enable = bool(getattr(long_context_args, "enable", False))
+        self.include_long_prompt = long_context_enable if include_long_prompt is None else include_long_prompt
+        long_input_key = getattr(self.strategy.args.data, "long_input_key", None)
+        long_input_template = getattr(self.strategy.args.data, "long_input_template", None)
+        if long_input_template is None:
+            long_input_template = input_template
 
         if apply_chat_template:
             apply_chat_template = self.tokenizer.apply_chat_template
@@ -80,12 +88,20 @@ class PromptDataset(Dataset):
         self.prompts = []
         self.labels = []
         self.images = []
+        self.long_prompts = []
         self.datasources = []
         for data in tqdm(dataset, desc="Preprocessing data", disable=not self.strategy.is_rank_0()):
             prompt, label = preprocess_data(data, input_template, input_key, label_key, apply_chat_template)
+            if self.include_long_prompt:
+                if long_input_key is None:
+                    raise ValueError("data.long_input_key is required when long-context IS is enabled")
+                long_prompt, _ = preprocess_data(data, long_input_template, long_input_key, None, apply_chat_template)
+            else:
+                long_prompt = None
             self.prompts.append(prompt)
             self.labels.append(label)
             self.images.append(data.get(self.image_key, None))
+            self.long_prompts.append(long_prompt)
             self.datasources.append(data.get("datasource", "default"))
 
     def __len__(self):
@@ -93,17 +109,19 @@ class PromptDataset(Dataset):
         return length
 
     def __getitem__(self, idx):
-        return self.datasources[idx], self.prompts[idx], self.labels[idx], self.images[idx]
+        return self.datasources[idx], self.prompts[idx], self.labels[idx], self.images[idx], self.long_prompts[idx]
 
     def collate_fn(self, item_list):
         datasources = []
         prompts = []
         labels = []
         images = []
-        for datasource, prompt, label, img in item_list:
+        long_prompts = []
+        for datasource, prompt, label, img, long_prompt in item_list:
             datasources.append(datasource)
             prompts.append(prompt)
             labels.append(label)
             images.append(img)
+            long_prompts.append(long_prompt)
 
-        return datasources, prompts, labels, images
+        return datasources, prompts, labels, images, long_prompts

@@ -12,7 +12,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from openrlhf.models import Actor, PolicyLoss, aggregate_loss
+from openrlhf.models import Actor, LongContextISLoss, PolicyLoss, aggregate_loss
 from openrlhf.models.utils import compute_approx_kl, masked_mean
 from openrlhf.trainer.ppo_utils.experience import Experience
 from openrlhf.utils import get_tokenizer
@@ -27,11 +27,22 @@ from openrlhf.utils.loss_utils import get_loss_batch_info
 from openrlhf.utils.vlm_utils import merge_mm_train_inputs
 
 from ..ppo_utils import NaiveReplayBuffer
+from .launcher import BaseModelActor
+from .utils import get_physical_gpu_id
 
 logger = init_logger(__name__)
 
-from .launcher import BaseModelActor
-from .utils import get_physical_gpu_id
+LONG_CONTEXT_IS_METRIC_KEYS = (
+    "long_is/raw_log_ratio",
+    "long_is/clipped_log_ratio",
+    "long_is/weight",
+    "long_is/clip_low",
+    "long_is/clip_high",
+    "long_is/valid_rate",
+    "long_is/short_seq_logp",
+    "long_is/long_seq_logp",
+    "long_is/token_logp_gap",
+)
 
 
 class ActorPPOTrainer(ABC):
@@ -86,6 +97,14 @@ class ActorPPOTrainer(ABC):
             ),
             vllm_is_correction_type=self.args.algo.advantage.is_correction_type,
         )
+        long_context_args = getattr(self.args.algo, "long_context_is", None)
+        self.long_context_is_enable = bool(getattr(long_context_args, "enable", False))
+        self.long_context_is_loss_fn = None
+        if self.long_context_is_enable:
+            self.long_context_is_loss_fn = LongContextISLoss(
+                beta=long_context_args.beta,
+                log_ratio_clip=tuple(long_context_args.log_ratio_clip),
+            )
 
         # Mixtral 8x7b
         self.aux_loss = self.args.actor.aux_loss_coef > 1e-8
@@ -302,6 +321,48 @@ class ActorPPOTrainer(ABC):
         if vllm_kl is not None:
             experience.info["vllm_kl"] = vllm_kl.detach()
 
+        long_context_is_loss = 0
+        long_context_metrics = {}
+        if self.long_context_is_enable:
+            long_context_is_loss = action_log_probs.sum() * 0.0
+            zero_sample_metrics = action_log_probs.new_zeros(action_mask.shape[0])
+            long_context_metrics = {key: zero_sample_metrics for key in LONG_CONTEXT_IS_METRIC_KEYS}
+            if experience.long_is_valid is not None:
+                long_context_metrics["long_is/valid_rate"] = (
+                    experience.long_is_valid.to(action_log_probs.device).float().view(-1)
+                )
+
+        if self.long_context_is_enable and experience.long_sequences is not None:
+            long_action_mask = experience.long_action_mask
+            if self.args.train.dynamic_batch_enable:
+                long_loss_batch_info = get_loss_batch_info(
+                    self.strategy,
+                    long_action_mask,
+                    batch_num_tokens=self.replay_buffer.dynamic_long_batch_num_tokens[step],
+                    global_batch_size=self.replay_buffer.dynamic_long_global_batch_size[step],
+                )
+            else:
+                long_loss_batch_info = get_loss_batch_info(self.strategy, long_action_mask)
+
+            global_long_tokens = long_loss_batch_info["batch_num_tokens"].item()
+            if global_long_tokens > 0:
+                long_action_log_probs = self.actor(
+                    experience.long_sequences,
+                    long_action_mask,
+                    attention_mask=experience.long_attention_mask,
+                    ring_attn_group=self.strategy.ring_attn_group,
+                    packed_seq_lens=packed_seq_lens,
+                )
+                long_context_is_loss, long_context_metrics = self.long_context_is_loss_fn(
+                    long_action_log_probs,
+                    old_action_log_probs,
+                    advantages,
+                    experience.action_mask,
+                    long_action_mask,
+                    experience.long_is_valid,
+                    **long_loss_batch_info,
+                )
+
         if self.args.algo.kl.use_loss:
             if self.args.algo.kl.init_coef > 0:
                 kl = compute_approx_kl(
@@ -320,7 +381,7 @@ class ActorPPOTrainer(ABC):
         else:
             kl_loss = 0
 
-        loss = actor_loss + kl_loss * kl_ctl
+        loss = actor_loss + long_context_is_loss + kl_loss * kl_ctl
         # mixtral
         if self.aux_loss:
             aux_loss = output.aux_loss * self.args.actor.aux_loss_coef
@@ -354,6 +415,13 @@ class ActorPPOTrainer(ABC):
         # Per-token losses (0-D tensors, shape carries weighting info for ppo_train)
         metrics = {"policy_loss": actor_loss.detach()}
         weights = {"policy_loss": "token"}
+        if self.long_context_is_enable:
+            if isinstance(long_context_is_loss, torch.Tensor):
+                metrics["long_is/loss"] = long_context_is_loss.detach()
+                weights["long_is/loss"] = "sample"
+            for k, v in long_context_metrics.items():
+                metrics[k] = v.detach()
+                weights[k] = "sample"
         if self.args.actor.entropy_coef is not None:
             metrics["entropy_loss"] = entropy_loss.detach()
             weights["entropy_loss"] = "token"

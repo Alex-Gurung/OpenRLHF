@@ -39,6 +39,7 @@ def _load_loss_utils_module():
 _loss_module = _load_loss_module()
 _loss_utils_module = _load_loss_utils_module()
 PolicyLoss = _loss_module.PolicyLoss
+LongContextISLoss = _loss_module.LongContextISLoss
 aggregate_loss = _loss_module.aggregate_loss
 get_loss_batch_info = _loss_utils_module.get_loss_batch_info
 
@@ -156,3 +157,60 @@ def test_policy_kl_metric_is_not_clamped():
     _, _, ppo_kl, _ = PolicyLoss()(log_probs, old_log_probs, advantages, action_mask=mask)
 
     assert torch.allclose(ppo_kl, (old_log_probs - log_probs).mean())
+
+
+def test_long_context_is_loss_uses_exp_ratio_and_detached_short_denominator():
+    long_log_probs = torch.tensor([[-0.5, -0.25, -0.25]], requires_grad=True)
+    old_short_log_probs = torch.tensor([[-1.0, -2.0, 0.0]], requires_grad=True)
+    advantages = torch.tensor([[1.0, 3.0, 0.0]])
+    short_mask = torch.tensor([[1.0, 1.0, 0.0]])
+    long_mask = torch.tensor([[1.0, 1.0, 1.0]])
+    valid = torch.tensor([True])
+
+    loss_fn = LongContextISLoss(beta=2.0, log_ratio_clip=(-10.0, 1.0))
+    loss, metrics = loss_fn(
+        long_log_probs,
+        old_short_log_probs,
+        advantages,
+        short_mask,
+        long_mask,
+        valid,
+    )
+
+    expected_weight = torch.exp(torch.tensor(1.0))
+    expected_loss = 2.0 * expected_weight * 2.0 / 3.0
+    assert torch.allclose(loss, expected_loss)
+    assert torch.allclose(metrics["long_is/raw_log_ratio"], torch.tensor([2.0]))
+    assert torch.allclose(metrics["long_is/weight"], torch.tensor([expected_weight]))
+
+    loss.backward()
+    expected_grad = torch.full_like(long_log_probs, -2.0 * expected_weight * 2.0 / 3.0)
+    assert torch.allclose(long_log_probs.grad, expected_grad)
+    assert old_short_log_probs.grad is None
+
+
+def test_long_context_is_loss_handles_invalid_local_rows_with_global_tokens():
+    long_log_probs = torch.tensor([[-0.5]], requires_grad=True)
+    old_short_log_probs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+    advantages = torch.tensor([[1.0, 1.0]])
+    short_mask = torch.tensor([[1.0, 1.0]])
+    long_mask = torch.tensor([[0.0]])
+    valid = torch.tensor([False])
+
+    loss_fn = LongContextISLoss(beta=1.0, log_ratio_clip=(-10.0, 1.0))
+    loss, metrics = loss_fn(
+        long_log_probs,
+        old_short_log_probs,
+        advantages,
+        short_mask,
+        long_mask,
+        valid,
+        batch_num_tokens=1.0,
+    )
+
+    assert torch.allclose(loss, torch.tensor(0.0))
+    assert torch.allclose(metrics["long_is/valid_rate"], torch.tensor([0.0]))
+
+    loss.backward()
+    assert torch.allclose(long_log_probs.grad, torch.zeros_like(long_log_probs))
+    assert old_short_log_probs.grad is None

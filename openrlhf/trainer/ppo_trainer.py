@@ -57,7 +57,9 @@ def prepare_datasets(strategy, tokenizer):
             dataset_split=args.eval.split,
         )
         eval_data = eval_data.select(range(min(args.data.max_samples, len(eval_data))))
-        eval_dataset = PromptDataset(eval_data, tokenizer, strategy, input_template=args.data.input_template)
+        eval_dataset = PromptDataset(
+            eval_data, tokenizer, strategy, input_template=args.data.input_template, include_long_prompt=False
+        )
         eval_dataloader = strategy.setup_dataloader(
             eval_dataset,
             1,
@@ -88,7 +90,7 @@ def compute_eval_metrics(eval_dataloader, samples_list, n_samples_per_prompt):
         return {}
 
     prompt_to_datasource = {}
-    for datasources, prompts, labels, _images in eval_dataloader:
+    for datasources, prompts, labels, _images, _long_prompts in eval_dataloader:
         for prompt, datasource in zip(prompts, datasources):
             prompt_to_datasource[prompt] = datasource
 

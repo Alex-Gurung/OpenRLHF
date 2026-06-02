@@ -189,6 +189,7 @@ class RolloutRayActor:
         hf_tokenizer,
         num_samples: int = 1,
         images=None,
+        long_prompt=None,
     ):
         """Generate N samples for a single prompt."""
         tasks = [
@@ -203,7 +204,10 @@ class RolloutRayActor:
             )
             for _ in range(num_samples)
         ]
-        return await asyncio.gather(*tasks)
+        responses = await asyncio.gather(*tasks)
+        for response in responses:
+            response["long_prompt"] = long_prompt
+        return responses
 
 
 def create_vllm_engines(

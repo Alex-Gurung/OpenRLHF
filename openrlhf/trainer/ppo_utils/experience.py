@@ -41,6 +41,9 @@ class Experience:
     sequences: torch.Tensor = tensor_field("step", default=None)  # (B, T) token ids [prompt + response]
     attention_mask: torch.LongTensor = tensor_field("step", default=None)  # (B, T)
     action_mask: torch.BoolTensor = tensor_field("step", default=None)  # (B, A) mask over action (response) tokens
+    long_sequences: torch.Tensor = tensor_field("step", default=None)  # (B, T_long) paired long prompt + response
+    long_attention_mask: torch.LongTensor = tensor_field("step", default=None)  # (B, T_long)
+    long_action_mask: torch.BoolTensor = tensor_field("step", default=None)  # (B, A_long)
 
     # ── Policy: log π(a|s) under different policies ──
     action_log_probs: torch.Tensor = tensor_field("step", default=None)  # (B, A) log π_θ(a|s)  current policy
@@ -59,11 +62,14 @@ class Experience:
     response_length: torch.Tensor = tensor_field("episode", default=None)  # (B,) number of generated tokens
     truncated: torch.Tensor = tensor_field("episode", default=None)  # (B,) whether generation was truncated
     total_length: torch.Tensor = tensor_field("episode", default=None)  # (B,) prompt + response length
+    long_total_length: torch.Tensor = tensor_field("episode", default=None)  # (B,) long prompt + response length
+    long_is_valid: torch.Tensor = tensor_field("episode", default=None)  # (B,) whether long objective can use sample
 
     # ── Metadata (not part of RL computation) ──
     index: list[int] = None
     prompts: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
+    long_prompts: list[str] = field(default_factory=list)
     images: list = field(default_factory=list)  # per-sample image paths/URLs for VLM (None entries for text-only)
     mm_train_inputs: list = field(default_factory=list)  # per-sample processor outputs (pixel_values dicts) for VLM
     info: dict = field(default_factory=dict)  # per-sample metrics for logging
@@ -171,8 +177,8 @@ class Experience:
         # Merge all fields
         for field in field_names:
             values = [getattr(e, field) for e in experiences_list]
-            # Use pad_token_id for sequences field, 0 for others
-            pad_value = pad_token_id if field == "sequences" else 0
+            # Use pad_token_id for token-id sequence fields, 0 for masks/logprobs.
+            pad_value = pad_token_id if field in {"sequences", "long_sequences"} else 0
             result[field] = Experience._merge_item(values, pad_value)
 
         return Experience(**result)
@@ -256,15 +262,36 @@ def make_experience_batch(items: List[Experience], packing_samples=False) -> Exp
 def remove_padding_in_sequences(items: List[Experience]) -> List[Experience]:
     """Remove right padding from per-step fields of single-sample Experiences."""
     for item in items:
-        right_pad = item.attention_mask.flip(0).argmax()
-        right_pad = None if right_pad == 0 else -right_pad
+        short_right_pad = item.attention_mask.flip(0).argmax()
+        short_right_pad = None if short_right_pad == 0 else -short_right_pad
+
+        long_right_pad = None
+        if item.long_attention_mask is not None:
+            long_right_pad = item.long_attention_mask.flip(0).argmax()
+            long_right_pad = None if long_right_pad == 0 else -long_right_pad
 
         for f in fields(Experience):
             value = getattr(item, f.name)
             if isinstance(value, torch.Tensor) and Experience.is_step_tensor_field(f.name):
-                setattr(item, f.name, value[:right_pad])
+                if f.name.startswith("long_"):
+                    setattr(item, f.name, value[:long_right_pad])
+                else:
+                    setattr(item, f.name, value[:short_right_pad])
 
     return items
+
+
+def _long_context_is_enabled(args) -> bool:
+    long_context_args = getattr(getattr(args, "algo", None), "long_context_is", None)
+    return bool(getattr(long_context_args, "enable", False))
+
+
+def _effective_total_length(item: Experience, args) -> float:
+    total_length = item.total_length.item()
+    if _long_context_is_enabled(args) and item.long_is_valid is not None and item.long_total_length is not None:
+        if bool(item.long_is_valid.item()):
+            total_length = max(total_length, item.long_total_length.item())
+    return total_length
 
 
 def balance_experiences(experiences, args):
@@ -280,7 +307,7 @@ def balance_experiences(experiences, args):
     items_all = []
     for item in experiences:
         items_all.extend(split_experience_batch(item))
-    items_all.sort(key=lambda x: x.total_length, reverse=True)
+    items_all.sort(key=lambda x: _effective_total_length(x, args), reverse=True)
 
     # split experience into chunks
     effective_num = (
