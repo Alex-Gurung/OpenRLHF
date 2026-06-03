@@ -344,6 +344,48 @@ class ActorPPOTrainer(ABC):
                     experience.long_is_valid.to(action_log_probs.device).float().view(-1)
                 )
 
+        if self.args.algo.kl.use_loss:
+            if self.args.algo.kl.init_coef > 0:
+                kl = compute_approx_kl(
+                    action_log_probs,
+                    base_action_log_probs,
+                    kl_estimator=self.args.algo.kl.estimator,
+                )
+                logprobs_diff = action_log_probs.float() - base_action_log_probs.float()
+            else:
+                kl = torch.zeros_like(action_log_probs)
+                logprobs_diff = torch.zeros_like(action_log_probs)
+            kl_loss = aggregate_loss(kl, experience.action_mask, **loss_batch_info)
+            logprobs_diff = masked_mean(logprobs_diff, experience.action_mask)
+            experience.info["kl"] = kl_loss.detach()
+            experience.info["logprobs_diff"] = logprobs_diff.detach()
+        else:
+            kl_loss = 0
+
+        # Backward the short-prompt objective before the long-prompt forward.
+        # Ring attention stores cu_seqlens in global state for the patched
+        # attention kernels. Gradient checkpointing recomputes the short
+        # forward during backward, so running the long forward first would
+        # overwrite that state and make the recompute use the wrong metadata.
+        short_loss = actor_loss + kl_loss * kl_ctl
+        # mixtral
+        if self.aux_loss:
+            aux_loss = output.aux_loss * self.args.actor.aux_loss_coef
+            if self.args.train.dynamic_batch_enable:
+                aux_loss = aux_loss * self.replay_buffer.dynamic_sample_loss_scale[step]
+            short_loss += aux_loss
+        # entropy loss
+        if self.args.actor.entropy_coef is not None:
+            entropy_loss = aggregate_loss(
+                output.entropy[:, -experience.action_mask.shape[1] :],
+                experience.action_mask,
+                **loss_batch_info,
+            )
+            if self.args.actor.entropy_coef != 0:
+                short_loss -= entropy_loss * self.args.actor.entropy_coef
+
+        self.strategy.backward(short_loss, self.actor, self.actor_optim)
+
         if self.long_context_is_enable and experience.long_sequences is not None:
             long_action_mask = experience.long_action_mask
             if self.args.train.dynamic_batch_enable:
@@ -379,43 +421,8 @@ class ActorPPOTrainer(ABC):
                     experience.long_is_valid,
                     **long_loss_batch_info,
                 )
+                self.strategy.backward(long_context_is_loss, self.actor, self.actor_optim)
 
-        if self.args.algo.kl.use_loss:
-            if self.args.algo.kl.init_coef > 0:
-                kl = compute_approx_kl(
-                    action_log_probs,
-                    base_action_log_probs,
-                    kl_estimator=self.args.algo.kl.estimator,
-                )
-                logprobs_diff = action_log_probs.float() - base_action_log_probs.float()
-            else:
-                kl = torch.zeros_like(action_log_probs)
-                logprobs_diff = torch.zeros_like(action_log_probs)
-            kl_loss = aggregate_loss(kl, experience.action_mask, **loss_batch_info)
-            logprobs_diff = masked_mean(logprobs_diff, experience.action_mask)
-            experience.info["kl"] = kl_loss.detach()
-            experience.info["logprobs_diff"] = logprobs_diff.detach()
-        else:
-            kl_loss = 0
-
-        loss = actor_loss + long_context_is_loss + kl_loss * kl_ctl
-        # mixtral
-        if self.aux_loss:
-            aux_loss = output.aux_loss * self.args.actor.aux_loss_coef
-            if self.args.train.dynamic_batch_enable:
-                aux_loss = aux_loss * self.replay_buffer.dynamic_sample_loss_scale[step]
-            loss += aux_loss
-        # entropy loss
-        if self.args.actor.entropy_coef is not None:
-            entropy_loss = aggregate_loss(
-                output.entropy[:, -experience.action_mask.shape[1] :],
-                experience.action_mask,
-                **loss_batch_info,
-            )
-            if self.args.actor.entropy_coef != 0:
-                loss -= entropy_loss * self.args.actor.entropy_coef
-
-        self.strategy.backward(loss, self.actor, self.actor_optim)
         if self.args.train.dynamic_batch_enable:
             if self.replay_buffer.dynamic_optimizer_step[step]:
                 self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
