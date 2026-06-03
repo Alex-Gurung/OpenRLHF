@@ -1,19 +1,22 @@
+import ray.util.collective as collective
+import torch
+
+from openrlhf.trainer.ray.utils import get_physical_gpu_id
+from openrlhf.utils.distributed_util import stateless_init_process_group
+
+
 class WorkerWrap:
     def init_process_group(
         self, master_address, master_port, rank_offset, world_size, group_name, backend="nccl", use_ray=False
     ):
         """Init torch process group for model weights update"""
-        import torch
-        from openrlhf.utils.distributed_util import stateless_init_process_group
-
         assert torch.distributed.is_initialized(), f"default torch process group must be initialized"
         assert group_name != "", f"group name must not be empty"
 
         rank = torch.distributed.get_rank() + rank_offset
+        self._model_update_backend = backend.lower()
         self._model_update_with_ray = use_ray
         if use_ray:
-            import ray.util.collective as collective
-
             collective.init_collective_group(world_size=world_size, rank=rank, backend=backend, group_name=group_name)
             self._model_update_group = group_name
         else:
@@ -30,21 +33,20 @@ class WorkerWrap:
         )
 
     def update_weight(self, name, dtype, shape, empty_cache=False):
-        import torch
-
         """Broadcast weight to all vllm workers from source rank 0 (actor model)"""
         if torch.distributed.get_rank() == 0:
             print(f"update weight: {name}, dtype: {dtype}, shape: {shape}")
 
         assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
-        weight = torch.empty(shape, dtype=dtype, device="cuda")
+        device = "cpu" if self._model_update_backend == "gloo" else "cuda"
+        weight = torch.empty(shape, dtype=dtype, device=device)
         if self._model_update_with_ray:
-            import ray.util.collective as collective
-
             collective.broadcast(weight, 0, group_name=self._model_update_group)
         else:
             self._model_update_group.broadcast(weight, src=0, stream=torch.cuda.current_stream())
 
+        if weight.device.type == "cpu":
+            weight = weight.to(device=self.device, non_blocking=True)
         self.model_runner.model.load_weights(weights=[(name, weight)])
 
         del weight
@@ -52,10 +54,19 @@ class WorkerWrap:
         # if empty_cache:
         #     torch.cuda.empty_cache()
 
-    def update_weight_cuda_ipc(self, name, dtype, shape, ipc_handles=None, empty_cache=False):
-        import torch
-        from openrlhf.trainer.ray.utils import get_physical_gpu_id
+    def update_weight_from_cpu(self, name, dtype, shape, weight, empty_cache=False):
+        if torch.distributed.get_rank() == 0:
+            print(f"update weight from cpu: {name}, dtype: {dtype}, shape: {shape}")
 
+        assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
+        assert weight.dtype == dtype, f"mismatch dtype: src {weight.dtype}, dst {dtype}"
+        assert tuple(weight.shape) == tuple(shape), f"mismatch shape: src {tuple(weight.shape)}, dst {tuple(shape)}"
+
+        weight = weight.to(device=self.device, non_blocking=True)
+        self.model_runner.model.load_weights(weights=[(name, weight)])
+        del weight
+
+    def update_weight_cuda_ipc(self, name, dtype, shape, ipc_handles=None, empty_cache=False):
         if torch.distributed.get_rank() == 0:
             print(f"update weight: {name}, dtype: {dtype}, shape: {shape}")
 

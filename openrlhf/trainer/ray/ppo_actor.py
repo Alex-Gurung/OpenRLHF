@@ -6,8 +6,12 @@ from typing import Dict, List, Optional, Union
 
 import deepspeed
 import ray
+import ray.util.collective as collective
 import torch
 import torch.distributed
+import vllm
+from packaging import version as pkg_version
+from torch.multiprocessing.reductions import reduce_tensor
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -120,10 +124,18 @@ class ActorPPOTrainer(ABC):
         # Init torch group for weights sync. CUDA IPC is an explicit backend
         # because some container environments disallow pidfd_getfd, which
         # makes CUDA IPC handle reconstruction fail after the first train step.
-        backend = getattr(self.strategy.args.vllm, "sync_backend", "nccl")
+        backend = getattr(self.strategy.args.vllm, "sync_backend", "nccl").lower()
+        self.vllm_sync_backend = backend
         self.use_cuda_ipc = backend == "cuda_ipc"
+        self.use_ray_cpu_sync = backend == "ray_cpu"
+        self.use_ray_vllm_sync = backend == "gloo" or getattr(self.strategy.args.vllm, "sync_with_ray", False)
 
-        if self.vllm_engines is not None and not self.use_cuda_ipc and torch.distributed.get_rank() == 0:
+        if (
+            self.vllm_engines is not None
+            and not self.use_cuda_ipc
+            and not self.use_ray_cpu_sync
+            and torch.distributed.get_rank() == 0
+        ):
             self._init_vllm_sync_group(backend)
 
         torch_dist_barrier_and_cuda_sync()
@@ -147,7 +159,7 @@ class ActorPPOTrainer(ABC):
         vllm_tensor_parallel_size = self.strategy.args.vllm.tensor_parallel_size
         world_size = vllm_num_engines * vllm_tensor_parallel_size + 1
 
-        use_ray = getattr(self.strategy.args.vllm, "sync_with_ray", False)
+        use_ray = self.use_ray_vllm_sync
         group_name = "openrlhf"
         refs = [
             engine.init_process_group.remote(
@@ -162,8 +174,6 @@ class ActorPPOTrainer(ABC):
             for i, engine in enumerate(self.vllm_engines)
         ]
         if use_ray:
-            import ray.util.collective as collective
-
             collective.init_collective_group(world_size=world_size, rank=0, backend=backend, group_name=group_name)
             self._model_update_group = group_name
         else:
@@ -479,26 +489,36 @@ class ActorPPOTrainer(ABC):
         count = 0
 
         def _broadcast_param(param, count, num_params):
-            use_ray = getattr(self.strategy.args.vllm, "sync_with_ray", False)
             # Fire all vllm engines for broadcast
             if torch.distributed.get_rank() == 0:
                 shape = param.shape if self.strategy.args.ds.zero_stage != 3 else param.ds_shape
+                if self.use_ray_cpu_sync:
+                    weight = param.data.detach().cpu()
+                    weight_ref = ray.put(weight)
+                    refs = [
+                        engine.update_weight_from_cpu.remote(
+                            name, dtype=param.dtype, shape=shape, weight=weight_ref, empty_cache=count == num_params
+                        )
+                        for engine in self.vllm_engines
+                    ]
+                    ray.get(refs)
+                    del weight_ref
+                    del weight
+                    return
+
                 refs = [
                     engine.update_weight.remote(name, dtype=param.dtype, shape=shape, empty_cache=count == num_params)
                     for engine in self.vllm_engines
                 ]
 
-                if use_ray:
-                    import ray.util.collective as collective
-
-                    collective.broadcast(param.data, 0, group_name=self._model_update_group)
+                if self.use_ray_vllm_sync:
+                    data = param.data.cpu() if self.vllm_sync_backend == "gloo" else param.data
+                    collective.broadcast(data, 0, group_name=self._model_update_group)
                 else:
                     self._model_update_group.broadcast(param.data, src=0, stream=torch.cuda.current_stream())
                 ray.get(refs)
 
         def _handle_cuda_ipc(param, count, num_params):
-            from torch.multiprocessing.reductions import reduce_tensor
-
             weight = param.data.clone()
             ipc_handle = reduce_tensor(weight)
 
@@ -562,9 +582,6 @@ class PolicyModelActor(BaseModelActor):
         # Skip for vLLM >= 0.16 where NCCL_CUMEM_ENABLE=0 causes ncclCommInitRank to fail
         # with "unhandled cuda error" under NCCL 2.27+.
         if getattr(args.vllm, "sync_backend", "nccl") == "nccl":
-            import vllm
-            from packaging import version as pkg_version
-
             if pkg_version.parse(vllm.__version__) < pkg_version.parse("0.16"):
                 os.environ["NCCL_CUMEM_ENABLE"] = "0"
 

@@ -241,7 +241,11 @@ if __name__ == "__main__":
         "--vllm.sync_backend",
         type=str,
         default="nccl",
-        help="DeepSpeed -> vLLM weight sync backend. Use cuda_ipc only when CUDA IPC handle passing is supported.",
+        help=(
+            "DeepSpeed -> vLLM weight sync backend. "
+            "Use cuda_ipc only when CUDA IPC handle passing is supported; "
+            "use ray_cpu when colocated NCCL sees duplicate GPUs."
+        ),
     )
     parser.add_argument("--vllm.sync_with_ray", action="store_true", default=False)
     parser.add_argument("--vllm.enable_prefix_caching", action="store_true", default=False)
