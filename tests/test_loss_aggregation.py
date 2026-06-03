@@ -159,9 +159,9 @@ def test_policy_kl_metric_is_not_clamped():
     assert torch.allclose(ppo_kl, (old_log_probs - log_probs).mean())
 
 
-def test_long_context_is_loss_uses_exp_ratio_and_detached_short_denominator():
+def test_long_context_is_loss_uses_exp_ratio_and_detached_short_behavior_denominator():
     long_log_probs = torch.tensor([[-0.5, -0.25, -0.25]], requires_grad=True)
-    old_short_log_probs = torch.tensor([[-1.0, -2.0, 0.0]], requires_grad=True)
+    short_behavior_log_probs = torch.tensor([[-1.0, -2.0, 0.0]], requires_grad=True)
     advantages = torch.tensor([[1.0, 3.0, 0.0]])
     short_mask = torch.tensor([[1.0, 1.0, 0.0]])
     long_mask = torch.tensor([[1.0, 1.0, 1.0]])
@@ -170,7 +170,7 @@ def test_long_context_is_loss_uses_exp_ratio_and_detached_short_denominator():
     loss_fn = LongContextISLoss(beta=2.0, log_ratio_clip=(-10.0, 1.0))
     loss, metrics = loss_fn(
         long_log_probs,
-        old_short_log_probs,
+        short_behavior_log_probs,
         advantages,
         short_mask,
         long_mask,
@@ -186,12 +186,12 @@ def test_long_context_is_loss_uses_exp_ratio_and_detached_short_denominator():
     loss.backward()
     expected_grad = torch.full_like(long_log_probs, -2.0 * expected_weight * 2.0 / 3.0)
     assert torch.allclose(long_log_probs.grad, expected_grad)
-    assert old_short_log_probs.grad is None
+    assert short_behavior_log_probs.grad is None
 
 
 def test_long_context_is_loss_handles_invalid_local_rows_with_global_tokens():
     long_log_probs = torch.tensor([[-0.5]], requires_grad=True)
-    old_short_log_probs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
+    short_behavior_log_probs = torch.tensor([[-1.0, -2.0]], requires_grad=True)
     advantages = torch.tensor([[1.0, 1.0]])
     short_mask = torch.tensor([[1.0, 1.0]])
     long_mask = torch.tensor([[0.0]])
@@ -200,7 +200,7 @@ def test_long_context_is_loss_handles_invalid_local_rows_with_global_tokens():
     loss_fn = LongContextISLoss(beta=1.0, log_ratio_clip=(-10.0, 1.0))
     loss, metrics = loss_fn(
         long_log_probs,
-        old_short_log_probs,
+        short_behavior_log_probs,
         advantages,
         short_mask,
         long_mask,
@@ -213,4 +213,4 @@ def test_long_context_is_loss_handles_invalid_local_rows_with_global_tokens():
 
     loss.backward()
     assert torch.allclose(long_log_probs.grad, torch.zeros_like(long_log_probs))
-    assert old_short_log_probs.grad is None
+    assert short_behavior_log_probs.grad is None

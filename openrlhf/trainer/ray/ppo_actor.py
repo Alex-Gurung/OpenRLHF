@@ -117,9 +117,11 @@ class ActorPPOTrainer(ABC):
             self.args.train.dynamic_batch_enable,
         )
 
-        # Init torch group for weights sync
+        # Init torch group for weights sync. CUDA IPC is an explicit backend
+        # because some container environments disallow pidfd_getfd, which
+        # makes CUDA IPC handle reconstruction fail after the first train step.
         backend = getattr(self.strategy.args.vllm, "sync_backend", "nccl")
-        self.use_cuda_ipc = backend == "nccl" and self.args.train.colocate_all and not self.args.train.async_enable
+        self.use_cuda_ipc = backend == "cuda_ipc"
 
         if self.vllm_engines is not None and not self.use_cuda_ipc and torch.distributed.get_rank() == 0:
             self._init_vllm_sync_group(backend)
@@ -346,6 +348,10 @@ class ActorPPOTrainer(ABC):
 
             global_long_tokens = long_loss_batch_info["batch_num_tokens"].item()
             if global_long_tokens > 0:
+                short_behavior_log_probs = experience.rollout_log_probs
+                if short_behavior_log_probs is None:
+                    short_behavior_log_probs = old_action_log_probs
+
                 long_action_log_probs = self.actor(
                     experience.long_sequences,
                     long_action_mask,
@@ -356,7 +362,7 @@ class ActorPPOTrainer(ABC):
                 )
                 long_context_is_loss, long_context_metrics = self.long_context_is_loss_fn(
                     long_action_log_probs,
-                    action_log_probs,
+                    short_behavior_log_probs,
                     advantages,
                     experience.action_mask,
                     long_action_mask,

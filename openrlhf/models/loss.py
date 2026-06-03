@@ -226,7 +226,7 @@ class LongContextISLoss(nn.Module):
     """Sequence-level IS objective for paired short-prompt/long-prompt training.
 
     The IS ratio is computed in log space and clipped before exponentiation:
-        w = exp(clip(log pi_long(y) - sg(log pi_short(y)))).
+        w = exp(clip(log pi_long(y) - sg(log pi_short_behavior(y)))).
 
     The clip bounds are therefore log-weight bounds. For example, a lower
     bound of -5 floors the post-exp weight at about 0.0067. This is biased
@@ -243,7 +243,7 @@ class LongContextISLoss(nn.Module):
     def forward(
         self,
         long_log_probs: torch.Tensor,
-        short_log_probs: torch.Tensor,
+        short_behavior_log_probs: torch.Tensor,
         advantages: torch.Tensor,
         short_action_mask: torch.Tensor,
         long_action_mask: torch.Tensor,
@@ -256,10 +256,11 @@ class LongContextISLoss(nn.Module):
         valid_mask = valid_mask & (long_action_mask.sum(dim=-1) > 0) & (short_action_mask.sum(dim=-1) > 0)
         valid_float = valid_mask.float()
 
-        # The paired response is sampled from the short-prompt policy. The
-        # denominator is stop-gradient by construction, so this loss only
-        # trains the model to raise/lower pi_long(y | long_prompt).
-        short_seq_logp = (short_log_probs.detach() * short_action_mask).sum(dim=-1)
+        # The paired response was sampled from a short-prompt behavior policy.
+        # Keep that denominator fixed across PPO updates; using the current
+        # short-prompt policy here would make later epochs on the same rollout
+        # optimize a moving-ratio surrogate instead of the IS objective.
+        short_seq_logp = (short_behavior_log_probs.detach() * short_action_mask).sum(dim=-1)
         long_seq_logp = (long_log_probs * long_action_mask).sum(dim=-1)
         raw_log_ratio = long_seq_logp - short_seq_logp
 
