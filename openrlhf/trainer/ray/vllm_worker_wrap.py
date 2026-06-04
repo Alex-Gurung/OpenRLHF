@@ -66,6 +66,19 @@ class WorkerWrap:
         self.model_runner.model.load_weights(weights=[(name, weight)])
         del weight
 
+    def update_weight_from_cpu_file(self, name, dtype, shape, path, empty_cache=False):
+        if torch.distributed.get_rank() == 0:
+            print(f"update weight from cpu file: {name}, dtype: {dtype}, shape: {shape}")
+
+        assert dtype == self.model_config.dtype, f"mismatch dtype: src {dtype}, dst {self.model_config.dtype}"
+        weight = torch.load(path, map_location="cpu", weights_only=True)
+        assert weight.dtype == dtype, f"mismatch dtype: src {weight.dtype}, dst {dtype}"
+        assert tuple(weight.shape) == tuple(shape), f"mismatch shape: src {tuple(weight.shape)}, dst {tuple(shape)}"
+
+        weight = weight.to(device=self.device, non_blocking=True)
+        self.model_runner.model.load_weights(weights=[(name, weight)])
+        del weight
+
     def update_weight_cuda_ipc(self, name, dtype, shape, ipc_handles=None, empty_cache=False):
         if torch.distributed.get_rank() == 0:
             print(f"update weight: {name}, dtype: {dtype}, shape: {shape}")

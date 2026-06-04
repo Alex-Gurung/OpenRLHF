@@ -1,5 +1,6 @@
 import os
 import socket
+import tempfile
 from abc import ABC
 from dataclasses import fields
 from typing import Dict, List, Optional, Union
@@ -46,6 +47,8 @@ LONG_CONTEXT_IS_METRIC_KEYS = (
     "long_is/short_seq_logp",
     "long_is/long_seq_logp",
     "long_is/token_logp_gap",
+    "long_is/sample_ratio",
+    "long_is/selected_rate",
 )
 
 
@@ -103,6 +106,7 @@ class ActorPPOTrainer(ABC):
         )
         long_context_args = getattr(self.args.algo, "long_context_is", None)
         self.long_context_is_enable = bool(getattr(long_context_args, "enable", False))
+        self.long_context_is_sample_ratio = float(getattr(long_context_args, "sample_ratio", 1.0))
         self.long_context_is_loss_fn = None
         if self.long_context_is_enable:
             self.long_context_is_loss_fn = LongContextISLoss(
@@ -339,6 +343,7 @@ class ActorPPOTrainer(ABC):
             long_context_is_loss = action_log_probs.sum() * 0.0
             zero_sample_metrics = action_log_probs.new_zeros(action_mask.shape[0])
             long_context_metrics = {key: zero_sample_metrics for key in LONG_CONTEXT_IS_METRIC_KEYS}
+            long_context_metrics["long_is/sample_ratio"] = zero_sample_metrics + self.long_context_is_sample_ratio
             if experience.long_is_valid is not None:
                 long_context_metrics["long_is/valid_rate"] = (
                     experience.long_is_valid.to(action_log_probs.device).float().view(-1)
@@ -404,24 +409,56 @@ class ActorPPOTrainer(ABC):
                 if short_behavior_log_probs is None:
                     short_behavior_log_probs = old_action_log_probs
 
-                long_action_log_probs = self.actor(
-                    experience.long_sequences,
-                    long_action_mask,
-                    attention_mask=experience.long_attention_mask,
-                    ring_attn_group=self.strategy.ring_attn_group,
-                    packed_seq_lens=packed_seq_lens,
-                    logits_to_keep_action=True,
-                )
-                long_context_is_loss, long_context_metrics = self.long_context_is_loss_fn(
-                    long_action_log_probs,
-                    short_behavior_log_probs,
-                    advantages,
-                    experience.action_mask,
-                    long_action_mask,
-                    experience.long_is_valid,
-                    **long_loss_batch_info,
-                )
-                self.strategy.backward(long_context_is_loss, self.actor, self.actor_optim)
+                valid_long_samples = experience.long_is_valid.to(action_log_probs.device).bool().view(-1)
+                valid_long_samples = valid_long_samples & (long_action_mask.sum(dim=-1) > 0)
+                if self.long_context_is_sample_ratio < 1.0:
+                    sample_draw = torch.rand(valid_long_samples.shape, device=action_log_probs.device)
+                    selected_long_samples = valid_long_samples & (sample_draw < self.long_context_is_sample_ratio)
+                else:
+                    selected_long_samples = valid_long_samples
+
+                long_context_metrics["long_is/selected_rate"] = selected_long_samples.float()
+                selected_indices = selected_long_samples.nonzero(as_tuple=False).view(-1)
+                if selected_indices.numel() == 0:
+                    long_context_is_loss = action_log_probs.new_zeros(())
+                else:
+                    # Subsampling avoids most full-prefix long forwards. The
+                    # selected loss is scaled by 1/p against the original
+                    # dynamic-batch denominator, giving an unbiased estimator
+                    # of the full long-IS term with higher variance.
+                    loss_scale = 1.0 / self.long_context_is_sample_ratio
+                    selected_long_action_mask = long_action_mask.index_select(0, selected_indices)
+                    selected_short_action_mask = experience.action_mask.index_select(0, selected_indices)
+                    selected_long_is_valid = experience.long_is_valid.index_select(0, selected_indices)
+                    selected_short_behavior_log_probs = short_behavior_log_probs.index_select(0, selected_indices)
+                    selected_advantages = advantages.index_select(0, selected_indices)
+
+                    long_action_log_probs = self.actor(
+                        experience.long_sequences.index_select(0, selected_indices),
+                        selected_long_action_mask,
+                        attention_mask=experience.long_attention_mask.index_select(0, selected_indices),
+                        ring_attn_group=self.strategy.ring_attn_group,
+                        packed_seq_lens=packed_seq_lens,
+                        logits_to_keep_action=True,
+                    )
+                    long_context_is_loss, selected_long_context_metrics = self.long_context_is_loss_fn(
+                        long_action_log_probs,
+                        selected_short_behavior_log_probs,
+                        selected_advantages,
+                        selected_short_action_mask,
+                        selected_long_action_mask,
+                        selected_long_is_valid,
+                        **long_loss_batch_info,
+                    )
+                    long_context_is_loss = long_context_is_loss * loss_scale
+                    for key, selected_metric in selected_long_context_metrics.items():
+                        if key == "long_is/valid_rate":
+                            continue
+                        full_metric = zero_sample_metrics.clone()
+                        full_metric.index_copy_(0, selected_indices, selected_metric.to(full_metric.device))
+                        long_context_metrics[key] = full_metric
+
+                    self.strategy.backward(long_context_is_loss, self.actor, self.actor_optim)
 
         if self.args.train.dynamic_batch_enable:
             if self.replay_buffer.dynamic_optimizer_step[step]:
@@ -500,17 +537,28 @@ class ActorPPOTrainer(ABC):
             if torch.distributed.get_rank() == 0:
                 shape = param.shape if self.strategy.args.ds.zero_stage != 3 else param.ds_shape
                 if self.use_ray_cpu_sync:
-                    weight = param.data.detach().cpu()
-                    weight_ref = ray.put(weight)
-                    refs = [
-                        engine.update_weight_from_cpu.remote(
-                            name, dtype=param.dtype, shape=shape, weight=weight_ref, empty_cache=count == num_params
-                        )
-                        for engine in self.vllm_engines
-                    ]
-                    ray.get(refs)
-                    del weight_ref
-                    del weight
+                    tmp_dir = os.path.join(tempfile.gettempdir(), "openrlhf_vllm_weight_sync")
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    fd, weight_path = tempfile.mkstemp(prefix="weight_", suffix=".pt", dir=tmp_dir)
+                    os.close(fd)
+                    try:
+                        weight = param.data.detach().cpu()
+                        torch.save(weight, weight_path)
+                        refs = [
+                            engine.update_weight_from_cpu_file.remote(
+                                name,
+                                dtype=param.dtype,
+                                shape=shape,
+                                path=weight_path,
+                                empty_cache=count == num_params,
+                            )
+                            for engine in self.vllm_engines
+                        ]
+                        ray.get(refs)
+                        del weight
+                    finally:
+                        if os.path.exists(weight_path):
+                            os.remove(weight_path)
                     return
 
                 refs = [

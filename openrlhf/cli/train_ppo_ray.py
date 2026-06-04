@@ -281,6 +281,15 @@ if __name__ == "__main__":
     parser.add_argument("--algo.long_context_is.enable", action="store_true", default=False)
     parser.add_argument("--algo.long_context_is.beta", type=float, default=1.0)
     parser.add_argument(
+        "--algo.long_context_is.sample_ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of valid long-context samples to use for the expensive long-prompt IS backward. "
+            "Values below 1.0 subsample samples and scale selected losses by 1/sample_ratio."
+        ),
+    )
+    parser.add_argument(
         "--algo.long_context_is.log_ratio_clip",
         type=float,
         nargs=2,
@@ -691,6 +700,9 @@ if __name__ == "__main__":
         assert args.data.long_max_len > 1, "--data.long_max_len must be greater than 1"
         assert args.algo.long_context_is.log_ratio_clip[0] < args.algo.long_context_is.log_ratio_clip[1], (
             "--algo.long_context_is.log_ratio_clip low bound must be less than high bound"
+        )
+        assert 0 < args.algo.long_context_is.sample_ratio <= 1, (
+            "--algo.long_context_is.sample_ratio must be in (0, 1]"
         )
         assert not args.train.agent_func_path, "long-context IS v1 supports single-turn text rollouts only"
         assert args.data.max_images_per_prompt == 0, "long-context IS v1 supports text-only rollouts"
