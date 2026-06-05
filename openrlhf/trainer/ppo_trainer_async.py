@@ -91,6 +91,8 @@ class GenerateSamplesActor:
         eval_kwargs = self.generate_kwargs.copy()
         eval_kwargs["temperature"] = self.args.eval.temperature
         eval_kwargs["n_samples_per_prompt"] = self.args.eval.n_samples_per_prompt
+        if self.args.eval.max_len is not None:
+            eval_kwargs["max_len"] = self.args.eval.max_len
 
         samples_list = self.samples_generator.generate_eval_samples(**eval_kwargs)
         logs = compute_eval_metrics(self.eval_dataloader, samples_list, self.args.eval.n_samples_per_prompt)

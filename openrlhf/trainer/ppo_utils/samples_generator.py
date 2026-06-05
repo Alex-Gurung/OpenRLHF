@@ -75,7 +75,7 @@ class SamplesGenerator:
             while True:
                 experiences, _, exhausted = self._generate_vllm(
                     dataloader_iter=self._eval_dataloader_iter,
-                    num_prompts=self.args.rollout.batch_size,
+                    num_prompts=getattr(self.args.eval, "batch_size", None) or self.args.rollout.batch_size,
                     dynamic_filtering=False,
                     **generate_kwargs,
                 )

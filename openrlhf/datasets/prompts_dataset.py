@@ -62,6 +62,8 @@ class PromptDataset(Dataset):
         strategy,
         input_template=None,
         include_long_prompt=None,
+        input_key=None,
+        label_key=None,
     ) -> None:
         super().__init__()
         self.strategy = strategy
@@ -69,8 +71,10 @@ class PromptDataset(Dataset):
 
         # chat_template
         self.input_template = input_template
-        input_key = getattr(self.strategy.args.data, "input_key", None)
-        label_key = getattr(self.strategy.args.data, "label_key", None)
+        if input_key is None:
+            input_key = getattr(self.strategy.args.data, "input_key", None)
+        if label_key is None:
+            label_key = getattr(self.strategy.args.data, "label_key", None)
         apply_chat_template = getattr(self.strategy.args.data, "apply_chat_template", False)
         long_context_args = getattr(getattr(self.strategy.args, "algo", None), "long_context_is", None)
         long_context_enable = bool(getattr(long_context_args, "enable", False))

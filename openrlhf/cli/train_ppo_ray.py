@@ -53,6 +53,9 @@ def train(args):
     vllm_engines = None
     if args.vllm.num_engines is not None and args.vllm.num_engines > 0:
         max_len = args.data.max_len
+        vllm_max_len = max_len
+        if args.eval.dataset and args.eval.max_len is not None:
+            vllm_max_len = max(vllm_max_len, args.eval.max_len)
         if args.train.colocate_all and not args.train.async_enable:
             assert (
                 args.actor.num_nodes * args.actor.num_gpus_per_node
@@ -71,7 +74,7 @@ def train(args):
             args.train.full_determinism_enable,
             args.vllm.enable_prefix_caching,
             args.vllm.enforce_eager,
-            max_len,
+            vllm_max_len,
             pg if args.train.colocate_all and not args.train.async_enable else None,
             args.vllm.gpu_memory_utilization,
             args.vllm.enable_sleep,
@@ -575,6 +578,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--eval.n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
     )
+    parser.add_argument("--eval.input_key", type=str, default=None, help="JSON dataset key for evaluation prompts")
+    parser.add_argument("--eval.input_template", type=str, default=None)
+    parser.add_argument("--eval.max_len", type=int, default=None, help="Max total sequence length for evaluation")
+    parser.add_argument(
+        "--eval.batch_size",
+        type=int,
+        default=None,
+        help="Number of eval prompts dispatched per generation batch. Defaults to rollout.batch_size.",
+    )
 
     parser.add_argument("--data.input_key", type=str, default="input", help="JSON dataset key")
     parser.add_argument(
@@ -643,6 +655,8 @@ if __name__ == "__main__":
 
     if args.data.long_max_len is None:
         args.data.long_max_len = args.data.max_len
+    if args.eval.max_len is None and args.eval.input_key and args.eval.input_key == args.data.long_input_key:
+        args.eval.max_len = args.data.long_max_len
 
     if args.train.agent_func_path:
         args.reward.remote_url = "agent"
@@ -745,6 +759,10 @@ if __name__ == "__main__":
         assert (
             args.reward.remote_url or args.train.agent_func_path
         ), "`--eval.dataset` requires `--reward.remote_url` or `--train.agent_func_path` (#1242)."
+        if args.eval.max_len is not None:
+            assert args.eval.max_len > 1, "--eval.max_len must be greater than 1"
+        if args.eval.batch_size is not None:
+            assert args.eval.batch_size > 0, "--eval.batch_size must be positive"
 
     if args.algo.kl.use_loss:
         if args.algo.kl.estimator not in ["k2", "k3"]:

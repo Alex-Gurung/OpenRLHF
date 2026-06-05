@@ -57,8 +57,17 @@ def prepare_datasets(strategy, tokenizer):
             dataset_split=args.eval.split,
         )
         eval_data = eval_data.select(range(min(args.data.max_samples, len(eval_data))))
+        eval_input_key = getattr(args.eval, "input_key", None) or args.data.input_key
+        eval_input_template = getattr(args.eval, "input_template", None)
+        if eval_input_template is None:
+            eval_input_template = args.data.input_template
         eval_dataset = PromptDataset(
-            eval_data, tokenizer, strategy, input_template=args.data.input_template, include_long_prompt=False
+            eval_data,
+            tokenizer,
+            strategy,
+            input_template=eval_input_template,
+            include_long_prompt=False,
+            input_key=eval_input_key,
         )
         eval_dataloader = strategy.setup_dataloader(
             eval_dataset,
@@ -560,6 +569,8 @@ class PPOTrainer(BasePPOTrainer):
                     eval_generate_kwargs = self.generate_kwargs.copy()
                     eval_generate_kwargs["temperature"] = self.args.eval.temperature
                     eval_generate_kwargs["n_samples_per_prompt"] = self.args.eval.n_samples_per_prompt
+                    if self.args.eval.max_len is not None:
+                        eval_generate_kwargs["max_len"] = self.args.eval.max_len
                     eval_logs = self.evaluate(global_step, **eval_generate_kwargs)
                     self.save_best_checkpoint(eval_logs, global_step, client_states)
 
