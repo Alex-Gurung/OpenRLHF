@@ -1,4 +1,5 @@
 import os
+import shutil
 import socket
 import tempfile
 from abc import ABC
@@ -790,6 +791,44 @@ class PolicyModelActor(BaseModelActor):
     def offload_states(self):
         offload_deepspeed_states(self.actor.model)
 
+    def _rotate_hf_checkpoints(self, checkpoint_dir, current_name, max_num):
+        if not self.strategy.is_rank_0() or max_num is None or max_num < 1 or not os.path.isdir(checkpoint_dir):
+            return
+
+        current_path = os.path.abspath(os.path.join(checkpoint_dir, current_name))
+        is_best = current_name.startswith("best")
+        regular_checkpoints = []
+
+        for name in os.listdir(checkpoint_dir):
+            path = os.path.join(checkpoint_dir, name)
+            if not name.endswith("_hf") or not os.path.isdir(path):
+                continue
+
+            if name.startswith("best"):
+                if is_best and os.path.abspath(path) != current_path:
+                    shutil.rmtree(path)
+                    self.strategy.print(f"Removed old best HF checkpoint {path}")
+                continue
+
+            regular_checkpoints.append((os.path.getmtime(path), name, path))
+
+        if is_best:
+            return
+
+        overflow = max(0, len(regular_checkpoints) - max_num)
+        if overflow == 0:
+            return
+
+        removed = 0
+        for _, _, path in sorted(regular_checkpoints):
+            if os.path.abspath(path) == current_path:
+                continue
+            shutil.rmtree(path)
+            self.strategy.print(f"Deleted HF checkpoint {path}")
+            removed += 1
+            if removed >= overflow:
+                break
+
     def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
         args = self.strategy.args
         client_states = client_states or {}
@@ -811,5 +850,6 @@ class PolicyModelActor(BaseModelActor):
                 self.tokenizer,
                 save_path,
             )
+            self._rotate_hf_checkpoints(args.ckpt.path, f"{tag}_hf", args.ckpt.max_num)
         # wait
         torch_dist_barrier_and_cuda_sync()
