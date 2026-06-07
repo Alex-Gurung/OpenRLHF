@@ -81,18 +81,16 @@ class WandbLogger:
         wandb.define_metric("eval/epoch")
         wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
         self.handle = wandb
-        self.samples_table = wandb.Table(columns=["global_step", "text", "reward"])
+        self.sample_log_steps = args.logger.wandb.sample_log_steps
 
     def log_train(self, global_step: int, logs_dict: Dict[str, Any]) -> None:
         logs_dict = dict(logs_dict)
 
         generated_samples = logs_dict.pop("generated_samples", None)
-        if generated_samples:
-            # https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-            new_table = self.handle.Table(columns=self.samples_table.columns, data=self.samples_table.data)
-            new_table.add_data(global_step, *generated_samples)
-            self.samples_table = new_table
-            self.handle.log({"train/generated_samples": new_table})
+        if generated_samples and self.sample_log_steps > 0 and global_step % self.sample_log_steps == 0:
+            samples_table = self.handle.Table(columns=["global_step", "text", "reward"])
+            samples_table.add_data(global_step, *generated_samples)
+            self.handle.log({"train/generated_samples": samples_table})
 
         metrics = {k: v for k, v in logs_dict.items() if v is not None}
         logs = {"train/%s" % k: v for k, v in {**metrics, "global_step": global_step}.items()}

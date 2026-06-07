@@ -615,6 +615,12 @@ if __name__ == "__main__":
         type=str,
         default="ppo_%s" % datetime.now().strftime("%m%dT%H:%M"),
     )
+    parser.add_argument(
+        "--logger.wandb.sample_log_steps",
+        type=int,
+        default=1,
+        help="Log one generated-sample table every N steps. Set to 0 to disable sample media uploads.",
+    )
 
     # Dynamic filtering
     parser.add_argument(
