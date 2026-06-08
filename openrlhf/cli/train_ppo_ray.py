@@ -328,6 +328,12 @@ if __name__ == "__main__":
     parser.add_argument("--logger.logging_steps", type=int, default=1)
     parser.add_argument("--ckpt.path", type=str, default="./ckpt/checkpoints_ppo_ray")
     parser.add_argument("--ckpt.save_hf", action="store_true", default=False)
+    parser.add_argument(
+        "--ckpt.best_hf_only",
+        action="store_true",
+        default=False,
+        help="Save best eval checkpoints as HF exports only; regular checkpoints remain unchanged.",
+    )
     parser.add_argument("--ckpt.disable_ds", action="store_true", default=False)
     parser.add_argument("--ckpt.max_num", type=int, default=3)
     parser.add_argument("--ckpt.max_mem", type=float, default=float("inf"))
@@ -726,6 +732,9 @@ if __name__ == "__main__":
         )
         assert not args.train.agent_func_path, "long-context IS v1 supports single-turn text rollouts only"
         assert args.data.max_images_per_prompt == 0, "long-context IS v1 supports text-only rollouts"
+
+    if args.ckpt.best_hf_only:
+        assert args.ckpt.save_hf, "--ckpt.best_hf_only requires --ckpt.save_hf"
 
     if args.ds.ring_attn_size > 1:
         if not args.ds.packing_samples:

@@ -829,10 +829,10 @@ class PolicyModelActor(BaseModelActor):
             if removed >= overflow:
                 break
 
-    def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None):
+    def save_checkpoint(self, tag, client_states=None, metric_value=None, metric_key=None, save_deepspeed=True):
         args = self.strategy.args
         client_states = client_states or {}
-        if not self.disable_ds_ckpt:
+        if save_deepspeed and not self.disable_ds_ckpt:
             self.strategy.save_ckpt(
                 self.actor.model,
                 os.path.join(args.ckpt.path, "_actor"),

@@ -375,14 +375,16 @@ class BasePPOTrainer(ABC):
             client_states["checkpoint_metric_key"] = metric_key
 
             tag = f"best_global_step{global_step}"
+            best_hf_only = bool(getattr(self.args.ckpt, "best_hf_only", False))
             refs = self.actor_model_group.async_run_method(
                 method_name="save_checkpoint",
                 tag=tag,
                 client_states=client_states,
                 metric_value=current_value,
                 metric_key=metric_key,
+                save_deepspeed=not best_hf_only,
             )
-            if self.critic_model_group is not None:
+            if self.critic_model_group is not None and not best_hf_only:
                 refs.extend(
                     self.critic_model_group.async_run_method(
                         method_name="save_checkpoint", tag=tag, metric_value=current_value, metric_key=metric_key
