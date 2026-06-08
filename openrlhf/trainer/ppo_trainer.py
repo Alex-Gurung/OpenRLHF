@@ -383,6 +383,7 @@ class BasePPOTrainer(ABC):
                 metric_value=current_value,
                 metric_key=metric_key,
                 save_deepspeed=not best_hf_only,
+                save_hf=best_hf_only or None,
             )
             if self.critic_model_group is not None and not best_hf_only:
                 refs.extend(

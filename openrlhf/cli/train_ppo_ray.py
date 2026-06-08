@@ -733,9 +733,6 @@ if __name__ == "__main__":
         assert not args.train.agent_func_path, "long-context IS v1 supports single-turn text rollouts only"
         assert args.data.max_images_per_prompt == 0, "long-context IS v1 supports text-only rollouts"
 
-    if args.ckpt.best_hf_only:
-        assert args.ckpt.save_hf, "--ckpt.best_hf_only requires --ckpt.save_hf"
-
     if args.ds.ring_attn_size > 1:
         if not args.ds.packing_samples:
             print("[Warning] --ring_attn_size > 1 requires --packing_samples.")
